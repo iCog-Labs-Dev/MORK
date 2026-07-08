@@ -1164,7 +1164,13 @@ impl Sink for PureSink {
 
                         let mut res = match self.scope.eval(ExprSource::new(&p[clen])) {
                             Ok(res) => { res }
-                            Err(er) => { trace!(target: "pure", "err {}", er); continue 'vals }
+                            Err(er) => {
+                                // Surface the failing expression before skipping it so
+                                // a bad pure-eval branch is visible on stderr.
+                                eprintln!("pure eval error: {} in {}", er, serialize(&p[clen..]));
+                                trace!(target: "pure", "err {}", er);
+                                continue 'vals
+                            }
                         };
 
                         trace!(target: "sink", "result {:?}", serialize(&res[..]));

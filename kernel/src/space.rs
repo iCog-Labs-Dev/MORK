@@ -1705,6 +1705,9 @@ impl Space {
                 let mut xe = Expr{ ptr: x.as_mut_ptr() };
                 let start = Instant::now();
                 if let Err(e) = self.interpret(xe) {
+                    // Keep malformed exec forms visible even when interpretation
+                    // falls back to logging and continues the search.
+                    eprintln!("interpret error: {} in {}", e, serialize(&x));
                     debug!(target: "interpret", "not interpreting: {}", e);
                 }
                 if self.timing {

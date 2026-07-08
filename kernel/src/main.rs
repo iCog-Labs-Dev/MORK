@@ -1,6 +1,6 @@
 #![feature(string_from_utf8_lossy_owned)]
 
-use mork::{expr, prefix, sexpr, space};
+use mork::{expr, prefix, sexpr, space, output};
 use mork::space::{transitions, unifications, writes, Space, ACT_PATH};
 use mork_frontend::bytestring_parser::Parser;
 use mork_expr::{item_byte, serialize, SourceItem, Tag};
@@ -6258,17 +6258,36 @@ fn main() {
                 let mmapf = unsafe { memmap2::Mmap::map(&f).unwrap() };
                 s.add_all_sexpr(&*mmapf);
             }
-            if instrumentation > 0 { println!("loaded {} expressions", s.btm.val_count()) }
-            println!("loaded {:?} ; running and outputing to {:?}", &input_path, output_path.as_ref().or(Some(&"stdout".to_string())));
+            // Route all human-facing run output through the shared formatter so
+            // the header, status, and result blocks stay visually consistent.
+            let output_target = output_path
+                .as_deref()
+                .unwrap_or("stdout");
+
+            output::print_header(&input_path, output_target);
+
+            if instrumentation > 0 {
+                output::print_loaded(s.btm.val_count());
+            }
             let t0 = Instant::now();
             let mut performed = s.metta_calculus(steps);
-            println!("executing {performed} steps took {} ms (unifications {}, writes {}, transitions {})", t0.elapsed().as_millis(), unsafe { unifications }, unsafe { writes }, unsafe { transitions });
-            if instrumentation > 0 { println!("dumping {} expressions", s.btm.val_count()) }
+            let elapsed_ms = t0.elapsed().as_millis();
+
+            output::print_execution(
+                performed,
+                elapsed_ms,
+                unsafe { unifications },
+                unsafe { writes },
+                unsafe { transitions },
+            );
+            if instrumentation > 0 {
+                output::print_dumping(s.btm.val_count());
+            }
             if output_path.is_none() {
                 let mut v = vec![];
                 s.dump_all_sexpr(&mut v).unwrap();
                 let res = String::from_utf8_lossy_owned(v);
-                println!("result:\n{res}");
+                output::print_result(&res);
             } else {
                 let f = std::fs::File::create(&output_path.unwrap()).unwrap();
                 let mut w = std::io::BufWriter::new(f);
