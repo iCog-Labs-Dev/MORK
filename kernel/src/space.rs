@@ -1653,7 +1653,7 @@ impl Space {
     
     // (exec <loc> (, <src1> <src2> <srcn>)
     //             (, <dst1> <dst2> <dstm>))
-    pub fn interpret(&mut self, rt: Expr) -> Result<(), &'static str> {
+    pub fn interpret(&mut self, rt: Expr) -> Result<(usize, bool), &'static str> {
         #[cfg(feature = "periodic_merkleize")]
         if self.last_merkleize.elapsed().as_secs() > 10 {
             self.btm.merkleize();
@@ -1688,7 +1688,7 @@ impl Space {
             };
 
             trace!(target: "interpret", "(run, changed) = {:?}", res);
-            return Ok(())
+            return Ok(res)
         }, _err => return Err("exec shape (exec <loc> <patterns> <templates>)"))
     }
 
