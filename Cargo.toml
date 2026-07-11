@@ -5,6 +5,7 @@ members = [
     "expr/",
     "frontend/",
     "kernel/",
+    "server/",
     "experiments/eval",
     "experiments/eval-ffi",
     "experiments/eval-examples",
