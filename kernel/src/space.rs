@@ -905,7 +905,11 @@ impl Space {
     }
 
     pub fn dump_all_sexpr<W : Write>(&self, w: &mut W) -> Result<usize, String> {
-        let mut rz = self.btm.read_zipper();
+        Self::dump_all_sexpr_from(&self.btm, &self.sm, w)
+    }
+
+    pub fn dump_all_sexpr_from<W : Write>(btm: &PathMap<()>, sm: &SharedMappingHandle, w: &mut W) -> Result<usize, String> {
+        let mut rz = btm.read_zipper();
         let mut i = 0usize;
         while rz.to_next_val() {
             // println!("{}", serialize(rz.path()));
@@ -913,7 +917,7 @@ impl Space {
                 #[cfg(feature="interning")]
                 {
                     let symbol = i64::from_be_bytes(s.try_into().unwrap()).to_be_bytes();
-                    let mstr = self.sm.get_bytes(symbol).map(unsafe { |x| std::str::from_utf8_unchecked(x) });
+                    let mstr = sm.get_bytes(symbol).map(unsafe { |x| std::str::from_utf8_unchecked(x) });
                     // println!("symbol {symbol:?}, bytes {mstr:?}");
                     unsafe { std::mem::transmute(mstr.expect(format!("failed to look up {:?}", symbol).as_str())) }
                 }
@@ -928,6 +932,10 @@ impl Space {
     }
 
     pub fn dump_sexpr<W : Write>(&self, pattern: Expr, template: Expr, w: &mut W) -> usize {
+        Self::dump_sexpr_from(&self.btm, &self.sm, pattern, template, w)
+    }
+
+    pub fn dump_sexpr_from<W : Write>(btm: &PathMap<()>, sm: &SharedMappingHandle, pattern: Expr, template: Expr, w: &mut W) -> usize {
         let constant_template_prefix = unsafe { template.prefix().unwrap_or_else(|_| template.span()).as_ref().unwrap() };
 
         let mut buffer = Vec::with_capacity(1 << 32);
@@ -937,7 +945,7 @@ impl Space {
 
         let mut stack       = Vec::new();
         let mut assignments = Vec::new();
-        Self::query_multi(&self.btm, Expr{ ptr: pat.leak().as_mut_ptr() }, |refs_bindings, loc| 'query : {
+        Self::query_multi(btm, Expr{ ptr: pat.leak().as_mut_ptr() }, |refs_bindings, loc| 'query : {
             let mut oz = ExprZipper::new(Expr { ptr: buffer.as_mut_ptr() });
 
             match refs_bindings {
@@ -962,7 +970,7 @@ impl Space {
                 #[cfg(feature="interning")]
                 {
                     let symbol = i64::from_be_bytes(s.try_into().unwrap()).to_be_bytes();
-                    let mstr = self.sm.get_bytes(symbol).map(unsafe { |x| std::str::from_utf8_unchecked(x) });
+                    let mstr = sm.get_bytes(symbol).map(unsafe { |x| std::str::from_utf8_unchecked(x) });
                     // println!("symbol {symbol:?}, bytes {mstr:?}");
                     unsafe { std::mem::transmute(mstr.expect(format!("failed to look up {:?}", symbol).as_str())) }
                 }
