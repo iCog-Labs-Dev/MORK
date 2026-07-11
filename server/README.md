@@ -1,0 +1,188 @@
+# mork-server
+
+An HTTP + SSE server exposing the MORK graph database's metta-calculus VM
+(`Space::metta_calculus`) to multiple concurrent clients.
+
+One verb: **`POST /run`** — submitting a transaction (data + execs) *is* running it.
+Execution feedback streams live over **`GET /events`** (Server-Sent Events), and results are
+read from lock-free snapshots via **`GET /export`**. There is no separate load step and no
+`/count`, `/clear` or `/status` — counting, clearing, and even cancelling a program are all
+expressible as ordinary transactions, and status lives on the event stream.
+
+## Running
+
+The workspace requires the nightly toolchain:
+
+```sh
+cargo +nightly run --release -p mork-server -- --addr 127.0.0.1:8081
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--addr` | `127.0.0.1:8081` | Listen address |
+| `--events-buffer` | `4096` | Per-subscriber event buffer; slower clients get `lagged` events instead of back-pressuring the engine |
+
+Logging via `env_logger`: `RUST_LOG=info cargo +nightly run -p mork-server`.
+Stop with Ctrl-C (open connections are closed, the engine thread is joined).
+
+## Quick start
+
+```sh
+# 1. watch everything the VM does (keep this open in a terminal)
+curl -N http://127.0.0.1:8081/events
+
+# 2. submit a program (a process-calculus 2+2 adder) — the exact same file
+#    also runs unchanged with the CLI: `mork run server/examples/adder.metta`
+curl -X POST --data-binary @server/examples/adder.metta http://127.0.0.1:8081/run
+# → {"ok":true,"tx":"tx1_si49f8v6","count":6,"version":1}
+
+# 3. after the stream shows `quiescent`, read the result
+curl 'http://127.0.0.1:8081/export?pattern=%5B2%5D%20petri%20%5B3%5D%20%21%20result%20%24&template=_1'
+# → (S (S (S (S Z))))
+```
+
+## Execution model (what a "transaction" means here)
+
+- **Submit = run.** A transaction is a body of MeTTa s-expressions — plain data plus
+  `(exec <loc> <patterns> <templates>)` programs. It is applied **atomically** (never
+  half-visible) and its execs start executing immediately.
+- **Namespacing.** The server rewrites every `(exec L …)` in your upload to
+  `(exec (<tx-id> L) …)` — uniformly across data, patterns, and templates, so your
+  pattern-matching still works. This gives each transaction a private work queue. The
+  wrapper is stripped from everything you see (events, exports); you never observe it.
+- **Fair scheduling.** The engine runs one VM step per active transaction per round
+  (round-robin), so a 10-step program finishes promptly even while a million-step program
+  runs. *Within* your transaction, execs run in plain trie order over your locs — your
+  program's own inference control is untouched.
+- **Serial writes, parallel reads.** All mutation happens on one engine thread, one step at
+  a time (interleaving is turn-taking, never concurrent writes). Reads (`/export`) and the
+  event stream are served in parallel from copy-on-write snapshots and never block on, or
+  are blocked by, execution.
+- **Isolation: none.** All transactions share one space's data region — overlapping reads
+  and writes between programs are MeTTa semantics, not an error. (MVCC is future work.)
+- **Cancellation is a transaction.** A RemoveSink exec that matches your pending execs
+  deletes them. Because patterns are wrapped into your namespace too, a transaction can
+  only cancel *its own* chain — never another client's.
+- **CLI compatibility.** Any file that works as `mork run <file>` works unmodified as a
+  `POST /run` body: same parser, same exec shape, same semantics, identical results.
+
+---
+
+# API reference
+
+Control responses are JSON with an `"ok"` flag; bulk bodies are raw s-expression text.
+
+## `POST /run`
+
+Submit a transaction and start executing it.
+
+- **Body**: MeTTa s-expression text (UTF-8) — data and/or `(exec …)` programs, exactly the
+  CLI's input syntax.
+- **Returns immediately** (execution continues in the background; watch `/events`):
+
+```json
+{"ok": true, "tx": "tx17_si49f8v6", "count": 6, "version": 42}
+```
+
+| Field | Meaning |
+|---|---|
+| `tx` | Transaction id, format `tx<count>_<unique 8-char alphanumeric>`. Doubles as the loc-namespace symbol |
+| `count` | Expressions added by this transaction |
+| `version` | Global step counter after the (atomic) load |
+
+**Errors**: `400` non-UTF-8 body or s-expression parse error (nothing applied) ·
+`422` kernel load failure (body may be partially applied; message says so) ·
+`503` engine shut down.
+
+Examples:
+
+```sh
+# just data — loads atomically, no execution starts (no execs)
+printf '(edge a b) (edge b c)' | curl -s -X POST --data-binary @- localhost:8081/run
+
+# a "count" transaction (replaces a /count endpoint)
+printf '(exec 0 (, (edge $x $y)) (O (count (edges two) 2 (q $x $y))))' \
+  | curl -s -X POST --data-binary @- localhost:8081/run
+
+# a "clear this subtree" transaction (replaces a /clear endpoint)
+printf '(exec 0 (, (edge $x $y)) (O (- (edge $x $y))))' \
+  | curl -s -X POST --data-binary @- localhost:8081/run
+```
+
+## `GET /events` — Server-Sent Events
+
+The single live feed of everything the VM does. Standard SSE: `event: <name>` +
+`data: <json>` frames; consume with `curl -N`, `EventSource`, or any SSE client.
+
+**Query parameters**
+
+| Param | Meaning |
+|---|---|
+| `tx=<tx-id>` | Only events belonging to that transaction (global events — `idle`, `delta` — still pass) |
+| `deltas=true` | Additionally receive `delta` snapshot-diff events (off by default; costs nothing when nobody subscribes) |
+
+**Events (exhaustive).** Every payload carries `version`, the global step counter, so any
+client can totally order what it observes.
+
+| Event | Payload | Meaning |
+|---|---|---|
+| `hello` | `{version, count, active_txs}` | First frame on connect: snapshot version, expression count, transactions with pending execs |
+| `tx` | `{tx, count, version}` | A transaction was applied atomically |
+| `step` | `{tx, exec, touched, new, us, version, error}` | One VM step ran for `tx`. `exec` = the s-expression that executed (namespace unwrapped), `touched` = template instantiations written, `new` = whether anything not already present was written, `us` = duration in microseconds, `error` = interpreter rejection if the exec was malformed (it is still consumed) |
+| `quiescent` | `{tx, version}` | **Per-transaction**: `tx`'s namespace has no pending execs — its program finished (or removed itself). Other transactions may still be running |
+| `idle` | `{version}` | **Global**: no pending execs in *any* namespace; every program has quiesced and the engine is parked awaiting transactions. Always preceded by the last `quiescent` |
+| `delta` | `{version, added, removed}` | Opt-in snapshot diff: expressions added/removed between two consecutively observed snapshots (arrays of s-expression strings). Computed off the engine thread with PathMap set algebra; under load several steps may coalesce into one delta |
+| `error` | `{tx?, message}` | Malformed transaction or engine-side failure |
+| `lagged` | `{skipped}` | *You* consumed too slowly and missed `skipped` events (buffer overrun). Re-sync with `/export`; the engine was never slowed down |
+
+Typical lifecycle of one transaction on the stream:
+
+```
+tx → step → step → … → quiescent        (and idle, if nothing else is running)
+```
+
+## `GET /export`
+
+Read from the **latest published snapshot** — consistent, lock-free, never blocked by
+execution. Response is s-expression text, one expression per line, with transaction
+namespaces stripped. The `x-mork-version` response header carries the snapshot's version.
+
+**Query parameters** (both or neither; values URL-encoded):
+
+| Param | Meaning |
+|---|---|
+| *(none)* | Dump the entire space |
+| `pattern` | Query pattern in the CLI's bracket notation (same as `mork convert --pattern`), e.g. `[2] petri [3] ! result $` |
+| `template` | Output template, e.g. `_1` (= the first `$` binding) |
+
+Bracket notation crash course: `[N]` opens an N-ary expression, `$` introduces a variable,
+`_k` refers back to the k-th variable. `[2] petri [3] ! result $` matches
+`(petri (! result $x))`; template `_1` outputs the binding of `$x`.
+
+```sh
+# everything
+curl -s localhost:8081/export
+
+# just the adder's result
+curl -s 'localhost:8081/export?pattern=%5B2%5D%20petri%20%5B3%5D%20%21%20result%20%24&template=_1'
+```
+
+**Consistency note**: exports see the last *committed* step (snapshot isolation) — a
+slightly stale but always consistent view. To coordinate, compare the `version` on your
+`/run` reply or `step` events with the `x-mork-version` header.
+
+---
+
+## Operational notes
+
+- **Toolchain**: nightly only (`cargo +nightly`); the workspace has no `rust-toolchain`
+  file and fails on stable.
+- **Symbol encoding**: the server assumes the kernel's default features (no `interning`).
+- **Deep nesting**: expression machinery recurses per nesting level; the engine thread
+  reserves a 512 MB stack (lazily committed) and tokio threads 64 MB, so deeply nested
+  terms like a 400-deep `(S (S … Z))` are fine.
+- **Runaway programs**: a program whose continuations never stop runs forever, by design —
+  it shares the machine fairly with everyone else. Cancel it with a RemoveSink transaction
+  from the same namespace, or restart the server (no persistence yet).
+- **Roadmap** (not yet implemented): WAL crash recovery, then MVCC snapshots/isolation,
+  then parallel execution of write-disjoint execs.
