@@ -443,6 +443,15 @@ macro_rules! sexpr {
     }};
 }
 
+/// One consumed exec, reported by [`Space::metta_calculus_scoped`]'s `on_step` callback.
+pub struct StepInfo<'e> {
+    pub exec: &'e [u8],
+    pub touched: usize,
+    pub new: bool,
+    pub micros: u64,
+    pub error: Option<&'static str>,
+}
+
 impl Space {
     pub fn new() -> Self {
         Self { btm: PathMap::new(), sm: SharedMapping::new(), mmaps: HashMap::new(), z3s: HashMap::new(), last_merkleize: Instant::now(), timing: false }
@@ -1693,20 +1702,34 @@ impl Space {
     }
 
     pub fn metta_calculus(&mut self, steps: usize) -> usize {
+        self.metta_calculus_scoped(&[], steps, |_| true)
+    }
+
+    /// Steps only execs under `(exec <loc_prefix> …)`. `on_step` is called with each
+    /// consumed exec's info; returning `false` stops early (cooperative cancellation).
+    /// Empty `loc_prefix` is byte-for-byte the previous whole-space semantics, including the
+    /// off-by-one where `steps == 0` still runs exactly one exec (the check below only gates
+    /// *continuing* to a next round; an available exec is always consumed first).
+    pub fn metta_calculus_scoped(&mut self, loc_prefix: &[u8], steps: usize,
+                                 mut on_step: impl FnMut(StepInfo) -> bool) -> usize {
         let mut done: usize = 0;
         const PREFIX: [u8; 6] = const { [item_byte(Tag::Arity(4)), item_byte(Tag::SymbolSize(4)), b'e', b'x', b'e', b'c' ] };
+        let mut full_prefix: Vec<u8> = Vec::with_capacity(PREFIX.len() + loc_prefix.len());
+        full_prefix.extend_from_slice(&PREFIX[..]);
+        full_prefix.extend_from_slice(loc_prefix);
 
         while {
-            let mut rz = self.btm.read_zipper_at_borrowed_path(&PREFIX[..]);
+            let mut rz = self.btm.read_zipper_at_borrowed_path(&full_prefix[..]);
             if rz.to_next_val() {
                 // cannot be here `rz` conflicts potentially with zippers(rz.path())
                 let mut x: Vec<u8> = rz.into_path(); // should use local buffer
                 self.btm.remove(&x[..]);
                 let mut xe = Expr{ ptr: x.as_mut_ptr() };
                 let start = Instant::now();
-                if let Err(e) = self.interpret(xe) {
-                    debug!(target: "interpret", "not interpreting: {}", e);
-                }
+                let (touched, new, error) = match self.interpret(xe) {
+                    Ok((touched, new)) => (touched, new, None),
+                    Err(e) => { debug!(target: "interpret", "not interpreting: {}", e); (0, false, Some(e)) }
+                };
                 if self.timing {
                     let start_string = start.elapsed().as_nanos().to_string();
                     let start_str = start_string.as_str();
@@ -1716,7 +1739,9 @@ impl Space {
                     self.btm.insert(&buf[..], ());
                     trace!(target: "interpret", "interpret took {} ns", start_str);
                 }
-                done < steps
+                let micros = start.elapsed().as_micros() as u64;
+                let cont = on_step(StepInfo { exec: &x[..], touched, new, micros, error });
+                done < steps && cont
             } else {
                 false
             }
