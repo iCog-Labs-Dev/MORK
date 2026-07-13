@@ -36,7 +36,7 @@ pub static ACT_PATH: &'static str = "/dev/shm/";
 // pub static ACT_PATH: &'static str = "/mnt/data/";
 
 pub struct Space {
-    pub btm: PathMap<()>,
+    pub btm: PathMap<u64>,
     pub sm: SharedMappingHandle,
     pub mmaps: HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
     pub z3s: HashMap<OwnedSourceItem, Box<Popen>>,
@@ -263,14 +263,14 @@ impl <'a> ParDataParser<'a> {
     }
 }
 
-pub struct SpaceTranscriber<'a, 'b, 'c> { count: usize, wz: &'c mut WriteZipperUntracked<'a, 'b, ()>, pdp: ParDataParser<'a> }
+pub struct SpaceTranscriber<'a, 'b, 'c> { count: usize, wz: &'c mut WriteZipperUntracked<'a, 'b, u64>, pdp: ParDataParser<'a> }
 impl <'a, 'b, 'c> SpaceTranscriber<'a, 'b, 'c> {
     #[inline(always)] fn write<S : AsRef<[u8]>>(&mut self, s: S) {
         let token = self.pdp.tokenizer(s.as_ref());
         let mut path = vec![item_byte(Tag::SymbolSize(token.len() as u8))];
         path.extend(token);
         self.wz.descend_to(&path[..]);
-        self.wz.set_val(());
+        self.wz.set_val(1u64);
         self.wz.ascend(path.len());
     }
 }
@@ -493,7 +493,7 @@ impl Space {
                     ez.reset();
                     ez.write_arity(a);
                     wz.descend_to(&stack[..total]);
-                    wz.set_value(());
+                    wz.set_value(1u64);
                     wz.reset();
                     i += 1;
                 }
@@ -544,7 +544,7 @@ impl Space {
             }
             let new_data = &buf[..oz.loc];
             wz.descend_to(&new_data[constant_template_prefix.len()..]);
-            wz.set_value(());
+            wz.set_value(1u64);
             wz.reset();
             i += 1;
         }
@@ -696,7 +696,7 @@ impl Space {
                 ez.loc += internal.len() + 1;
             }
             // println!("{}", serialize(ez.span()));
-            unsafe { self.btm.insert(ez.span(), ()); }
+            unsafe {                 self.btm.insert(ez.span(), 1u64); }
             count += 1;
             if count % 1000000 == 0 {
                 println!("{count} triples");
@@ -750,7 +750,7 @@ impl Space {
                         wz.descend_to_byte(item_byte(Tag::SymbolSize(internal_v.len() as _)));
                         wz.descend_to(internal_v);
 
-                        wz.set_value(());
+                    wz.set_value(1u64);
 
                         wz.ascend(internal_v.len() + 1);
                     }
@@ -759,7 +759,7 @@ impl Space {
                     wz.descend_to_byte(item_byte(Tag::SymbolSize(internal_v.len() as _)));
                     wz.descend_to(internal_v);
 
-                    wz.set_value(());
+                    wz.set_value(1u64);
 
                     wz.ascend(internal_v.len() + 1);
                 }
@@ -816,7 +816,7 @@ impl Space {
                 wz.descend_to_byte(item_byte(Tag::SymbolSize(internal_v.len() as _)));
                 wz.descend_to(internal_v);
 
-                wz.set_value(());
+                wz.set_value(1u64);
 
                 wz.ascend(internal_v.len() + 1);
 
@@ -845,7 +845,13 @@ impl Space {
             match parser.sexpr(&mut it, &mut ez) {
                 Ok(()) => {
                     let data = &stack[..ez.loc];
-                    if add { self.btm.insert(data, ()); }
+                    if add {
+                        let zh = self.btm.zipper_head();
+                        if let Ok(mut wz) = zh.write_zipper_at_exclusive_path(data) {
+                            wz.set_val_w(1u64);
+                            zh.cleanup_write_zipper_w(wz);
+                        }
+                    }
                     else { self.btm.remove(data); }
                 }
                 Err(ParserError::InputFinished) => { break }
@@ -856,6 +862,8 @@ impl Space {
         }
         Ok(i)
     }
+
+
 
     pub fn add_sexpr(&mut self, r: &[u8], pattern: Expr, template: Expr) -> Result<usize, String> { self.load_sexpr_impl(r, pattern, template, true) }
     pub fn remove_sexpr(&mut self, r: &[u8], pattern: Expr, template: Expr) -> Result<usize, String> { self.load_sexpr_impl(r, pattern, template, false) }
@@ -881,7 +889,7 @@ impl Space {
                     }
                     let new_data = &buffer[..oz.loc];
                     wz.move_to_path(&new_data[constant_template_prefix.len()..]);
-                    if add { wz.set_val(()); }
+                    if add { wz.set_val(1u64); }
                     else { wz.remove_val(true); }
                     wz.reset();
                 }
@@ -994,7 +1002,7 @@ impl Space {
         let tree = pathmap::arena_compact::ArenaCompactTree::open_mmap(path)?;
         let mut rz = tree.read_zipper();
         while rz.to_next_val() {
-            self.btm.insert(rz.path(), ());
+            self.btm.insert(rz.path(), 1u64);
         }
         Ok(())
     }
@@ -1006,10 +1014,10 @@ impl Space {
 
     pub fn restore_paths<OutDirPath : AsRef<std::path::Path>>(&mut self, path: OutDirPath) -> Result<pathmap::paths_serialization::DeserializationStats, std::io::Error> {
         let mut file = File::open(path).unwrap();
-        pathmap::paths_serialization::deserialize_paths(self.btm.write_zipper(), &mut file, ())
+        pathmap::paths_serialization::deserialize_paths(self.btm.write_zipper(), &mut file, 1u64)
     }
 
-    pub fn query_multi<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
+    pub fn query_multi<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(btm: &PathMap<u64>, pat_expr: Expr, mut effect: F) -> usize {
         let pat_newvars = pat_expr.newvars();
         trace!(target: "query_multi", "pattern (newvars={}) {:?}", pat_newvars, serialize(unsafe { pat_expr.span().as_ref().unwrap() }));
         let n_factors = pat_expr.arity().unwrap() as usize;
@@ -1030,7 +1038,7 @@ impl Space {
     }
 
     #[inline]
-    unsafe fn read_handler<'trie, 'path>(btm: *const PathMap<()>,
+    unsafe fn read_handler<'trie, 'path>(btm: *const PathMap<u64>,
                     mmaps: *mut HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
                     z3s: *mut HashMap<OwnedSourceItem, Box<Popen>>,
                     request: ResourceRequest) -> Resource<'trie, 'path> {
@@ -1044,7 +1052,7 @@ impl Space {
                     ArenaCompactTree::open_mmap(format!("{ACT_PATH}{name}.act")).unwrap()
                 });
                 trace!(target: "query_multi_i", "taking RZ of {}", name);
-                Resource::ACT(act.read_zipper())
+                Resource::ACT(act.read_zipper_u64())
             }
             ResourceRequest::Z3(instance) => {
                 trace!(target: "query_multi_i", "getting z3 instance");
@@ -1081,7 +1089,7 @@ impl Space {
     }
 
     #[inline]
-    unsafe fn write_handler<'w, 'a, 'k>(zh_wzs: (*mut ZipperHead<'w, 'a, ()>, *mut Vec<WriteZipperTracked<'a, 'k, ()>>),
+    unsafe fn write_handler<'w, 'a, 'k>(zh_wzs: (*mut ZipperHead<'w, 'a, u64>, *mut Vec<WriteZipperTracked<'a, 'k, u64>>),
                 mmaps: *mut HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
                 z3s: *mut HashMap<OwnedSourceItem, Box<Popen>>,
                 request: &WriteResourceRequest) -> WriteResource<'w, 'a, 'k> where 'w : 'a {
@@ -1115,7 +1123,7 @@ impl Space {
     pub fn query_multi_i<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(no_source: bool,
             mmaps: &mut HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
             z3s: &mut HashMap<OwnedSourceItem, Box<Popen>>,
-            btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
+            btm: &PathMap<u64>, pat_expr: Expr, mut effect: F) -> usize {
         use crate::sources::{ASource, Resource, ResourceRequest, Source};
 
         let pat_newvars = pat_expr.newvars();
@@ -1341,7 +1349,7 @@ impl Space {
         let mut placements = subsumption.clone();
         let mut read_copy = self.btm.clone();
         let mut zh = self.btm.zipper_head();
-        read_copy.insert(unsafe { add.span().as_ref().unwrap() }, ());
+        read_copy.insert(unsafe { add.span().as_ref().unwrap() }, 1u64);
         let mut template_wzs: Vec<_> = Vec::with_capacity(64);
         template_prefixes.iter().enumerate().for_each(|(i, x)| {
             if subsumption[i] == i {
@@ -1392,7 +1400,7 @@ impl Space {
 
                         trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
                         wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
-                        any_new |= wz.set_val(()).is_none();
+                        any_new |= wz.set_val(1u64).is_none();
                     }
                     true
                 }
@@ -1416,7 +1424,7 @@ impl Space {
         let mut placements = subsumption.clone();
         let mut read_copy = self.btm.clone();
         let mut zh = self.btm.zipper_head();
-        read_copy.insert(unsafe { add.span().as_ref().unwrap() }, ());
+        read_copy.insert(unsafe { add.span().as_ref().unwrap() }, 1u64);
         let mut template_wzs: Vec<_> = Vec::with_capacity(64);
         template_prefixes.iter().enumerate().for_each(|(i, x)| {
             if subsumption[i] == i {
@@ -1466,7 +1474,7 @@ impl Space {
 
                         trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
                         wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
-                        any_new |= wz.set_val(()).is_none();
+                        any_new |= wz.set_val(1u64).is_none();
                     }
                     true
                 }
@@ -1494,11 +1502,11 @@ impl Space {
         let mut placements = subsumption.clone();
         let mut read_copy = self.btm.clone();
         let mut zh = self.btm.zipper_head();
-        let zh_ptr = ((&zh) as *const ZipperHead<()>).cast_mut();
-        read_copy.insert(unsafe { add.span().as_ref().unwrap() }, ());
+        let zh_ptr = ((&zh) as *const ZipperHead<u64>).cast_mut();
+        read_copy.insert(unsafe { add.span().as_ref().unwrap() }, 1u64);
         let mut template_resources: Vec<_> = Vec::with_capacity(64);
         let mut outstanding_wzs = Vec::with_capacity(64);
-        let outstanding_wzs_ptr = ((&outstanding_wzs) as *const Vec<WriteZipperTracked<()>>).cast_mut();
+        let outstanding_wzs_ptr = ((&outstanding_wzs) as *const Vec<WriteZipperTracked<u64>>).cast_mut();
         let acts_ptr = ((&self.mmaps) as *const HashMap<OwnedSourceItem, _>).cast_mut();
         let z3s_ptr = ((&self.z3s) as *const HashMap<OwnedSourceItem, Box<Popen>>).cast_mut();
         template_prefixes.iter().enumerate().for_each(|(i, request)| {
@@ -1580,11 +1588,11 @@ impl Space {
         let mut placements = subsumption.clone();
         let mut read_copy = self.btm.clone();
         let mut zh = self.btm.zipper_head();
-        let zh_ptr = ((&zh) as *const ZipperHead<()>).cast_mut();
-        read_copy.insert(unsafe { add.span().as_ref().unwrap() }, ());
+        let zh_ptr = ((&zh) as *const ZipperHead<u64>).cast_mut();
+        read_copy.insert(unsafe { add.span().as_ref().unwrap() }, 1u64);
         let mut template_resources: Vec<_> = Vec::with_capacity(64);
         let mut outstanding_wzs = Vec::with_capacity(64);
-        let outstanding_wzs_ptr = ((&outstanding_wzs) as *const Vec<WriteZipperTracked<()>>).cast_mut();
+        let outstanding_wzs_ptr = ((&outstanding_wzs) as *const Vec<WriteZipperTracked<u64>>).cast_mut();
         let acts_ptr = ((&self.mmaps) as *const HashMap<OwnedSourceItem, _>).cast_mut();
         let z3s_ptr = ((&self.z3s) as *const HashMap<OwnedSourceItem, Box<Popen>>).cast_mut();
         template_prefixes.iter().enumerate().for_each(|(i, request)| {
@@ -1712,7 +1720,7 @@ impl Space {
                     let done_string = done.to_string();
                     let done_str = done_string.as_str();
                     let buf = mork_expr::construct!("timing" xe done_str start_str).unwrap();
-                    self.btm.insert(&buf[..], ());
+                    self.btm.insert(&buf[..], 1u64);
                     trace!(target: "interpret", "interpret took {} ns", start_str);
                 }
                 done < steps

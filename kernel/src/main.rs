@@ -3231,7 +3231,7 @@ fn sink_wasm_add() {
             e.extend_from_slice(is.as_bytes());
             e.push(item_byte(Tag::SymbolSize(4)));
             e.extend_from_slice(((options.len() as i32)*i + (k as i32)).to_be_bytes().as_slice());
-            s.btm.insert(&e[..], ());
+            s.btm.insert(&e[..], 1u64);
         }
     }
     s.add_all_sexpr(&args[..]).unwrap();
@@ -4664,7 +4664,7 @@ fn json_upaths_smoke() {
     let written = s.json_to_paths(test.as_bytes(), &mut cv).unwrap();
     // println!("{:?}", pathmap::path_serialization::serialize_paths_(btm.read_zipper(), &mut cv));
     println!("written {written}");
-    pathmap::paths_serialization::deserialize_paths(s.btm.write_zipper(), &cv[..], ()).unwrap();
+    pathmap::paths_serialization::deserialize_paths(s.btm.write_zipper(), &cv[..], 1u64).unwrap();
 
     let mut v = vec![];
     s.dump_all_sexpr(&mut v).unwrap();
@@ -5820,6 +5820,19 @@ const SEXPRS0: &str = r#"(first_name John)
 (spouse null)
 "#;
 
+fn weight_basics() {
+    let mut s = Space::new();
+    s.add_all_sexpr(b"(a)(b)").unwrap();
+    let mut v = vec![];
+    s.dump_all_sexpr(&mut v).unwrap();
+    let res = String::from_utf8_lossy_owned(v);
+    assert_eq!(s.btm.val_count(), 2, "should have 2 atoms");
+    let root_rz = s.btm.read_zipper_at_path(&[]);
+    let root_w = root_rz.agg_w();
+    assert_eq!(root_w, 2, "root agg_w should be 2 (2 default weights), got {root_w}");
+    println!("weight basics: 2 atoms, root_agg_w={}", root_w);
+}
+
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 enum Format { MeTTa, JSON, CSV, UPaths, Paths, ACT }
@@ -5977,6 +5990,8 @@ fn main() {
 
             parse_csv();
             parse_json();
+
+            weight_basics();
 
             #[cfg(target_os = "linux")]
             sink_act_readback();
