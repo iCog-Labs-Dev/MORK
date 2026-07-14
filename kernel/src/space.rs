@@ -1797,6 +1797,11 @@ impl Space {
     }
 
     pub fn metta_calculus(&mut self, steps: usize) -> usize {
+        let was_paused = self.was.map.is_some();
+        if was_paused {
+            self.btm = self.was.pause_all();
+        }
+
         let mut done: usize = 0;
         const PREFIX: [u8; 6] = const { [item_byte(Tag::Arity(4)), item_byte(Tag::SymbolSize(4)), b'e', b'x', b'e', b'c' ] };
 
@@ -1825,6 +1830,11 @@ impl Space {
                 false
             }
         } { done += 1 }
+
+        if was_paused {
+            let btm = std::mem::take(&mut self.btm);
+            self.was.resume_all(btm);
+        }
 
         done
     }
@@ -1887,6 +1897,11 @@ impl Drop for Space {
         for (_, z3) in self.z3s.iter_mut() {
             // z3.terminate();
             drop(z3.stdin.take())
+        }
+        if self.was.map.is_some() {
+            if let Some(btm) = self.was.shutdown_all() {
+                self.btm = btm;
+            }
         }
     }
 }

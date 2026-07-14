@@ -5873,6 +5873,22 @@ fn sweep_parser_bogus_type() {
     println!("sweep_parser_bogus_type: engine skipped, no crash");
 }
 
+fn sweep_pause_resume() {
+    let mut s = Space::new();
+    s.add_all_sexpr(b"(sweep (e random_walk) (e decay))").unwrap();
+    let handle = s.sweep();
+    assert!(!handle.is_empty(), "sweep started");
+    assert!(s.was.map.is_some(), "STATE B after sweep");
+    assert_eq!(s.btm.val_count(), 0, "btm emptied in STATE B");
+
+    let _done = s.metta_calculus(100);
+    assert!(s.was.map.is_some(), "STATE B restored after metta_calculus");
+    assert_eq!(s.btm.val_count(), 0, "btm empty in STATE B");
+
+    s.was.shutdown_all();
+    println!("sweep_pause_resume: pause/resume OK");
+}
+
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 enum Format { MeTTa, JSON, CSV, UPaths, Paths, ACT }
@@ -6036,6 +6052,7 @@ fn main() {
             sweep_parser_two_engines();
             sweep_parser_empty();
             sweep_parser_bogus_type();
+            sweep_pause_resume();
 
             #[cfg(target_os = "linux")]
             sink_act_readback();
