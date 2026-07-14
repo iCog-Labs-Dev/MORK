@@ -5833,6 +5833,46 @@ fn weight_basics() {
     println!("weight basics: 2 atoms, root_agg_w={}", root_w);
 }
 
+fn sweep_parser_one_engine() {
+    let mut s = Space::new();
+    s.add_all_sexpr(b"(sweep (imp random_walk) (imp decay))").unwrap();
+    let handle = s.sweep();
+    assert!(!handle.is_empty(), "one sweep handle");
+    assert_eq!(s.was.controllers.len(), 1, "one controller");
+    assert!(s.was.map.is_some(), "STATE B");
+    assert_eq!(s.btm.val_count(), 0, "btm emptied in STATE B");
+    s.was.shutdown_all();
+    println!("sweep_parser_one_engine: 1 controller");
+}
+
+fn sweep_parser_two_engines() {
+    let mut s = Space::new();
+    s.add_all_sexpr(b"(sweep (a random_walk) (b cpq))").unwrap();
+    let handle = s.sweep();
+    assert!(!handle.is_empty(), "one sweep handle for two engines");
+    assert_eq!(s.was.controllers.len(), 1, "one controller for all engines");
+    s.was.shutdown_all();
+    println!("sweep_parser_two_engines: 1 controller");
+}
+
+fn sweep_parser_empty() {
+    let mut s = Space::new();
+    s.add_all_sexpr(b"(a)(b)").unwrap();
+    let handle = s.sweep();
+    assert!(handle.is_empty(), "no sweep atoms");
+    assert!(s.was.map.is_none(), "STATE A unchanged");
+    assert_eq!(s.btm.val_count(), 2, "btm untouched");
+    println!("sweep_parser_empty: no sweep atoms");
+}
+
+fn sweep_parser_bogus_type() {
+    let mut s = Space::new();
+    s.add_all_sexpr(b"(sweep (imp bogus_type))").unwrap();
+    let handle = s.sweep();
+    assert!(handle.is_empty(), "bogus engine type skipped");
+    println!("sweep_parser_bogus_type: engine skipped, no crash");
+}
+
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 enum Format { MeTTa, JSON, CSV, UPaths, Paths, ACT }
@@ -5992,6 +6032,10 @@ fn main() {
             parse_json();
 
             weight_basics();
+            sweep_parser_one_engine();
+            sweep_parser_two_engines();
+            sweep_parser_empty();
+            sweep_parser_bogus_type();
 
             #[cfg(target_os = "linux")]
             sink_act_readback();

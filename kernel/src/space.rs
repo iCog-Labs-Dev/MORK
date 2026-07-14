@@ -21,6 +21,9 @@ use pathmap::utils::{BitMask, ByteMask};
 use pathmap::zipper::*;
 use pathmap::arena_compact::ArenaCompactTree;
 use pathmap::{zipper, PathMap};
+use weighted_atom_sweep::{WeightedAtomSweep, WeightedAtomSweepSettings};
+use weighted_atom_sweep::new_eng_op::{build_operation, build_strategy};
+use weighted_atom_sweep::OperationObserver;
 use mork_frontend::json_parser::Transcriber;
 use log::*;
 use subprocess::{Popen, PopenConfig, Redirection};
@@ -37,6 +40,7 @@ pub static ACT_PATH: &'static str = "/dev/shm/";
 
 pub struct Space {
     pub btm: PathMap<u64>,
+    pub was: WeightedAtomSweep,
     pub sm: SharedMappingHandle,
     pub mmaps: HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
     pub z3s: HashMap<OwnedSourceItem, Box<Popen>>,
@@ -444,7 +448,7 @@ macro_rules! sexpr {
 
 impl Space {
     pub fn new() -> Self {
-        Self { btm: PathMap::new(), sm: SharedMapping::new(), mmaps: HashMap::new(), z3s: HashMap::new(), last_merkleize: Instant::now(), timing: false }
+        Self { btm: PathMap::new(), was: WeightedAtomSweep::new(WeightedAtomSweepSettings::default()), sm: SharedMapping::new(), mmaps: HashMap::new(), z3s: HashMap::new(), last_merkleize: Instant::now(), timing: false }
     }
 
     pub fn parse_sexpr(&mut self, r: &[u8], buf: *mut u8) -> Result<(Expr, usize), ParserError> {
@@ -1697,6 +1701,99 @@ impl Space {
             trace!(target: "interpret", "(run, changed) = {:?}", res);
             return Ok(())
         }, _err => return Err("exec shape (exec <loc> <patterns> <templates>)"))
+    }
+
+    pub fn sweep(&mut self) -> String {
+        let mut groups: HashMap<String, (String, Vec<(String, Vec<Vec<u8>>)>)> = HashMap::new();
+
+        {
+            let mut rz = self.btm.read_zipper();
+            while rz.to_next_val() {
+                let path = rz.path();
+                if path.len() < 7 { continue; }
+                if !matches!(byte_item(path[0]), Tag::Arity(_)) { continue; }
+                if byte_item(path[1]) != Tag::SymbolSize(5) { continue; }
+                if &path[2..7] != b"sweep" { continue; }
+
+                let mut i = 7;
+                while i < path.len() {
+                    let tuple_arity = match byte_item(path[i]) {
+                        Tag::Arity(a) => { i += 1; a }
+                        _ => break,
+                    };
+                    if i >= path.len() { break; }
+                    let name = match byte_item(path[i]) {
+                        Tag::SymbolSize(sz) => {
+                            i += 1;
+                            if i + sz as usize > path.len() { break; }
+                            let s = std::str::from_utf8(&path[i..i + sz as usize]).unwrap_or("").to_string();
+                            i += sz as usize;
+                            s
+                        }
+                        _ => break,
+                    };
+                    if i >= path.len() { break; }
+                    let typ = match byte_item(path[i]) {
+                        Tag::SymbolSize(sz) => {
+                            i += 1;
+                            if i + sz as usize > path.len() { break; }
+                            let s = std::str::from_utf8(&path[i..i + sz as usize]).unwrap_or("").to_string();
+                            i += sz as usize;
+                            s
+                        }
+                        _ => break,
+                    };
+                    let mut args: Vec<Vec<u8>> = Vec::new();
+                    for _ in 2..tuple_arity {
+                        if i >= path.len() { break; }
+                        match byte_item(path[i]) {
+                            Tag::SymbolSize(sz) => {
+                                i += 1;
+                                if i + sz as usize > path.len() { break; }
+                                args.push(path[i..i + sz as usize].to_vec());
+                                i += sz as usize;
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    let entry = groups.entry(name.clone()).or_insert_with(|| (String::new(), Vec::new()));
+                    if entry.0.is_empty() {
+                        entry.0 = typ;
+                    } else {
+                        entry.1.push((typ, args));
+                    }
+                }
+            }
+        }
+
+        if groups.is_empty() { return String::new(); }
+
+        let valid_groups: Vec<(String, (String, Vec<(String, Vec<Vec<u8>>)>))> = groups.into_iter().filter(|(_, (et, _))| {
+            if build_strategy(et).is_none() {
+                warn!("unknown engine type '{}', skipping", et);
+                false
+            } else {
+                true
+            }
+        }).collect();
+
+        if valid_groups.is_empty() { return String::new(); }
+
+        self.was.take_trie(std::mem::take(&mut self.btm));
+
+        for (engine_name, (engine_type, ops)) in &valid_groups {
+            let process = self.was.add_engine(engine_name, engine_type);
+            for (op_type, op_args) in ops {
+                let args_refs: Vec<&[u8]> = op_args.iter().map(|a| &a[..]).collect();
+                if let Some(op) = build_operation(op_type, &args_refs) {
+                    process.subscribe(op);
+                } else {
+                    warn!("unknown op type '{}' for engine '{}', skipping", op_type, engine_name);
+                }
+            }
+        }
+        self.was.spawn()
     }
 
     pub fn metta_calculus(&mut self, steps: usize) -> usize {
