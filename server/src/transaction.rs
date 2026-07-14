@@ -21,7 +21,6 @@ pub struct Transaction {
     pub reply: tokio::sync::oneshot::Sender<Result<TxOk, String>>,
 }
 
-#[derive(Clone, serde::Serialize)]
 pub struct TxOk {
     pub tx: TxId,
     pub count: usize,

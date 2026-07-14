@@ -64,7 +64,6 @@ fn main() {
 
         let listener = TcpListener::bind(&args.addr).await
             .unwrap_or_else(|e| panic!("failed to bind {}: {e}", args.addr));
-        log::info!("mork-server listening on http://{}", args.addr);
         println!("mork-server listening on http://{}", args.addr);
 
         loop {

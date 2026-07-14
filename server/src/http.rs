@@ -106,10 +106,7 @@ fn percent_decode(s: &str) -> Option<String> {
     while i < b.len() {
         match b[i] {
             b'%' => {
-                let hex = b.get(i + 1..i + 3)?;
-                let hi = (hex[0] as char).to_digit(16)?;
-                let lo = (hex[1] as char).to_digit(16)?;
-                out.push((hi * 16 + lo) as u8);
+                out.push(u8::from_str_radix(std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?, 16).ok()?);
                 i += 3;
             }
             b'+' => { out.push(b' '); i += 1; }
