@@ -5,7 +5,7 @@ use mork::space::{transitions, unifications, writes, Space, ACT_PATH};
 use mork_frontend::bytestring_parser::Parser;
 use mork_expr::{item_byte, serialize, SourceItem, Tag};
 use pathmap::PathMap;
-use pathmap::zipper::{Zipper, ZipperAbsolutePath, ZipperIteration, ZipperMoving};
+use pathmap::zipper::{Zipper, ZipperAbsolutePath, ZipperIteration, ZipperMoving, ZipperValues};
 use std::collections::{BTreeSet, HashSet};
 use std::time::Instant;
 use std::ffi::OsStr;
@@ -5823,14 +5823,37 @@ const SEXPRS0: &str = r#"(first_name John)
 fn weight_basics() {
     let mut s = Space::new();
     s.add_all_sexpr(b"(a)(b)").unwrap();
-    let mut v = vec![];
-    s.dump_all_sexpr(&mut v).unwrap();
-    let res = String::from_utf8_lossy_owned(v);
     assert_eq!(s.btm.val_count(), 2, "should have 2 atoms");
-    let root_rz = s.btm.read_zipper_at_path(&[]);
-    let root_w = root_rz.agg_w();
+    let root_w = s.btm.read_zipper_at_path(&[]).agg_w();
     assert_eq!(root_w, 2, "root agg_w should be 2 (2 default weights), got {root_w}");
-    println!("weight basics: 2 atoms, root_agg_w={}", root_w);
+    println!("weight basics: default weight 1, root_agg_w={}", root_w);
+}
+
+fn weight_explicit() {
+    let mut s = Space::new();
+    s.add_all_sexpr(b"(x (# 100))(y (# 200))(z)").unwrap();
+    assert_eq!(s.btm.val_count(), 3, "should have 3 atoms");
+    let root_w = s.btm.read_zipper_at_path(&[]).agg_w();
+    assert_eq!(root_w, 301, "root agg_w should be 100+200+1=301, got {root_w}");
+
+    // (# N) marker is NOT stored as part of the expression path or dump output
+    let mut dumped = vec![];
+    s.dump_all_sexpr(&mut dumped).unwrap();
+    let text = String::from_utf8_lossy_owned(dumped);
+    assert!(!text.contains('#'), "(# N) marker must not appear in dumped output: {text}");
+    assert!(text.contains("(x)"), "dumped output must include (x)");
+    assert!(text.contains("(y)"), "dumped output must include (y)");
+    assert!(text.contains("(z)"), "dumped output must include (z)");
+
+    // Verify individual atom weights via the zipper
+    let mut rz = s.btm.read_zipper();
+    let mut weight_sum = 0u64;
+    while rz.to_next_val() {
+        weight_sum += rz.val().copied().unwrap_or(0);
+    }
+    assert_eq!(weight_sum, 301, "sum of individual weights should equal root agg_w");
+
+    println!("weight explicit: 3 atoms with varied weights, root_agg_w={}", root_w);
 }
 
 fn sweep_parser_one_engine() {
@@ -6048,6 +6071,7 @@ fn main() {
             parse_json();
 
             weight_basics();
+            weight_explicit();
             sweep_parser_one_engine();
             sweep_parser_two_engines();
             sweep_parser_empty();

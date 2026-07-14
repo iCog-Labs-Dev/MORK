@@ -455,7 +455,7 @@ impl Space {
         let mut it = Context::new(r);
         let mut parser = ParDataParser::new(&self.sm);
         let mut ez = ExprZipper::new(Expr{ ptr: buf });
-        parser.sexpr(&mut it, &mut ez).map(|_| (Expr{ ptr: buf }, ez.loc))
+        parser.sexpr(&mut it, &mut ez).map(|(len, _weight)| (Expr{ ptr: buf }, len))
     }
 
     /// Remy :I want to really discourage the use of this method, it needs to be exposed if we want to use the debugging macros `expr` and `sexpr` without giving acces directly to the field
@@ -847,12 +847,12 @@ impl Space {
         loop {
             let mut ez = ExprZipper::new(Expr{ptr: stack.as_mut_ptr()});
             match parser.sexpr(&mut it, &mut ez) {
-                Ok(()) => {
-                    let data = &stack[..ez.loc];
+                Ok((len, weight)) => {
+                    let data = &stack[..len];
                     if add {
                         let zh = self.btm.zipper_head();
                         if let Ok(mut wz) = zh.write_zipper_at_exclusive_path(data) {
-                            wz.set_val_w(1u64);
+                            wz.set_val_w(weight);
                             zh.cleanup_write_zipper_w(wz);
                         }
                     }
@@ -884,8 +884,8 @@ impl Space {
         loop {
             let mut ez = ExprZipper::new(Expr{ptr: stack.as_mut_ptr()});
             match parser.sexpr(&mut it, &mut ez) {
-                Ok(()) => {
-                    let data = &stack[..ez.loc];
+                Ok((len, weight)) => {
+                    let data = &stack[..len];
                     let mut oz = ExprZipper::new(Expr{ ptr: buffer.as_ptr().cast_mut() });
                     match (Expr{ ptr: data.as_ptr().cast_mut() }.transformData(pattern, template, &mut oz)) {
                         Ok(()) => {}
@@ -893,7 +893,7 @@ impl Space {
                     }
                     let new_data = &buffer[..oz.loc];
                     wz.move_to_path(&new_data[constant_template_prefix.len()..]);
-                    if add { wz.set_val(1u64); }
+                    if add { wz.set_val(weight); }
                     else { wz.remove_val(true); }
                     wz.reset();
                 }
