@@ -1703,48 +1703,77 @@ impl Space {
         }, _err => return Err("exec shape (exec <loc> <patterns> <templates>)"))
     }
 
-    pub fn sweep(&mut self) -> String {
-        let mut groups: HashMap<String, (String, Vec<(String, Vec<Vec<u8>>)>)> = HashMap::new();
+    /// Parse a single `(sweep engineName (e type) (o op args...) ...)` from raw path bytes.
+    /// Returns (engine_name, engine_type, operations) on success, None on parse failure.
+    fn parse_sweep_atom(path: &[u8]) -> Option<(String, String, Vec<(String, Vec<Vec<u8>>)>)> {
+        if path.len() < 7 { return None; }
+        if !matches!(byte_item(path[0]), Tag::Arity(_)) { return None; }
+        if byte_item(path[1]) != Tag::SymbolSize(5) { return None; }
+        if &path[2..7] != b"sweep" { return None; }
 
-        {
-            let mut rz = self.btm.read_zipper();
-            while rz.to_next_val() {
-                let path = rz.path();
-                if path.len() < 7 { continue; }
-                if !matches!(byte_item(path[0]), Tag::Arity(_)) { continue; }
-                if byte_item(path[1]) != Tag::SymbolSize(5) { continue; }
-                if &path[2..7] != b"sweep" { continue; }
+        let mut i = 7;
+        // engine name: SymbolSize(L) + L bytes
+        let engine_name = match byte_item(path[i]) {
+            Tag::SymbolSize(sz) => {
+                i += 1;
+                if i + sz as usize > path.len() { return None; }
+                let s = std::str::from_utf8(&path[i..i + sz as usize]).ok()?.to_string();
+                i += sz as usize;
+                s
+            }
+            _ => return None,
+        };
 
-                let mut i = 7;
-                while i < path.len() {
-                    let tuple_arity = match byte_item(path[i]) {
-                        Tag::Arity(a) => { i += 1; a }
-                        _ => break,
-                    };
+        let mut engine_type = String::new();
+        let mut ops: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
+
+        while i < path.len() {
+            // each tuple: Arity(N) + first-child symbol tag + data ...
+            let arity = match byte_item(path[i]) {
+                Tag::Arity(a) => { i += 1; a }
+                _ => break,
+            };
+            if i >= path.len() { break; }
+            let tag = match byte_item(path[i]) {
+                Tag::SymbolSize(sz) => {
+                    i += 1;
+                    if i + sz as usize > path.len() { break; }
+                    let t = &path[i..i + sz as usize];
+                    i += sz as usize;
+                    t.to_vec()
+                }
+                _ => break,
+            };
+            match &tag[..] {
+                b"e" => {
+                    // (e <engine-type>) — engine definition
                     if i >= path.len() { break; }
-                    let name = match byte_item(path[i]) {
+                    engine_type = match byte_item(path[i]) {
                         Tag::SymbolSize(sz) => {
                             i += 1;
                             if i + sz as usize > path.len() { break; }
-                            let s = std::str::from_utf8(&path[i..i + sz as usize]).unwrap_or("").to_string();
+                            let s = std::str::from_utf8(&path[i..i + sz as usize]).ok()?.to_string();
                             i += sz as usize;
                             s
                         }
                         _ => break,
                     };
+                }
+                b"o" => {
+                    // (o <op-type> [args...]) — single operation
                     if i >= path.len() { break; }
-                    let typ = match byte_item(path[i]) {
+                    let op_type = match byte_item(path[i]) {
                         Tag::SymbolSize(sz) => {
                             i += 1;
                             if i + sz as usize > path.len() { break; }
-                            let s = std::str::from_utf8(&path[i..i + sz as usize]).unwrap_or("").to_string();
+                            let s = std::str::from_utf8(&path[i..i + sz as usize]).ok()?.to_string();
                             i += sz as usize;
                             s
                         }
                         _ => break,
                     };
                     let mut args: Vec<Vec<u8>> = Vec::new();
-                    for _ in 2..tuple_arity {
+                    for _ in 2..arity {
                         if i >= path.len() { break; }
                         match byte_item(path[i]) {
                             Tag::SymbolSize(sz) => {
@@ -1756,13 +1785,59 @@ impl Space {
                             _ => break,
                         }
                     }
-
-                    let entry = groups.entry(name.clone()).or_insert_with(|| (String::new(), Vec::new()));
-                    if entry.0.is_empty() {
-                        entry.0 = typ;
-                    } else {
-                        entry.1.push((typ, args));
+                    ops.push((op_type, args));
+                }
+                b"," => {
+                    // (, (op1 args...) (op2 args...) ...) — multiple operations grouped
+                    for _ in 1..arity {
+                        if i >= path.len() { break; }
+                        let op_arity = match byte_item(path[i]) {
+                            Tag::Arity(a) => { i += 1; a }
+                            _ => break,
+                        };
+                        if i >= path.len() { break; }
+                        let op_type = match byte_item(path[i]) {
+                            Tag::SymbolSize(sz) => {
+                                i += 1;
+                                if i + sz as usize > path.len() { break; }
+                                let s = std::str::from_utf8(&path[i..i + sz as usize]).ok()?.to_string();
+                                i += sz as usize;
+                                s
+                            }
+                            _ => break,
+                        };
+                        let mut args: Vec<Vec<u8>> = Vec::new();
+                        for _ in 1..op_arity {
+                            if i >= path.len() { break; }
+                            match byte_item(path[i]) {
+                                Tag::SymbolSize(sz) => {
+                                    i += 1;
+                                    if i + sz as usize > path.len() { break; }
+                                    args.push(path[i..i + sz as usize].to_vec());
+                                    i += sz as usize;
+                                }
+                                _ => break,
+                            }
+                        }
+                        ops.push((op_type, args));
                     }
+                }
+                _ => break,
+            }
+        }
+
+        if engine_type.is_empty() { None } else { Some((engine_name, engine_type, ops)) }
+    }
+
+    pub fn sweep(&mut self) -> String {
+        let mut groups: HashMap<String, (String, Vec<(String, Vec<Vec<u8>>)>)> = HashMap::new();
+
+        {
+            let mut rz = self.btm.read_zipper();
+            while rz.to_next_val() {
+                let path = rz.path();
+                if let Some((name, etype, ops)) = Self::parse_sweep_atom(path) {
+                    groups.insert(name, (etype, ops));
                 }
             }
         }

@@ -5858,7 +5858,7 @@ fn weight_explicit() {
 
 fn sweep_parser_one_engine() {
     let mut s = Space::new();
-    s.add_all_sexpr(b"(sweep (imp random_walk) (imp decay))").unwrap();
+    s.add_all_sexpr(b"(sweep imp (e random_walk) (o decay))").unwrap();
     let handle = s.sweep();
     assert!(!handle.is_empty(), "one sweep handle");
     assert_eq!(s.was.controllers.len(), 1, "one controller");
@@ -5870,7 +5870,7 @@ fn sweep_parser_one_engine() {
 
 fn sweep_parser_two_engines() {
     let mut s = Space::new();
-    s.add_all_sexpr(b"(sweep (a random_walk) (b cpq))").unwrap();
+    s.add_all_sexpr(b"(sweep a (e random_walk))(sweep b (e cpq))").unwrap();
     let handle = s.sweep();
     assert!(!handle.is_empty(), "one sweep handle for two engines");
     assert_eq!(s.was.controllers.len(), 1, "one controller for all engines");
@@ -5890,7 +5890,7 @@ fn sweep_parser_empty() {
 
 fn sweep_parser_bogus_type() {
     let mut s = Space::new();
-    s.add_all_sexpr(b"(sweep (imp bogus_type))").unwrap();
+    s.add_all_sexpr(b"(sweep imp (e bogus_type))").unwrap();
     let handle = s.sweep();
     assert!(handle.is_empty(), "bogus engine type skipped");
     println!("sweep_parser_bogus_type: engine skipped, no crash");
@@ -5898,7 +5898,7 @@ fn sweep_parser_bogus_type() {
 
 fn sweep_pause_resume() {
     let mut s = Space::new();
-    s.add_all_sexpr(b"(sweep (e random_walk) (e decay))").unwrap();
+    s.add_all_sexpr(b"(sweep e (e random_walk) (o decay))").unwrap();
     let handle = s.sweep();
     assert!(!handle.is_empty(), "sweep started");
     assert!(s.was.map.is_some(), "STATE B after sweep");
