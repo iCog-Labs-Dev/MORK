@@ -1,0 +1,5 @@
+{
+    "pattern": "[2] petri [3] ! result $",
+    "template": "_1",
+    "expected": ["(S (S (S (S Z))))"]
+}

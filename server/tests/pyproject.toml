@@ -1,0 +1,35 @@
+[project]
+name = "mork-server-tests"
+version = "0.1.0"
+description = "Black-box e2e, regression, and load tests for mork-server"
+requires-python = ">=3.13"
+dependencies = [
+    "locust>=2.32",
+    "pytest>=8.3",
+    "requests>=2.32",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.14",
+    "ruff>=0.9",
+    "types-requests>=2.32",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+extend-select = ["I", "UP", "B"]
+
+[tool.mypy]
+strict = true
+files = ["."]
