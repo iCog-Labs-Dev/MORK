@@ -186,3 +186,38 @@ slightly stale but always consistent view. To coordinate, compare the `version` 
   from the same namespace, or restart the server (no persistence yet).
 - **Roadmap** (not yet implemented): WAL crash recovery, then MVCC snapshots/isolation,
   then parallel execution of write-disjoint execs.
+
+## Testing
+
+Black-box Python suite in [`tests/`](tests/) (managed by `uv`; pinned Python 3.13) plus the
+Rust unit tests:
+
+```sh
+cargo +nightly test -p mork-server        # Rust unit tests (wrap.rs)
+
+cd server/tests
+uv sync                                   # one-time env setup
+uv run pytest                             # e2e + regression (builds & spawns the server itself)
+uv run ruff check . && uv run ruff format --check . && uv run mypy .   # style + types
+```
+
+Regression cases are golden files: drop `<name>.metta` + `<name>.check` (JSON with
+`pattern`, `template`, `expected` lines) into `examples/` and pytest picks them up.
+
+Load testing (locust) targets a manually started server:
+
+```sh
+cargo +nightly run --release -p mork-server &
+cd server/tests
+uv run locust --headless -u 50 -r 10 -t 60s --host http://127.0.0.1:8081
+uv run locust --host http://127.0.0.1:8081        # or: web UI at :8089
+```
+
+Scenarios (each submitter subscribes to `/events` before acting and waits for its own
+`quiescent`, reported as a per-workload `quiesce [...]` stat): compute users mixing cheap
+one-step relays with multi-step petri-calculus adders on random operands (results verified
+via `/export` after quiescent), bulk telemetry ingesters, equi-join users that check the
+joined row count, analysts picking `/export` queries at random against the COW snapshots,
+and a watcher that reports `lagged` events as failures (backpressure signal). The space
+grows monotonically under load (no isolation/GC yet), so RSS growth is by design — watch
+it, don't assert on it.
