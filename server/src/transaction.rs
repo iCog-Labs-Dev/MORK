@@ -49,9 +49,15 @@ pub enum Event {
     /// two consecutively observed snapshots, computed off the engine thread via PathMap
     /// `subtract`. Under load several steps may coalesce into one delta.
     Delta { version: u64, added: Vec<String>, removed: Vec<String> },
-    /// The transaction was rolled back — a failed load or a failing exec. The space is
-    /// exactly as if the transaction never happened.
+    /// The transaction was rolled back — a failed load, a failing exec, or budget
+    /// exhaustion under `--budget-action abort`. The space is exactly as if the
+    /// transaction never happened.
     Abort { tx: TxId, reason: String, version: u64 },
+    /// The transaction exhausted its step budget under `--budget-action commit` (the
+    /// default): partial progress is kept, and every still-pending `(exec …)` was parked
+    /// as inert `(paused (exec …))` data — inspect or resume via /export and a new
+    /// transaction.
+    Budget { tx: TxId, steps: u64, version: u64 },
 }
 
 impl Event {
@@ -63,6 +69,7 @@ impl Event {
             Event::Idle { .. } => "idle",
             Event::Delta { .. } => "delta",
             Event::Abort { .. } => "abort",
+            Event::Budget { .. } => "budget",
         }
     }
 
@@ -75,6 +82,7 @@ impl Event {
             Event::Idle { version } => json!({"version": version}),
             Event::Delta { version, added, removed } => json!({"version": version, "added": added, "removed": removed}),
             Event::Abort { tx, reason, version } => json!({"tx": tx, "reason": reason, "version": version}),
+            Event::Budget { tx, steps, version } => json!({"tx": tx, "steps": steps, "version": version}),
         }
     }
 
@@ -83,7 +91,7 @@ impl Event {
     pub fn tx_id(&self) -> Option<&str> {
         match self {
             Event::Tx { tx, .. } | Event::Step { tx, .. } | Event::Quiescent { tx, .. }
-            | Event::Abort { tx, .. } => Some(tx),
+            | Event::Abort { tx, .. } | Event::Budget { tx, .. } => Some(tx),
             Event::Idle { .. } | Event::Delta { .. } => None,
         }
     }

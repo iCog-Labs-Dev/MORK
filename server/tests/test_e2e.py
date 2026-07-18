@@ -105,6 +105,43 @@ def test_exec_error_aborts_whole_transaction(server: MorkClient) -> None:
     assert "(alive 1)" in server.export()
 
 
+# A diverging program: the exec re-creates itself each step (its own code is stored as
+# data and re-emitted via $p), bumping (n …) forever. Only a step budget stops it.
+DIVERGING = """(n z)
+(prog (exec go (, (prog $p) (n $t)) (, (prog $p) (n (s $t)) $p)))
+(exec go (, (prog $p) (n $t)) (, (prog $p) (n (s $t)) $p))"""
+
+
+@pytest.mark.parametrize("server", [["--step-budget", "5"]], indirect=True)
+def test_budget_commit_keeps_partial_progress(server: MorkClient) -> None:
+    """Default budget action: partial results stay, pending execs are parked as inert
+    (paused ...) data, and the server moves on to the next transaction."""
+    with server.events() as stream:
+        res = server.run(DIVERGING)
+        ev = stream.wait_for("budget", tx=res.tx)
+        assert ev.data["steps"] == 5
+    out = server.export()
+    assert "(n (s z))" in out                      # partial progress kept
+    assert any(line.startswith("(paused ") for line in out)   # continuation parked
+    assert not any(line.startswith("(exec ") for line in out) # nothing left steppable
+    # the queue is unblocked: a following tx runs to quiescence normally
+    with server.events() as stream:
+        ok = server.run("(alive 1)")
+        stream.wait_for("quiescent", tx=ok.tx)
+
+
+@pytest.mark.parametrize(
+    "server", [["--step-budget", "5", "--budget-action", "abort"]], indirect=True
+)
+def test_budget_abort_rolls_back(server: MorkClient) -> None:
+    with server.events() as stream:
+        res = server.run(DIVERGING)
+        ev = stream.wait_for("abort", tx=res.tx)
+        assert "budget" in ev.data["reason"]
+    out = server.export()
+    assert not any("(n " in line or "prog" in line for line in out)  # no trace at all
+
+
 def test_deltas_stream_added_expressions(server: MorkClient) -> None:
     with server.events(deltas=True) as stream:
         server.run("(delta-fact 42)")

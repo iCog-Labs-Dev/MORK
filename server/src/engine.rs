@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use mork::space::Space;
+use mork_expr::Expr;
 use mork_interning::SharedMappingHandle;
 use pathmap::PathMap;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -21,9 +22,24 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::transaction::{Event, ReadSnapshot, Transaction, TxId, TxOk};
 use crate::wrap;
 
+/// What happens when a transaction exhausts its step budget.
+#[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
+pub enum BudgetAction {
+    /// Keep partial progress; park still-pending execs as inert `(paused …)` data.
+    Commit,
+    /// Roll the whole transaction back, as if it never happened.
+    Abort,
+}
+
+pub struct EngineConfig {
+    pub step_budget: u64,
+    pub budget_action: BudgetAction,
+}
+
 pub fn spawn_engine(
     events: broadcast::Sender<Event>,
     active: Arc<Mutex<HashSet<TxId>>>,
+    cfg: EngineConfig,
 ) -> (mpsc::Sender<Transaction>, watch::Receiver<Arc<ReadSnapshot>>, std::thread::JoinHandle<()>) {
     let (tx_send, rx) = mpsc::channel::<Transaction>(1024);
     let (snap_tx, snap_rx) = watch::channel(Arc::new(ReadSnapshot::empty()));
@@ -33,7 +49,7 @@ pub fn spawn_engine(
         // level; deeply nested expressions like (S (S … Z)) overflow the 2 MB default.
         // Linux commits stack pages lazily, so a large reservation costs nothing up front.
         .stack_size(512 * 1024 * 1024)
-        .spawn(move || run(rx, snap_tx, events, active))
+        .spawn(move || run(rx, snap_tx, events, active, cfg))
         .expect("failed to spawn engine thread");
     (tx_send, snap_rx, handle)
 }
@@ -43,6 +59,7 @@ fn run(
     snap_tx: watch::Sender<Arc<ReadSnapshot>>,
     events: broadcast::Sender<Event>,
     active: Arc<Mutex<HashSet<TxId>>>,
+    cfg: EngineConfig,
 ) {
     let mut space = Space::new(); // created HERE: Space is !Send
     let mut version: u64 = 0;
@@ -53,7 +70,7 @@ fn run(
         // space and the queue are empty.
         match rx.try_recv() {
             Ok(t) => {
-                run_tx(&mut space, t, &mut version, &snap_tx, &events, &active);
+                run_tx(&mut space, t, &mut version, &snap_tx, &events, &active, &cfg);
                 continue;
             }
             Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -61,7 +78,7 @@ fn run(
         }
         let _ = events.send(Event::Idle { version });
         match rx.blocking_recv() {
-            Some(t) => run_tx(&mut space, t, &mut version, &snap_tx, &events, &active),
+            Some(t) => run_tx(&mut space, t, &mut version, &snap_tx, &events, &active, &cfg),
             None => break,
         }
     }
@@ -88,6 +105,7 @@ fn run_tx(
     snap_tx: &watch::Sender<Arc<ReadSnapshot>>,
     events: &broadcast::Sender<Event>,
     active: &Arc<Mutex<HashSet<TxId>>>,
+    cfg: &EngineConfig,
 ) {
     let undo = space.btm.clone();
 
@@ -110,9 +128,30 @@ fn run_tx(
         }
     }
 
+    let mut steps: u64 = 0;
     loop {
+        if steps >= cfg.step_budget {
+            match cfg.budget_action {
+                BudgetAction::Commit => {
+                    if let Err(e) = pause_pending_execs(space) {
+                        log::error!("parking execs after budget exhaustion: {e}");
+                    }
+                    *version += 1;
+                    publish(snap_tx, space, *version);
+                    let _ = events.send(Event::Budget { tx: t.id.clone(), steps, version: *version });
+                }
+                BudgetAction::Abort => {
+                    space.btm = undo;
+                    *version += 1;
+                    publish(snap_tx, space, *version);
+                    let reason = format!("step budget exhausted ({steps} steps)");
+                    let _ = events.send(Event::Abort { tx: t.id.clone(), reason, version: *version });
+                }
+            }
+            break;
+        }
         match step_once(space, &t.id, version, snap_tx, events) {
-            StepOutcome::Stepped => {}
+            StepOutcome::Stepped => steps += 1,
             StepOutcome::Done => {
                 let _ = events.send(Event::Quiescent { tx: t.id.clone(), version: *version });
                 break;
@@ -129,6 +168,41 @@ fn run_tx(
         }
     }
     active.lock().unwrap().remove(&t.id);
+}
+
+/// Budget action `commit`: quiesce by force. Every still-pending `(exec …)` — all of them
+/// belong to the running transaction, because the space is fully drained between
+/// transactions — is re-rooted as inert `(paused (exec …))` data. Partial progress stays,
+/// nothing is left steppable (so a later transaction's stray fallback can't resume it
+/// under the wrong atomic scope), and clients can inspect or explicitly resume the parked
+/// continuations via /export and a follow-up transaction.
+///
+/// Text roundtrip on purpose: the kernel dump prints variables as `$a`, `$b`, … and the
+/// loader re-reads them by name into identical de Bruijn structure, so remove + re-add is
+/// exact. Leftover-exec counts at budget stop are small (the program's frontier).
+fn pause_pending_execs(space: &mut Space) -> Result<(), String> {
+    let mut pat = crate::read::parse_expr_bytes("[4] exec $ $ $", &space.sm)?;
+    let mut idt = crate::read::parse_expr_bytes("[4] exec _1 _2 _3", &space.sm)?;
+    let mut out = Vec::new();
+    Space::dump_sexpr_from(
+        &space.btm,
+        &space.sm,
+        Expr { ptr: pat.as_mut_ptr() },
+        Expr { ptr: idt.as_mut_ptr() },
+        &mut out,
+    );
+    if out.is_empty() {
+        return Ok(());
+    }
+    let execs = String::from_utf8_lossy(&out).into_owned();
+    let paused: String = execs
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| format!("(paused {l})\n"))
+        .collect();
+    space.remove_all_sexpr(execs.as_bytes())?;
+    space.add_all_sexpr(paused.as_bytes())?;
+    Ok(())
 }
 
 enum StepOutcome {

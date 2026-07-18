@@ -13,7 +13,7 @@ use crate::wrap;
 
 /// Parse a bracket-notation expression into owned expression bytes (kept alive by the
 /// returned Vec; build an `Expr` over `.as_mut_ptr()` at the use site).
-fn parse_expr_bytes(text: &str, sm: &SharedMappingHandle) -> Result<Vec<u8>, String> {
+pub(crate) fn parse_expr_bytes(text: &str, sm: &SharedMappingHandle) -> Result<Vec<u8>, String> {
     if text.len() > 2048 { return Err("expression too long (max 2048 bytes)".into()) }
     let parsed = std::panic::catch_unwind(|| mork_expr::parse::<4096>(text))
         .map_err(|_| format!("failed to parse expression: {text:?}"))?;

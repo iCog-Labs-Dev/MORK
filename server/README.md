@@ -21,6 +21,8 @@ cargo +nightly run --release -p mork-server -- --addr 127.0.0.1:8081
 |---|---|---|
 | `--addr` | `127.0.0.1:8081` | Listen address |
 | `--events-buffer` | `4096` | Per-subscriber event buffer; slower clients get `lagged` events instead of back-pressuring the engine |
+| `--step-budget` | `1000000` | Max VM steps one transaction may run; bounds how long a transaction can hold the (sequential) engine |
+| `--budget-action` | `commit` | On budget exhaustion: `commit` keeps partial progress and parks pending execs as `(paused …)` data; `abort` rolls the whole transaction back |
 
 Logging via `env_logger`: `RUST_LOG=info cargo +nightly run -p mork-server`.
 Stop with Ctrl-C (open connections are closed, the engine thread is joined).
@@ -58,7 +60,8 @@ curl 'http://127.0.0.1:8081/export?pattern=%5B2%5D%20petri%20%5B3%5D%20%21%20res
   order: the running transaction steps to quiescence before the next queued one is even
   applied. (This is what makes atomic rollback sound — nothing else runs in between that
   could observe reverted state.) *Within* your transaction, execs run in plain trie order
-  over your locs — your program's own inference control is untouched.
+  over your locs — your program's own inference control is untouched. A transaction holds
+  the engine for at most `--step-budget` steps (see the flags table).
 - **Serial writes, parallel reads.** All mutation happens on one engine thread, one step at
   a time (interleaving is turn-taking, never concurrent writes). Reads (`/export`) and the
   event stream are served in parallel from copy-on-write snapshots and never block on, or
@@ -139,7 +142,8 @@ client can totally order what it observes.
 | `quiescent` | `{tx, version}` | **Per-transaction**: `tx` committed — nothing steppable left; its effects are permanent. The next queued transaction, if any, starts after this |
 | `idle` | `{version}` | **Global**: nothing steppable and nothing queued; the engine is parked awaiting transactions |
 | `delta` | `{version, added, removed}` | Opt-in snapshot diff: expressions added/removed between two consecutively observed snapshots (arrays of s-expression strings). Computed off the engine thread with PathMap set algebra; under load several steps may coalesce into one delta |
-| `abort` | `{tx, reason, version}` | The transaction was **rolled back** (failed load or a rejected exec): the space is exactly as if it never happened |
+| `abort` | `{tx, reason, version}` | The transaction was **rolled back** (failed load, rejected exec, or budget exhaustion under `--budget-action abort`): the space is exactly as if it never happened |
+| `budget` | `{tx, steps, version}` | The transaction hit `--step-budget` under `--budget-action commit`: partial progress is kept, still-pending execs are parked as inert `(paused (exec …))` data — inspect via `/export`, resume with a follow-up transaction that rewrites them back to `(exec …)` |
 | `lagged` | `{skipped}` | *You* consumed too slowly and missed `skipped` events (buffer overrun). Re-sync with `/export`; the engine was never slowed down |
 
 Typical lifecycle of one transaction on the stream:
@@ -189,12 +193,12 @@ slightly stale but always consistent view. To coordinate, compare the `version` 
 - **Deep nesting**: expression machinery recurses per nesting level; the engine thread
   reserves a 512 MB stack (lazily committed) and tokio threads 64 MB, so deeply nested
   terms like a 400-deep `(S (S … Z))` are fine.
-- **Runaway programs**: a program whose continuations never stop runs forever — and since
-  scheduling is sequential it blocks every queued transaction behind it (a cancellation
-  transaction can't run either). Until the per-transaction step budget lands (next on the
-  roadmap), the only remedy is restarting the server (no persistence yet).
-- **Roadmap** (not yet implemented): per-transaction step budget, WAL crash recovery,
-  then MVCC snapshots/isolation, then parallel execution of write-disjoint execs.
+- **Runaway programs**: a program whose continuations never stop can't wedge the queue —
+  after `--step-budget` steps it is either quiesced by force (`commit`: results kept,
+  continuations parked as `(paused …)` data) or rolled back (`abort`). Size the budget to
+  your workload: it's the upper bound on how long one transaction can hold the engine.
+- **Roadmap** (not yet implemented): WAL crash recovery, then MVCC snapshots/isolation,
+  then parallel execution of write-disjoint execs.
 
 ## Testing
 
