@@ -25,7 +25,10 @@ use tokio::sync::broadcast;
 use transaction::ServerState;
 
 #[derive(Parser)]
-#[command(name = "mork-server", about = "HTTP + SSE server for the MORK metta-calculus VM")]
+#[command(
+    name = "mork-server",
+    about = "HTTP + SSE server for the MORK metta-calculus VM"
+)]
 struct Args {
     /// Address to listen on.
     #[arg(long, default_value = "127.0.0.1:8081")]
@@ -33,6 +36,15 @@ struct Args {
     /// Broadcast buffer size per SSE subscriber (events beyond this are reported as `lagged`).
     #[arg(long, default_value_t = 4096)]
     events_buffer: usize,
+    /// Max VM steps a single transaction may run before `--budget-action` applies
+    /// (scheduling is sequential, so this bounds how long one transaction can hold the
+    /// engine).
+    #[arg(long, default_value_t = 1_000_000)]
+    step_budget: u64,
+    /// On budget exhaustion: `commit` keeps partial progress and parks pending execs as
+    /// `(paused …)` data; `abort` rolls the whole transaction back.
+    #[arg(long, value_enum, default_value = "commit")]
+    budget_action: engine::BudgetAction,
 }
 
 fn main() {
@@ -41,7 +53,11 @@ fn main() {
 
     let (events, _keep) = broadcast::channel(args.events_buffer);
     let active = Arc::new(Mutex::new(HashSet::new()));
-    let (tx_send, snap_rx, engine_join) = engine::spawn_engine(events.clone(), active.clone());
+    let cfg = engine::EngineConfig {
+        step_budget: args.step_budget,
+        budget_action: args.budget_action,
+    };
+    let (tx_send, snap_rx, engine_join) = engine::spawn_engine(events.clone(), active.clone(), cfg);
 
     let state = Arc::new(ServerState {
         tx_send,
@@ -59,10 +75,16 @@ fn main() {
         .thread_stack_size(64 * 1024 * 1024)
         .build()
         .unwrap();
-    rt.block_on(async {
-        tokio::spawn(events::delta_task(snap_rx, events, state.delta_subs.clone()));
 
-        let listener = TcpListener::bind(&args.addr).await
+    rt.block_on(async {
+        tokio::spawn(events::delta_task(
+            snap_rx,
+            events,
+            state.delta_subs.clone(),
+        ));
+
+        let listener = TcpListener::bind(&args.addr)
+            .await
             .unwrap_or_else(|e| panic!("failed to bind {}: {e}", args.addr));
         println!("mork-server listening on http://{}", args.addr);
 

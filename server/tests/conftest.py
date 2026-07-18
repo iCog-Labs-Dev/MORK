@@ -32,10 +32,13 @@ def _free_port() -> int:
 
 
 @pytest.fixture
-def server(mork_binary: Path) -> Iterator[MorkClient]:
+def server(mork_binary: Path, request: pytest.FixtureRequest) -> Iterator[MorkClient]:
+    """Fresh server per test. Parametrize indirectly to pass extra CLI flags:
+    @pytest.mark.parametrize("server", [["--step-budget", "5"]], indirect=True)"""
+    extra_args: list[str] = getattr(request, "param", [])
     addr = f"127.0.0.1:{_free_port()}"
     proc = subprocess.Popen(
-        [str(mork_binary), "--addr", addr],
+        [str(mork_binary), "--addr", addr, *extra_args],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

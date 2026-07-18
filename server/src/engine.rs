@@ -2,14 +2,19 @@
 //! dropped on this thread). All mutation is serialized here; concurrency for readers comes
 //! from the O(1) COW snapshots published after every step.
 //!
-//! Scheduling is two-level: round-robin BETWEEN transaction namespaces (one step each per
-//! round, so a 10-step program finishes while a 10⁶-step one runs), plain trie order WITHIN
-//! a namespace (the program's own loc-ordering / inference control, untouched).
+//! Scheduling is purely sequential: one transaction runs to quiescence before the next is
+//! dequeued (submissions wait in the channel, unapplied — applying them mid-run would
+//! change what the running program observes). Sequential execution is what makes every
+//! transaction atomic for free: the O(1) COW clone of the trie taken at tx start is a
+//! complete rollback image, and nothing else runs in between that could observe — and
+//! outlive — state we might revert. A failing exec (or a partial load) reverts the whole
+//! transaction with one pointer swap.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use mork::space::Space;
+use mork_expr::Expr;
 use mork_interning::SharedMappingHandle;
 use pathmap::PathMap;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -17,9 +22,24 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::transaction::{Event, ReadSnapshot, Transaction, TxId, TxOk};
 use crate::wrap;
 
+/// What happens when a transaction exhausts its step budget.
+#[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
+pub enum BudgetAction {
+    /// Keep partial progress; park still-pending execs as inert `(paused …)` data.
+    Commit,
+    /// Roll the whole transaction back, as if it never happened.
+    Abort,
+}
+
+pub struct EngineConfig {
+    pub step_budget: u64,
+    pub budget_action: BudgetAction,
+}
+
 pub fn spawn_engine(
     events: broadcast::Sender<Event>,
     active: Arc<Mutex<HashSet<TxId>>>,
+    cfg: EngineConfig,
 ) -> (mpsc::Sender<Transaction>, watch::Receiver<Arc<ReadSnapshot>>, std::thread::JoinHandle<()>) {
     let (tx_send, rx) = mpsc::channel::<Transaction>(1024);
     let (snap_tx, snap_rx) = watch::channel(Arc::new(ReadSnapshot::empty()));
@@ -29,7 +49,7 @@ pub fn spawn_engine(
         // level; deeply nested expressions like (S (S … Z)) overflow the 2 MB default.
         // Linux commits stack pages lazily, so a large reservation costs nothing up front.
         .stack_size(512 * 1024 * 1024)
-        .spawn(move || run(rx, snap_tx, events, active))
+        .spawn(move || run(rx, snap_tx, events, active, cfg))
         .expect("failed to spawn engine thread");
     (tx_send, snap_rx, handle)
 }
@@ -39,52 +59,27 @@ fn run(
     snap_tx: watch::Sender<Arc<ReadSnapshot>>,
     events: broadcast::Sender<Event>,
     active: Arc<Mutex<HashSet<TxId>>>,
+    cfg: EngineConfig,
 ) {
     let mut space = Space::new(); // created HERE: Space is !Send
     let mut version: u64 = 0;
-    let mut rotation: VecDeque<TxId> = VecDeque::new();
     publish(&snap_tx, &space, version);
 
-    'main: loop {
-        // Drain everything pending before stepping, so submissions are never starved.
-        loop {
-            match rx.try_recv() {
-                Ok(t) => apply_transaction(&mut space, t, &mut version, &snap_tx, &events, &mut rotation, &active),
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => break 'main,
-            }
-        }
-
-        if rotation.is_empty() {
-            // Execs can exist outside every known namespace (a program can construct an
-            // exec whose loc escapes its wrapper at runtime). Step them so the space always
-            // drains, attributing by parsed txid when possible.
-            if step_stray(&mut space, &mut version, &snap_tx, &events, &mut rotation, &active) {
+    loop {
+        // Drain queued submissions before parking; `Idle` is only truthful when both the
+        // space and the queue are empty.
+        match rx.try_recv() {
+            Ok(t) => {
+                run_tx(&mut space, t, &mut version, &snap_tx, &events, &active, &cfg);
                 continue;
             }
-            let _ = events.send(Event::Idle { version });
-            match rx.blocking_recv() {
-                Some(t) => apply_transaction(&mut space, t, &mut version, &snap_tx, &events, &mut rotation, &active),
-                None => break,
-            }
-            continue;
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+            Err(mpsc::error::TryRecvError::Empty) => {}
         }
-
-        // One step per active namespace per round.
-        for _ in 0..rotation.len() {
-            let txid = rotation.pop_front().unwrap();
-            if step_namespace(&mut space, &txid, &mut version, &snap_tx, &events) {
-                rotation.push_back(txid);
-            } else {
-                active.lock().unwrap().remove(&txid);
-                let _ = events.send(Event::Quiescent { tx: txid, version });
-            }
-            // Stay responsive to submissions arriving mid-round.
-            match rx.try_recv() {
-                Ok(t) => apply_transaction(&mut space, t, &mut version, &snap_tx, &events, &mut rotation, &active),
-                Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => break 'main,
-            }
+        let _ = events.send(Event::Idle { version });
+        match rx.blocking_recv() {
+            Some(t) => run_tx(&mut space, t, &mut version, &snap_tx, &events, &active, &cfg),
+            None => break,
         }
     }
     log::info!("engine: transaction channel closed, shutting down");
@@ -100,111 +95,193 @@ fn publish(snap_tx: &watch::Sender<Arc<ReadSnapshot>>, space: &Space, version: u
     }));
 }
 
-fn apply_transaction(
+/// Run one transaction start to finish: load atomically, then step until nothing in the
+/// space can step. The COW clone taken up front (same soundness argument as `publish`)
+/// makes the transaction atomic — a partial load or a failing exec rolls back to it.
+fn run_tx(
     space: &mut Space,
     t: Transaction,
     version: &mut u64,
     snap_tx: &watch::Sender<Arc<ReadSnapshot>>,
     events: &broadcast::Sender<Event>,
-    rotation: &mut VecDeque<TxId>,
     active: &Arc<Mutex<HashSet<TxId>>>,
+    cfg: &EngineConfig,
 ) {
+    let undo = space.btm.clone();
+
     match space.add_all_sexpr(t.source.as_bytes()) {
         Ok(count) => {
             *version += 1;
             publish(snap_tx, space, *version);
             let _ = events.send(Event::Tx { tx: t.id.clone(), count, version: *version });
             active.lock().unwrap().insert(t.id.clone());
-            rotation.push_back(t.id.clone());
-            let _ = t.reply.send(Ok(TxOk { tx: t.id, count, version: *version }));
+            let _ = t.reply.send(Ok(TxOk { tx: t.id.clone(), count, version: *version }));
         }
         Err(e) => {
-            // wrap::rewrite validated the syntax up front, so this is rare — but the kernel
-            // loader writes as it parses, so a mid-body failure may leave a partial load.
-            let msg = format!("load failed (transaction may be partially applied): {e}");
-            let _ = events.send(Event::Error { tx: Some(t.id.clone()), message: msg.clone() });
-            let _ = t.reply.send(Err(msg));
+            // The kernel loader writes as it parses; the clone undoes any partial load.
+            // Nothing was published since the clone, so the version doesn't move.
+            space.btm = undo;
+            let reason = format!("load failed: {e}");
+            let _ = events.send(Event::Abort { tx: t.id.clone(), reason: reason.clone(), version: *version });
+            let _ = t.reply.send(Err(reason));
+            return;
         }
     }
+
+    let mut steps: u64 = 0;
+    loop {
+        if steps >= cfg.step_budget {
+            match cfg.budget_action {
+                BudgetAction::Commit => {
+                    if let Err(e) = pause_pending_execs(space) {
+                        log::error!("parking execs after budget exhaustion: {e}");
+                    }
+                    *version += 1;
+                    publish(snap_tx, space, *version);
+                    let _ = events.send(Event::Budget { tx: t.id.clone(), steps, version: *version });
+                }
+                BudgetAction::Abort => {
+                    space.btm = undo;
+                    *version += 1;
+                    publish(snap_tx, space, *version);
+                    let reason = format!("step budget exhausted ({steps} steps)");
+                    let _ = events.send(Event::Abort { tx: t.id.clone(), reason, version: *version });
+                }
+            }
+            break;
+        }
+        match step_once(space, &t.id, version, snap_tx, events) {
+            StepOutcome::Stepped => steps += 1,
+            StepOutcome::Done => {
+                let _ = events.send(Event::Quiescent { tx: t.id.clone(), version: *version });
+                break;
+            }
+            StepOutcome::Failed(reason) => {
+                // Rollback IS a new observable state (steps were published since the
+                // clone): bump + publish so /export and the delta stream see the revert.
+                space.btm = undo;
+                *version += 1;
+                publish(snap_tx, space, *version);
+                let _ = events.send(Event::Abort { tx: t.id.clone(), reason, version: *version });
+                break;
+            }
+        }
+    }
+    active.lock().unwrap().remove(&t.id);
 }
 
-/// Run exactly one VM step rooted at `(exec (<txid> …))`. Returns false when that
-/// namespace has no pending exec (quiescent).
-fn step_namespace(
+/// Budget action `commit`: quiesce by force. Every still-pending `(exec …)` — all of them
+/// belong to the running transaction, because the space is fully drained between
+/// transactions — is re-rooted as inert `(paused (exec …))` data. Partial progress stays,
+/// nothing is left steppable (so a later transaction's stray fallback can't resume it
+/// under the wrong atomic scope), and clients can inspect or explicitly resume the parked
+/// continuations via /export and a follow-up transaction.
+///
+/// Text roundtrip on purpose: the kernel dump prints variables as `$a`, `$b`, … and the
+/// loader re-reads them by name into identical de Bruijn structure, so remove + re-add is
+/// exact. Leftover-exec counts at budget stop are small (the program's frontier).
+fn pause_pending_execs(space: &mut Space) -> Result<(), String> {
+    let mut pat = crate::read::parse_expr_bytes("[4] exec $ $ $", &space.sm)?;
+    let mut idt = crate::read::parse_expr_bytes("[4] exec _1 _2 _3", &space.sm)?;
+    let mut out = Vec::new();
+    Space::dump_sexpr_from(
+        &space.btm,
+        &space.sm,
+        Expr { ptr: pat.as_mut_ptr() },
+        Expr { ptr: idt.as_mut_ptr() },
+        &mut out,
+    );
+    if out.is_empty() {
+        return Ok(());
+    }
+    let execs = String::from_utf8_lossy(&out).into_owned();
+    let paused: String = execs
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| format!("(paused {l})\n"))
+        .collect();
+    space.remove_all_sexpr(execs.as_bytes())?;
+    space.add_all_sexpr(paused.as_bytes())?;
+    Ok(())
+}
+
+enum StepOutcome {
+    Stepped,
+    /// Nothing anywhere in the space can step — the transaction quiesced.
+    Done,
+    /// The interpreter rejected an exec; the caller rolls the whole transaction back.
+    Failed(String),
+}
+
+/// One deterministic VM step for `txid`: its own namespace first; only when that is empty,
+/// one whole-space step. The latter drains "strays" — execs whose loc a program moved out
+/// of its wrapper at runtime — so the space is always fully drained at quiescence. Both
+/// picks are trie order: which exec fires is a pure function of trie contents (this is
+/// what will make WAL replay deterministic).
+fn step_once(
     space: &mut Space,
     txid: &TxId,
     version: &mut u64,
     snap_tx: &watch::Sender<Arc<ReadSnapshot>>,
     events: &broadcast::Sender<Event>,
-) -> bool {
+) -> StepOutcome {
     let prefix = wrap::ns_loc_prefix(txid);
-    step_at(space, &prefix, Some(txid.clone()), version, snap_tx, events).is_some()
-}
-
-/// Step the whole space once (empty prefix) — only used when every known namespace is
-/// quiescent but execs remain. If the consumed exec carries a parseable txid, the caller
-/// revives that namespace.
-fn step_stray(
-    space: &mut Space,
-    version: &mut u64,
-    snap_tx: &watch::Sender<Arc<ReadSnapshot>>,
-    events: &broadcast::Sender<Event>,
-    rotation: &mut VecDeque<TxId>,
-    active: &Arc<Mutex<HashSet<TxId>>>,
-) -> bool {
-    match step_at(space, &[], None, version, snap_tx, events) {
-        None => false,
-        Some(None) => true,
-        Some(Some(txid)) => {
-            // The stray belonged to a namespace we thought quiescent — revive it.
-            active.lock().unwrap().insert(txid.clone());
-            rotation.push_back(txid);
-            true
-        }
+    match step_at(space, &prefix, Some(txid), version, snap_tx, events) {
+        Some(outcome) => outcome,
+        None => step_at(space, &[], None, version, snap_tx, events).unwrap_or(StepOutcome::Done),
     }
 }
 
-/// Shared single-step: `None` = nothing to step; `Some(txid_of_exec)` otherwise.
+/// `None` = nothing to step under this prefix. On success bumps the version, publishes the
+/// snapshot and emits the `step` event; on interpreter error does none of that — the exec
+/// was consumed and its step wasted, but the caller reverts the entire transaction anyway.
 fn step_at(
     space: &mut Space,
     loc_prefix: &[u8],
-    attributed: Option<TxId>,
+    attributed: Option<&TxId>,
     version: &mut u64,
     snap_tx: &watch::Sender<Arc<ReadSnapshot>>,
     events: &broadcast::Sender<Event>,
-) -> Option<Option<TxId>> {
+) -> Option<StepOutcome> {
     let sm = space.sm.clone();
-    let mut v = *version;
+    let v = *version + 1;
     let mut ev: Option<Event> = None;
-    let mut exec_txid: Option<TxId> = None;
+    let mut failure: Option<String> = None;
 
     let done = space.metta_calculus_scoped(loc_prefix, 1, |info| {
-        v += 1;
         let raw = exec_to_text(info.exec, &sm);
         let (exec, parsed_txid) = wrap::unwrap_text(&raw);
-        let tx = attributed.clone().or_else(|| parsed_txid.clone()).unwrap_or_else(|| "?".into());
-        exec_txid = parsed_txid;
-        ev = Some(Event::Step {
-            tx,
-            exec,
-            touched: info.touched,
-            new: info.new,
-            us: info.micros,
-            version: v,
-            error: info.error.map(str::to_string),
-        });
+        match info.error {
+            Some(e) => failure = Some(format!("exec {exec}: {e}")),
+            None => {
+                // Stray steps (no `attributed`) are attributed by the txid parsed out of
+                // the exec's own wrapper, when it still carries one.
+                let tx = attributed.cloned().or(parsed_txid).unwrap_or_else(|| "?".into());
+                ev = Some(Event::Step {
+                    tx,
+                    exec,
+                    touched: info.touched,
+                    new: info.new,
+                    us: info.micros,
+                    version: v,
+                });
+            }
+        }
         true
     });
 
-    *version = v;
     if done == 0 {
         return None;
     }
+    if let Some(reason) = failure {
+        return Some(StepOutcome::Failed(reason));
+    }
+    *version = v;
     publish(snap_tx, space, *version);
     if let Some(e) = ev {
         let _ = events.send(e);
     }
-    Some(exec_txid)
+    Some(StepOutcome::Stepped)
 }
 
 /// Serialize one stored expression exactly the way `/export` does: insert its path into a

@@ -21,6 +21,8 @@ cargo +nightly run --release -p mork-server -- --addr 127.0.0.1:8081
 |---|---|---|
 | `--addr` | `127.0.0.1:8081` | Listen address |
 | `--events-buffer` | `4096` | Per-subscriber event buffer; slower clients get `lagged` events instead of back-pressuring the engine |
+| `--step-budget` | `1000000` | Max VM steps one transaction may run; bounds how long a transaction can hold the (sequential) engine |
+| `--budget-action` | `commit` | On budget exhaustion: `commit` keeps partial progress and parks pending execs as `(paused …)` data; `abort` rolls the whole transaction back |
 
 Logging via `env_logger`: `RUST_LOG=info cargo +nightly run -p mork-server`.
 Stop with Ctrl-C (open connections are closed, the engine thread is joined).
@@ -46,23 +48,31 @@ curl 'http://127.0.0.1:8081/export?pattern=%5B2%5D%20petri%20%5B3%5D%20%21%20res
 - **Submit = run.** A transaction is a body of MeTTa s-expressions — plain data plus
   `(exec <loc> <patterns> <templates>)` programs. It is applied **atomically** (never
   half-visible) and its execs start executing immediately.
+- **Atomic execution.** A transaction either runs to quiescence and commits, or — if the
+  interpreter rejects one of its execs, or the load itself fails — it is **rolled back
+  entirely** (an O(1) copy-on-write revert): the space is exactly as if the transaction
+  never happened. Watch for `quiescent` (committed) vs `abort` (rolled back) on `/events`.
 - **Namespacing.** The server rewrites every `(exec L …)` in your upload to
   `(exec (<tx-id> L) …)` — uniformly across data, patterns, and templates, so your
   pattern-matching still works. This gives each transaction a private work queue. The
   wrapper is stripped from everything you see (events, exports); you never observe it.
-- **Fair scheduling.** The engine runs one VM step per active transaction per round
-  (round-robin), so a 10-step program finishes promptly even while a million-step program
-  runs. *Within* your transaction, execs run in plain trie order over your locs — your
-  program's own inference control is untouched.
+- **Sequential scheduling.** Transactions execute strictly one at a time, in submission
+  order: the running transaction steps to quiescence before the next queued one is even
+  applied. (This is what makes atomic rollback sound — nothing else runs in between that
+  could observe reverted state.) *Within* your transaction, execs run in plain trie order
+  over your locs — your program's own inference control is untouched. A transaction holds
+  the engine for at most `--step-budget` steps (see the flags table).
 - **Serial writes, parallel reads.** All mutation happens on one engine thread, one step at
   a time (interleaving is turn-taking, never concurrent writes). Reads (`/export`) and the
   event stream are served in parallel from copy-on-write snapshots and never block on, or
   are blocked by, execution.
-- **Isolation: none.** All transactions share one space's data region — overlapping reads
-  and writes between programs are MeTTa semantics, not an error. (MVCC is future work.)
-- **Cancellation is a transaction.** A RemoveSink exec that matches your pending execs
-  deletes them. Because patterns are wrapped into your namespace too, a transaction can
-  only cancel *its own* chain — never another client's.
+- **Isolation: serial.** All transactions share one space's data region, but because
+  execution is sequential a transaction only ever sees the *committed* results of its
+  predecessors — never another program mid-flight. (MVCC snapshots are future work.)
+- **Cancellation is program semantics.** *Within* a running transaction, a RemoveSink exec
+  that matches its pending execs deletes them — a program can stop its own chain. (With
+  sequential scheduling nothing of a transaction survives past its commit for another
+  transaction to cancel; namespace wrapping keeps it that way.)
 - **CLI compatibility.** Any file that works as `mork run <file>` works unmodified as a
   `POST /run` body: same parser, same exec shape, same semantics, identical results.
 
@@ -91,7 +101,7 @@ Submit a transaction and start executing it.
 | `version` | Global step counter after the (atomic) load |
 
 **Errors**: `400` non-UTF-8 body or s-expression parse error (nothing applied) ·
-`422` kernel load failure (body may be partially applied; message says so) ·
+`422` kernel load failure (rolled back — nothing applied) ·
 `503` engine shut down.
 
 Examples:
@@ -128,17 +138,19 @@ client can totally order what it observes.
 |---|---|---|
 | `hello` | `{version, count, active_txs}` | First frame on connect: snapshot version, expression count, transactions with pending execs |
 | `tx` | `{tx, count, version}` | A transaction was applied atomically |
-| `step` | `{tx, exec, touched, new, us, version, error}` | One VM step ran for `tx`. `exec` = the s-expression that executed (namespace unwrapped), `touched` = template instantiations written, `new` = whether anything not already present was written, `us` = duration in microseconds, `error` = interpreter rejection if the exec was malformed (it is still consumed) |
-| `quiescent` | `{tx, version}` | **Per-transaction**: `tx`'s namespace has no pending execs — its program finished (or removed itself). Other transactions may still be running |
-| `idle` | `{version}` | **Global**: no pending execs in *any* namespace; every program has quiesced and the engine is parked awaiting transactions. Always preceded by the last `quiescent` |
+| `step` | `{tx, exec, touched, new, us, version}` | One VM step ran for `tx`. `exec` = the s-expression that executed (namespace unwrapped), `touched` = template instantiations written, `new` = whether anything not already present was written, `us` = duration in microseconds |
+| `quiescent` | `{tx, version}` | **Per-transaction**: `tx` committed — nothing steppable left; its effects are permanent. The next queued transaction, if any, starts after this |
+| `idle` | `{version}` | **Global**: nothing steppable and nothing queued; the engine is parked awaiting transactions |
 | `delta` | `{version, added, removed}` | Opt-in snapshot diff: expressions added/removed between two consecutively observed snapshots (arrays of s-expression strings). Computed off the engine thread with PathMap set algebra; under load several steps may coalesce into one delta |
-| `error` | `{tx?, message}` | Malformed transaction or engine-side failure |
+| `abort` | `{tx, reason, version}` | The transaction was **rolled back** (failed load, rejected exec, or budget exhaustion under `--budget-action abort`): the space is exactly as if it never happened |
+| `budget` | `{tx, steps, version}` | The transaction hit `--step-budget` under `--budget-action commit`: partial progress is kept, still-pending execs are parked as inert `(paused (exec …))` data — inspect via `/export`, resume with a follow-up transaction that rewrites them back to `(exec …)` |
 | `lagged` | `{skipped}` | *You* consumed too slowly and missed `skipped` events (buffer overrun). Re-sync with `/export`; the engine was never slowed down |
 
 Typical lifecycle of one transaction on the stream:
 
 ```
-tx → step → step → … → quiescent        (and idle, if nothing else is running)
+tx → step → step → … → quiescent        committed  (then idle, if nothing is queued)
+tx → step → step → … → abort            rolled back — space as if it never happened
 ```
 
 ## `GET /export`
@@ -181,9 +193,10 @@ slightly stale but always consistent view. To coordinate, compare the `version` 
 - **Deep nesting**: expression machinery recurses per nesting level; the engine thread
   reserves a 512 MB stack (lazily committed) and tokio threads 64 MB, so deeply nested
   terms like a 400-deep `(S (S … Z))` are fine.
-- **Runaway programs**: a program whose continuations never stop runs forever, by design —
-  it shares the machine fairly with everyone else. Cancel it with a RemoveSink transaction
-  from the same namespace, or restart the server (no persistence yet).
+- **Runaway programs**: a program whose continuations never stop can't wedge the queue —
+  after `--step-budget` steps it is either quiesced by force (`commit`: results kept,
+  continuations parked as `(paused …)` data) or rolled back (`abort`). Size the budget to
+  your workload: it's the upper bound on how long one transaction can hold the engine.
 - **Roadmap** (not yet implemented): WAL crash recovery, then MVCC snapshots/isolation,
   then parallel execution of write-disjoint execs.
 
