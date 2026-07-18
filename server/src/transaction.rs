@@ -36,10 +36,10 @@ pub enum Event {
     /// One VM step ran for `tx`: `exec` is the s-expr that executed (loc reported
     /// unwrapped), `touched` = template instantiations performed, `new` = whether anything
     /// not already present was written, `us` = duration in microseconds.
-    Step { tx: TxId, exec: String, touched: usize, new: bool, us: u64, version: u64, error: Option<String> },
-    /// **Per-transaction**: `tx`'s namespace has no pending execs left — its program
-    /// finished (or removed itself). Other transactions may still be running.
-    /// Contrast with [`Event::Idle`].
+    Step { tx: TxId, exec: String, touched: usize, new: bool, us: u64, version: u64 },
+    /// **Per-transaction**: `tx` committed — it ran to quiescence (nothing steppable
+    /// left) and its effects are permanent. The next queued transaction, if any, starts
+    /// after this. Contrast with [`Event::Idle`].
     Quiescent { tx: TxId, version: u64 },
     /// **Global**: no pending execs in *any* namespace — every program has quiesced and the
     /// engine thread is parked awaiting new transactions. Always preceded by the last
@@ -49,8 +49,9 @@ pub enum Event {
     /// two consecutively observed snapshots, computed off the engine thread via PathMap
     /// `subtract`. Under load several steps may coalesce into one delta.
     Delta { version: u64, added: Vec<String>, removed: Vec<String> },
-    /// Malformed transaction/exec or engine-side failure.
-    Error { tx: Option<TxId>, message: String },
+    /// The transaction was rolled back — a failed load or a failing exec. The space is
+    /// exactly as if the transaction never happened.
+    Abort { tx: TxId, reason: String, version: u64 },
 }
 
 impl Event {
@@ -61,19 +62,19 @@ impl Event {
             Event::Quiescent { .. } => "quiescent",
             Event::Idle { .. } => "idle",
             Event::Delta { .. } => "delta",
-            Event::Error { .. } => "error",
+            Event::Abort { .. } => "abort",
         }
     }
 
     pub fn data(&self) -> Value {
         match self {
             Event::Tx { tx, count, version } => json!({"tx": tx, "count": count, "version": version}),
-            Event::Step { tx, exec, touched, new, us, version, error } =>
-                json!({"tx": tx, "exec": exec, "touched": touched, "new": new, "us": us, "version": version, "error": error}),
+            Event::Step { tx, exec, touched, new, us, version } =>
+                json!({"tx": tx, "exec": exec, "touched": touched, "new": new, "us": us, "version": version}),
             Event::Quiescent { tx, version } => json!({"tx": tx, "version": version}),
             Event::Idle { version } => json!({"version": version}),
             Event::Delta { version, added, removed } => json!({"version": version, "added": added, "removed": removed}),
-            Event::Error { tx, message } => json!({"tx": tx, "message": message}),
+            Event::Abort { tx, reason, version } => json!({"tx": tx, "reason": reason, "version": version}),
         }
     }
 
@@ -81,8 +82,8 @@ impl Event {
     /// (idle, delta, global errors) pass every filter.
     pub fn tx_id(&self) -> Option<&str> {
         match self {
-            Event::Tx { tx, .. } | Event::Step { tx, .. } | Event::Quiescent { tx, .. } => Some(tx),
-            Event::Error { tx, .. } => tx.as_deref(),
+            Event::Tx { tx, .. } | Event::Step { tx, .. } | Event::Quiescent { tx, .. }
+            | Event::Abort { tx, .. } => Some(tx),
             Event::Idle { .. } | Event::Delta { .. } => None,
         }
     }

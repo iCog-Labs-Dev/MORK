@@ -3,9 +3,9 @@
 //! On ingest every `(exec L P T)` subexpression in a submitted transaction — in data,
 //! patterns, and templates alike, so pattern matching stays consistent — is rewritten to
 //! `(exec (<tx-id> L) P T)`. The tx-id becomes a stable namespace under the VM's exec
-//! prefix, which is what lets the engine schedule transactions fairly (round-robin between
-//! namespaces) while each program's own loc-ordering ("inference control") is preserved
-//! inside its namespace. Events and exports strip the wrapper back off.
+//! prefix, which is what lets the engine scope stepping to the running transaction and
+//! attribute every step, while each program's own loc-ordering ("inference control") is
+//! preserved inside its namespace. Events and exports strip the wrapper back off.
 //!
 //! CLI-compat rule: this module is the ONLY transform between the wire and the kernel. The
 //! tokenizer below accepts exactly the frontend parser's syntax (see
