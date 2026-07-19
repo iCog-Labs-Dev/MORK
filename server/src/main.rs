@@ -53,6 +53,10 @@ struct Args {
     /// When the log is fsynced — i.e. when POST /run's 200 implies "on disk".
     #[arg(long, value_enum, default_value = "everysec")]
     fsync: wal::FsyncPolicy,
+    /// Checkpoint the space and delete pre-checkpoint log segments every N finished
+    /// transactions; 0 disables (the log grows unbounded).
+    #[arg(long, default_value_t = 1024)]
+    checkpoint_every: u64,
 }
 
 fn main() {
@@ -67,6 +71,7 @@ fn main() {
         budget_action: args.budget_action,
         data_dir: args.data_dir.clone(),
         fsync: args.fsync,
+        checkpoint_every: args.checkpoint_every,
         tx_counter: tx_counter.clone(),
     };
     let (tx_send, snap_rx, ready, engine_join) = engine::spawn_engine(events.clone(), active.clone(), cfg);

@@ -373,7 +373,6 @@ impl CkptMeta {
     }
 
     /// Atomic install: write `.tmp`, fsync, rename over the old meta, fsync the dir.
-    #[allow(dead_code)] // caller arrives with the checkpoint commit
     pub fn store(&self, dir: &Path) -> io::Result<()> {
         let json = serde_json::json!({
             "snapshot": self.snapshot,
@@ -396,9 +395,30 @@ impl CkptMeta {
 // ---------------------------------------------------------------------------
 // The Wal handle + writer thread
 
-/// One unit of work for the writer thread: a pre-framed record and its optional ack.
+/// **What**: the snapshot serializer a checkpoint runs — the caller captures whatever
+/// image it wants persisted (today an O(1) PathMap clone) and this layer never sees the
+/// data structure, only bytes flowing into a writer. This is the §5.6 decoupling point:
+/// swapping the snapshot format (`.paths` → ACT) is a new closure + a new `format` tag,
+/// zero storage-layer changes.
+pub type SnapshotFn = Box<dyn FnOnce(&mut dyn Write) -> io::Result<()> + Send>;
+
+/// One unit of work for the writer thread: a pre-framed record and its optional ack, or
+/// a rotate-and-checkpoint request (ordered with the appends by the FIFO channel — that
+/// ordering is what puts pre-checkpoint records in old segments and post-checkpoint
+/// records in the new one).
 enum Cmd {
     Append { frame: Vec<u8>, ack: Option<Ack> },
+    Checkpoint { version: u64, tx_counter: u64, format: &'static str, serialize: SnapshotFn },
+}
+
+/// A rotate-complete checkpoint handed from the writer thread to the checkpointer.
+struct CkptJob {
+    version: u64,
+    tx_counter: u64,
+    format: &'static str,
+    serialize: SnapshotFn,
+    /// The freshly created segment: replay starts here once the meta is installed.
+    first_segment: u64,
 }
 
 /// The engine's handle to the log — queue records, observe poisoning.
@@ -418,37 +438,58 @@ enum Cmd {
 pub struct Wal {
     send: Option<mpsc::SyncSender<Cmd>>,
     poisoned: Arc<AtomicBool>,
+    /// One checkpoint in flight at a time; `checkpoint()` skips (returns false) while set.
+    ckpt_busy: Arc<AtomicBool>,
     writer: Option<std::thread::JoinHandle<()>>,
+    checkpointer: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Wal {
-    /// Open (or create) the newest segment for append and start the writer thread.
-    /// Run [`read_segments`] BEFORE this: the scan is what truncates a torn tail.
+    /// Open (or create) the newest segment for append and start the writer +
+    /// checkpointer threads. Run [`read_segments`] BEFORE this: the scan is what
+    /// truncates a torn tail.
     pub fn open(dir: &Path, policy: FsyncPolicy) -> io::Result<Wal> {
         fs::create_dir_all(dir)?;
-        // Sweep in-flight temp files from an interrupted checkpoint install.
+        // Sweep leftovers of an interrupted checkpoint install: `.tmp` files, and any
+        // snapshot file the (atomically installed) meta doesn't name.
+        let kept_snapshot = CkptMeta::load(dir).ok().flatten().map(|m| m.snapshot);
         for entry in fs::read_dir(dir)? {
             let path = entry?.path();
-            if path.extension().is_some_and(|e| e == "tmp") {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            let orphan_snapshot =
+                name.starts_with("checkpoint-") && Some(&name) != kept_snapshot.as_ref();
+            if path.extension().is_some_and(|e| e == "tmp") || orphan_snapshot {
                 let _ = fs::remove_file(&path);
             }
         }
 
-        let path = match list_segments(dir)?.last() {
-            Some((_, p)) => p.clone(),
-            None => create_segment(dir, 0)?,
+        let (seq, path) = match list_segments(dir)?.last() {
+            Some((seq, p)) => (*seq, p.clone()),
+            None => (0, create_segment(dir, 0)?),
         };
         let file = OpenOptions::new().append(true).open(&path)?;
         let poisoned = Arc::new(AtomicBool::new(false));
+        let ckpt_busy = Arc::new(AtomicBool::new(false));
         let (send, recv) = mpsc::sync_channel(QUEUE_DEPTH);
+        // Capacity 1 + the busy gate ⇒ the writer's forward never blocks.
+        let (job_send, job_recv) = mpsc::sync_channel::<CkptJob>(1);
+        let checkpointer = std::thread::Builder::new().name("mork-wal-ckpt".into()).spawn({
+            let dir = dir.to_path_buf();
+            let busy = ckpt_busy.clone();
+            move || checkpointer_loop(job_recv, dir, busy)
+        })?;
         let writer = std::thread::Builder::new().name("mork-wal".into()).spawn({
             let poisoned = poisoned.clone();
-            move || writer_loop(recv, file, policy, poisoned)
+            let busy = ckpt_busy.clone();
+            let dir = dir.to_path_buf();
+            move || writer_loop(recv, file, seq, dir, policy, poisoned, busy, job_send)
         })?;
         Ok(Wal {
             send: Some(send),
             poisoned,
+            ckpt_busy,
             writer: Some(writer),
+            checkpointer: Some(checkpointer),
         })
     }
 
@@ -483,6 +524,39 @@ impl Wal {
         self.poisoned.load(Ordering::Relaxed)
     }
 
+    /// **What**: rotate to a fresh segment and install a checkpoint, asynchronously.
+    ///
+    /// **Why**: the checkpoint is what lets recovery skip replaying history and lets old
+    /// segments be deleted — without it the log grows without bound.
+    ///
+    /// **How**: the request queues behind pending appends (FIFO ⇒ everything before it
+    /// lands in old segments), the writer fsyncs + rotates (fast), and the checkpointer
+    /// thread runs `serialize` into a temp file, installs snapshot + meta atomically,
+    /// then deletes segments `< first_segment` and superseded snapshots. Returns `false`
+    /// — skip, retry at the next trigger — while a previous checkpoint is still writing.
+    /// A failed install just leaves the old checkpoint standing (the log keeps growing).
+    pub fn checkpoint(
+        &self,
+        version: u64,
+        tx_counter: u64,
+        format: &'static str,
+        serialize: SnapshotFn,
+    ) -> bool {
+        if self.ckpt_busy.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        if self.poisoned() {
+            self.ckpt_busy.store(false, Ordering::Release);
+            return false;
+        }
+        let cmd = Cmd::Checkpoint { version, tx_counter, format, serialize };
+        if self.send.as_ref().expect("wal used after shutdown").send(cmd).is_err() {
+            self.ckpt_busy.store(false, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
     /// Drain the queue, final-fsync, and join the writer. (Dropping does the same; the
     /// engine relies on drop order, so this explicit form is used by tests only.)
     #[allow(dead_code)]
@@ -493,19 +567,29 @@ impl Drop for Wal {
     fn drop(&mut self) {
         drop(self.send.take()); // disconnect: the writer drains what's queued, then exits
         if let Some(h) = self.writer.take() {
-            let _ = h.join();
+            let _ = h.join(); // exiting drops the writer's job sender…
+        }
+        if let Some(h) = self.checkpointer.take() {
+            let _ = h.join(); // …so the checkpointer finishes any in-flight install and exits
         }
     }
 }
 
 /// The writer thread's loop: park for work (or the `everysec` sync deadline), drain
-/// everything queued into one write — and under `always` one fsync — then fire the
-/// batch's acks. Poisons the log on any write/fsync error; final-fsyncs on disconnect.
+/// everything queued — appends coalesce into one write (and under `always` one fsync),
+/// a checkpoint request flushes + fsyncs the current segment, rotates, and forwards the
+/// install job to the checkpointer — then fire the batch's acks. Poisons the log on any
+/// write/fsync error; final-fsyncs on disconnect.
+#[allow(clippy::too_many_arguments)]
 fn writer_loop(
     recv: mpsc::Receiver<Cmd>,
     mut file: File,
+    mut seq: u64,
+    dir: std::path::PathBuf,
     policy: FsyncPolicy,
     poisoned: Arc<AtomicBool>,
+    ckpt_busy: Arc<AtomicBool>,
+    job_send: mpsc::SyncSender<CkptJob>,
 ) {
     let mut dirty = false;
     let mut last_sync = Instant::now();
@@ -517,7 +601,7 @@ fn writer_loop(
         }
     };
 
-    loop {
+    'outer: loop {
         // Park for work; with a dirty file under `everysec`, wake at the sync deadline.
         let first = if policy == FsyncPolicy::Everysec && dirty {
             let deadline = last_sync + SYNC_INTERVAL;
@@ -533,30 +617,79 @@ fn writer_loop(
             }
         };
 
-        // Batch: one write (and under `always`, one fsync) for everything queued behind.
+        // Drain in order: appends coalesce; a checkpoint splits the stream — everything
+        // before it belongs to old segments, everything after to the fresh one.
         let mut batch = Vec::new();
         let mut acks = Vec::new();
-        let mut take = |cmd: Cmd, batch: &mut Vec<u8>, acks: &mut Vec<Ack>| {
-            let Cmd::Append { frame, ack } = cmd;
-            batch.extend_from_slice(&frame);
-            if let Some(a) = ack {
-                acks.push(a);
-            }
-        };
-        if let Some(cmd) = first {
-            take(cmd, &mut batch, &mut acks);
-        }
-        for cmd in recv.try_iter() {
-            take(cmd, &mut batch, &mut acks);
-        }
-
-        if !batch.is_empty() {
+        for cmd in first.into_iter().chain(recv.try_iter()) {
             if poisoned.load(Ordering::Relaxed) {
-                for a in acks.drain(..) {
-                    let _ = a.reply.send(Err("wal is poisoned".into()));
+                match cmd {
+                    Cmd::Append { ack: Some(a), .. } => {
+                        let _ = a.reply.send(Err("wal is poisoned".into()));
+                    }
+                    Cmd::Append { .. } => {}
+                    Cmd::Checkpoint { .. } => ckpt_busy.store(false, Ordering::Release),
                 }
                 continue;
             }
+            match cmd {
+                Cmd::Append { frame, ack } => {
+                    batch.extend_from_slice(&frame);
+                    if let Some(a) = ack {
+                        acks.push(a);
+                    }
+                }
+                Cmd::Checkpoint { version, tx_counter, format, serialize } => {
+                    // Flush + fsync the current segment first: rotation makes it
+                    // non-last, and the scan treats a torn tail there as hard
+                    // corruption — it must be clean before anything else can happen.
+                    if !batch.is_empty() {
+                        if let Err(e) = file.write_all(&batch) {
+                            poison(&e, &mut acks, &poisoned);
+                            ckpt_busy.store(false, Ordering::Release);
+                            continue 'outer;
+                        }
+                        batch.clear();
+                        dirty = true;
+                    }
+                    if dirty {
+                        if let Err(e) = file.sync_data() {
+                            poison(&e, &mut acks, &poisoned);
+                            ckpt_busy.store(false, Ordering::Release);
+                            continue 'outer;
+                        }
+                        dirty = false;
+                        last_sync = Instant::now();
+                    }
+                    match create_segment(&dir, seq + 1) {
+                        Ok(path) => match OpenOptions::new().append(true).open(&path) {
+                            Ok(f) => {
+                                file = f;
+                                seq += 1;
+                                let _ = job_send.send(CkptJob {
+                                    version,
+                                    tx_counter,
+                                    format,
+                                    serialize,
+                                    first_segment: seq,
+                                });
+                                // busy stays set: the checkpointer clears it when done
+                            }
+                            Err(e) => {
+                                log::error!("wal: opening rotated segment failed, checkpoint skipped: {e}");
+                                ckpt_busy.store(false, Ordering::Release);
+                            }
+                        },
+                        Err(e) => {
+                            log::error!("wal: segment rotation failed, checkpoint skipped: {e}");
+                            ckpt_busy.store(false, Ordering::Release);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !batch.is_empty() {
             if let Err(e) = file.write_all(&batch) {
                 poison(&e, &mut acks, &poisoned);
                 continue;
@@ -604,6 +737,57 @@ fn writer_loop(
     if dirty {
         let _ = file.sync_data();
     }
+}
+
+/// The checkpointer thread: runs at most one install at a time (the busy flag gates
+/// submissions), and a failure just leaves the previous checkpoint standing.
+fn checkpointer_loop(recv: mpsc::Receiver<CkptJob>, dir: std::path::PathBuf, busy: Arc<AtomicBool>) {
+    while let Ok(job) = recv.recv() {
+        match install_checkpoint(&dir, job) {
+            Ok(name) => log::info!("wal: checkpoint '{name}' installed, old segments deleted"),
+            Err(e) => log::error!("wal: checkpoint failed (log keeps growing until the next attempt): {e}"),
+        }
+        busy.store(false, Ordering::Release);
+    }
+}
+
+/// Serialize the snapshot to `<name>.tmp` → fsync → rename → fsync dir, install the
+/// meta the same way, then GC: segments below `first_segment` and superseded snapshot
+/// files. A crash at ANY point leaves either the old or the new checkpoint fully valid
+/// (the meta rename is the commit point); strays are swept at the next `Wal::open`.
+fn install_checkpoint(dir: &Path, job: CkptJob) -> io::Result<String> {
+    let name = format!("checkpoint-{:06}.{}", job.version, job.format);
+    let tmp = dir.join(format!("{name}.tmp"));
+    let mut w = io::BufWriter::new(File::create(&tmp)?);
+    (job.serialize)(&mut w)?;
+    let f = w.into_inner().map_err(|e| io::Error::other(e.to_string()))?;
+    f.sync_data()?;
+    drop(f);
+    fs::rename(&tmp, dir.join(&name))?;
+    fsync_dir(dir)?;
+
+    CkptMeta {
+        snapshot: name.clone(),
+        format: job.format.to_string(),
+        version: job.version,
+        tx_counter: job.tx_counter,
+        first_segment: job.first_segment,
+    }
+    .store(dir)?; // the commit point
+
+    for (seq, path) in list_segments(dir)? {
+        if seq < job.first_segment {
+            let _ = fs::remove_file(path);
+        }
+    }
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if fname.starts_with("checkpoint-") && fname != name && !fname.ends_with(".tmp") {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    Ok(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -879,6 +1063,33 @@ mod tests {
                 source: "(a b)".into()
             }
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_rotates_installs_and_gcs() {
+        let dir = tmpdir();
+        let wal = Wal::open(&dir, FsyncPolicy::No).unwrap();
+        wal.append(Rec::Tx { id: "tx1_aaaaaaaa", source: "(a)" }, None);
+        wal.append(Rec::Commit { id: "tx1_aaaaaaaa", steps: 0, version: 1 }, None);
+        assert!(wal.checkpoint(1, 1, "paths", Box::new(|w| w.write_all(b"SNAP"))));
+        // FIFO: this lands in the freshly rotated segment
+        wal.append(Rec::Tx { id: "tx2_bbbbbbbb", source: "(b)" }, None);
+        wal.shutdown(); // joins writer AND checkpointer: the install is complete
+
+        let meta = CkptMeta::load(&dir).unwrap().unwrap();
+        assert_eq!(meta.first_segment, 1);
+        assert_eq!(meta.tx_counter, 1);
+        assert_eq!(fs::read(dir.join(&meta.snapshot)).unwrap(), b"SNAP");
+        assert!(!seg_path(&dir, 0).exists(), "pre-checkpoint segment must be GC'd");
+        let tail = read_segments(&dir, meta.first_segment).unwrap();
+        assert_eq!(tail, vec![OwnedRec::Tx { id: "tx2_bbbbbbbb".into(), source: "(b)".into() }]);
+
+        // reopen sweeps snapshot files the meta doesn't name, keeps the one it does
+        fs::write(dir.join("checkpoint-000099.paths"), b"orphan").unwrap();
+        drop(Wal::open(&dir, FsyncPolicy::No).unwrap());
+        assert!(!dir.join("checkpoint-000099.paths").exists());
+        assert!(dir.join(&meta.snapshot).exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 

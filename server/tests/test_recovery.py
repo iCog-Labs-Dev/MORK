@@ -87,6 +87,39 @@ def test_tx_counter_and_version_survive(spawner, tmp_path) -> None:
     assert res.version == last.version + 1
 
 
+def test_checkpoint_restore_and_log_gc(spawner, tmp_path) -> None:
+    """--checkpoint-every N: the space is snapshotted, pre-checkpoint segments are
+    deleted, and recovery = restore checkpoint + replay only the log tail."""
+    args = ["--data-dir", str(tmp_path), "--fsync", "always", "--checkpoint-every", "2"]
+    c1, p1 = spawner(args)
+    for i in range(3):  # checkpoint fires after the 2nd tx; the 3rd is log tail
+        last = _run_and_wait(c1, f"(fact {i})")
+    before = c1.export()
+
+    deadline = time.monotonic() + 5.0  # the install is async on the checkpointer thread
+    while time.monotonic() < deadline:
+        names = {p.name for p in tmp_path.iterdir()}
+        if "checkpoint.meta" in names and "wal-000000.log" not in names:
+            break
+        time.sleep(0.05)
+    names = {p.name for p in tmp_path.iterdir()}
+    assert "checkpoint.meta" in names
+    assert any(n.startswith("checkpoint-") and n.endswith(".paths") for n in names)
+    assert "wal-000000.log" not in names  # pre-checkpoint segment GC'd
+    assert "wal-000001.log" in names      # the tail segment
+
+    p1.kill()
+    p1.wait(timeout=10)
+
+    c2, _ = spawner(args)  # checkpoint restore + tail replay
+    assert c2.export() == before
+    with c2.events() as stream:
+        assert stream.hello.data["version"] == last.version
+        res = c2.run("(after 1)")
+        stream.wait_for("quiescent", tx=res.tx)
+    assert int(res.tx[2:].split("_")[0]) == 4  # counter: meta (2) + tail replay (3) + 1
+
+
 def test_clean_restart(spawner, tmp_path) -> None:
     args = ["--data-dir", str(tmp_path)]
     c1, p1 = spawner(args)

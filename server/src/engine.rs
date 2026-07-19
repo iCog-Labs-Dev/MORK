@@ -41,6 +41,9 @@ pub struct EngineConfig {
     /// Persistence root; `None` = pure in-memory (no WAL, no recovery).
     pub data_dir: Option<std::path::PathBuf>,
     pub fsync: FsyncPolicy,
+    /// Checkpoint + rotate + GC old segments every N finished transactions; 0 = never
+    /// (the log then grows without bound and recovery replays it in full).
+    pub checkpoint_every: u64,
     /// Shared with the HTTP layer; recovery restores it before `ready` fires.
     pub tx_counter: Arc<AtomicU64>,
 }
@@ -108,6 +111,7 @@ fn run(
     publish(&snap_tx, &space, version);
     let _ = ready.send(());
 
+    let mut finished: u64 = 0; // transactions run to an outcome, for the checkpoint trigger
     loop {
         // Drain queued submissions before parking; `Idle` is only truthful when both the
         // space and the queue are empty.
@@ -123,6 +127,8 @@ fn run(
                     &cfg,
                     wal,
                 );
+                finished += 1;
+                maybe_checkpoint(&space, version, finished, &cfg, wal);
                 continue;
             }
             Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -130,21 +136,49 @@ fn run(
         }
         let _ = events.send(Event::Idle { version });
         match rx.blocking_recv() {
-            Some(t) => run_tx(
-                &mut space,
-                t,
-                &mut version,
-                &snap_tx,
-                &events,
-                &active,
-                &cfg,
-                wal,
-            ),
+            Some(t) => {
+                run_tx(
+                    &mut space,
+                    t,
+                    &mut version,
+                    &snap_tx,
+                    &events,
+                    &active,
+                    &cfg,
+                    wal,
+                );
+                finished += 1;
+                maybe_checkpoint(&space, version, finished, &cfg, wal);
+            }
             None => break,
         }
     }
     log::info!("engine: transaction channel closed, shutting down");
     // Dropping the Wal (owner is still in scope) drains its queue and final-fsyncs.
+}
+
+/// Every `checkpoint_every` finished transactions, hand the WAL an O(1) COW clone of the
+/// trie to persist (the engine's whole cost is the clone; serialization runs on the
+/// checkpointer thread). Taken at a tx boundary, the clone IS the consistent image —
+/// same soundness argument as `publish`. A skip (previous checkpoint still writing) is
+/// fine: the trigger fires again `checkpoint_every` transactions later.
+fn maybe_checkpoint(space: &Space, version: u64, finished: u64, cfg: &EngineConfig, wal: Option<&Wal>) {
+    let Some(w) = wal else { return };
+    if cfg.checkpoint_every == 0 || !finished.is_multiple_of(cfg.checkpoint_every) {
+        return;
+    }
+    let btm = space.btm.clone();
+    let accepted = w.checkpoint(
+        version,
+        cfg.tx_counter.load(Ordering::Relaxed),
+        "paths",
+        Box::new(move |out| {
+            pathmap::paths_serialization::serialize_paths(btm.read_zipper(), &mut { out }).map(|_| ())
+        }),
+    );
+    if !accepted {
+        log::info!("checkpoint at version {version} skipped: previous one still writing");
+    }
 }
 
 /// Snapshots are taken strictly BETWEEN interpret calls — no write-zipper session is ever
