@@ -23,6 +23,8 @@ cargo +nightly run --release -p mork-server -- --addr 127.0.0.1:8081
 | `--events-buffer` | `4096` | Per-subscriber event buffer; slower clients get `lagged` events instead of back-pressuring the engine |
 | `--step-budget` | `1000000` | Max VM steps one transaction may run; bounds how long a transaction can hold the (sequential) engine |
 | `--budget-action` | `commit` | On budget exhaustion: `commit` keeps partial progress and parks pending execs as `(paused …)` data; `abort` rolls the whole transaction back |
+| `--data-dir` | *(absent)* | Enable persistence: WAL + crash recovery rooted here. Absent = pure in-memory |
+| `--fsync` | `everysec` | When the log is fsynced: `always` = 200 means on disk (group-committed) · `everysec` = durable within ~1 s (Redis-style; the loss window covers process crash and power failure) · `no` = page cache decides |
 
 Logging via `env_logger`: `RUST_LOG=info cargo +nightly run -p mork-server`.
 Stop with Ctrl-C (open connections are closed, the engine thread is joined).
@@ -197,8 +199,17 @@ slightly stale but always consistent view. To coordinate, compare the `version` 
   after `--step-budget` steps it is either quiesced by force (`commit`: results kept,
   continuations parked as `(paused …)` data) or rolled back (`abort`). Size the budget to
   your workload: it's the upper bound on how long one transaction can hold the engine.
-- **Roadmap** (not yet implemented): WAL crash recovery, then MVCC snapshots/isolation,
-  then parallel execution of write-disjoint execs.
+- **Durability** (`--data-dir`): a logical command log — transaction sources plus
+  commit/abort outcome records — with the engine never touching a file (a dedicated
+  writer thread owns all I/O and fsync timing; under `--fsync always` it also fires the
+  client's 200 after the group-commit fsync). Recovery replays the log against the
+  deterministic VM: same text, same trie order, same steps ⇒ byte-identical space. A
+  transaction killed mid-execution (logged but no outcome) is re-run fresh on startup,
+  before the listener binds. A disk-write error poisons the log: writes get 503, reads
+  keep serving. Requires the default non-`interning` build.
+- **Roadmap** (not yet implemented): checkpoints + log truncation (today the log grows
+  unbounded and recovery replays it in full), then MVCC snapshots/isolation, then
+  parallel execution of write-disjoint execs.
 
 ## Testing
 

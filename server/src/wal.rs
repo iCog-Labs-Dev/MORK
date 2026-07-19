@@ -24,8 +24,6 @@
 //! `payload := tag:u8 …`. A torn write at power loss becomes a cleanly detectable log
 //! end, not corruption.
 
-#![allow(dead_code)] // wired into the engine in the recovery commit
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -375,6 +373,7 @@ impl CkptMeta {
     }
 
     /// Atomic install: write `.tmp`, fsync, rename over the old meta, fsync the dir.
+    #[allow(dead_code)] // caller arrives with the checkpoint commit
     pub fn store(&self, dir: &Path) -> io::Result<()> {
         let json = serde_json::json!({
             "snapshot": self.snapshot,
@@ -484,7 +483,9 @@ impl Wal {
         self.poisoned.load(Ordering::Relaxed)
     }
 
-    /// Drain the queue, final-fsync, and join the writer. (Dropping does the same.)
+    /// Drain the queue, final-fsync, and join the writer. (Dropping does the same; the
+    /// engine relies on drop order, so this explicit form is used by tests only.)
+    #[allow(dead_code)]
     pub fn shutdown(self) {}
 }
 

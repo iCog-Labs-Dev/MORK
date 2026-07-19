@@ -46,6 +46,13 @@ struct Args {
     /// `(paused …)` data; `abort` rolls the whole transaction back.
     #[arg(long, value_enum, default_value = "commit")]
     budget_action: engine::BudgetAction,
+    /// Enable persistence: WAL + crash recovery rooted at this directory. Absent = pure
+    /// in-memory (today's behavior).
+    #[arg(long)]
+    data_dir: Option<std::path::PathBuf>,
+    /// When the log is fsynced — i.e. when POST /run's 200 implies "on disk".
+    #[arg(long, value_enum, default_value = "everysec")]
+    fsync: wal::FsyncPolicy,
 }
 
 fn main() {
@@ -54,17 +61,25 @@ fn main() {
 
     let (events, _keep) = broadcast::channel(args.events_buffer);
     let active = Arc::new(Mutex::new(HashSet::new()));
+    let tx_counter = Arc::new(AtomicU64::new(0));
     let cfg = engine::EngineConfig {
         step_budget: args.step_budget,
         budget_action: args.budget_action,
+        data_dir: args.data_dir.clone(),
+        fsync: args.fsync,
+        tx_counter: tx_counter.clone(),
     };
-    let (tx_send, snap_rx, engine_join) = engine::spawn_engine(events.clone(), active.clone(), cfg);
+    let (tx_send, snap_rx, ready, engine_join) = engine::spawn_engine(events.clone(), active.clone(), cfg);
+
+    // Recovery gate: the listener must not accept requests (and mint txids) until the
+    // engine has replayed the log and restored the shared counter.
+    ready.recv().expect("engine died during startup/recovery");
 
     let state = Arc::new(ServerState {
         tx_send,
         snapshot: snap_rx.clone(),
         events: events.clone(),
-        tx_counter: AtomicU64::new(0),
+        tx_counter,
         active,
         delta_subs: Arc::new(AtomicUsize::new(0)),
     });
