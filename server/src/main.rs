@@ -10,6 +10,7 @@ mod events;
 mod http;
 mod read;
 mod transaction;
+mod wal;
 mod wrap;
 
 use std::collections::HashSet;
