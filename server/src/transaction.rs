@@ -117,7 +117,9 @@ pub struct ServerState {
     pub tx_send: tokio::sync::mpsc::Sender<Transaction>,
     pub snapshot: tokio::sync::watch::Receiver<Arc<ReadSnapshot>>,
     pub events: tokio::sync::broadcast::Sender<Event>,
-    pub tx_counter: AtomicU64,
+    /// Shared with the engine: recovery restores it to the highest replayed txid count
+    /// before the listener binds, so fresh txids can never collide with logged ones.
+    pub tx_counter: Arc<AtomicU64>,
     /// Transactions with pending execs (kept by the engine; read by `hello`).
     pub active: Arc<Mutex<HashSet<TxId>>>,
     /// Number of connected `?deltas=true` subscribers; the delta task skips work at 0.

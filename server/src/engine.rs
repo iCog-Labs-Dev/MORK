@@ -11,7 +11,10 @@
 //! transaction with one pointer swap.
 
 use std::collections::HashSet;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::{fs, io};
 
 use mork::space::Space;
 use mork_expr::Expr;
@@ -20,7 +23,8 @@ use pathmap::PathMap;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::transaction::{Event, ReadSnapshot, Transaction, TxId, TxOk};
-use crate::wrap;
+use crate::wal::{Ack, CkptMeta, FsyncPolicy, OwnedRec, Rec, Wal};
+use crate::{wal, wrap};
 
 /// What happens when a transaction exhausts its step budget.
 #[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
@@ -34,24 +38,43 @@ pub enum BudgetAction {
 pub struct EngineConfig {
     pub step_budget: u64,
     pub budget_action: BudgetAction,
+    /// Persistence root; `None` = pure in-memory (no WAL, no recovery).
+    pub data_dir: Option<std::path::PathBuf>,
+    pub fsync: FsyncPolicy,
+    /// Checkpoint + rotate + GC old segments every N finished transactions; 0 = never
+    /// (the log then grows without bound and recovery replays it in full).
+    pub checkpoint_every: u64,
+    /// Shared with the HTTP layer; recovery restores it before `ready` fires.
+    pub tx_counter: Arc<AtomicU64>,
 }
+
+/// Returned alongside the channels: fires once recovery is done and the snapshot is
+/// published. `main` must not bind the listener before this — a request arriving
+/// mid-recovery could mint a txid that collides with a replayed one.
+pub type ReadySignal = std::sync::mpsc::Receiver<()>;
 
 pub fn spawn_engine(
     events: broadcast::Sender<Event>,
     active: Arc<Mutex<HashSet<TxId>>>,
     cfg: EngineConfig,
-) -> (mpsc::Sender<Transaction>, watch::Receiver<Arc<ReadSnapshot>>, std::thread::JoinHandle<()>) {
+) -> (
+    mpsc::Sender<Transaction>,
+    watch::Receiver<Arc<ReadSnapshot>>,
+    ReadySignal,
+    std::thread::JoinHandle<()>,
+) {
     let (tx_send, rx) = mpsc::channel::<Transaction>(1024);
     let (snap_tx, snap_rx) = watch::channel(Arc::new(ReadSnapshot::empty()));
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let handle = std::thread::Builder::new()
         .name("mork-engine".into())
         // The kernel's expression machinery (parse/serialize/unify) recurses per nesting
         // level; deeply nested expressions like (S (S … Z)) overflow the 2 MB default.
         // Linux commits stack pages lazily, so a large reservation costs nothing up front.
         .stack_size(512 * 1024 * 1024)
-        .spawn(move || run(rx, snap_tx, events, active, cfg))
+        .spawn(move || run(rx, snap_tx, events, active, cfg, ready_tx))
         .expect("failed to spawn engine thread");
-    (tx_send, snap_rx, handle)
+    (tx_send, snap_rx, ready_rx, handle)
 }
 
 fn run(
@@ -60,17 +83,52 @@ fn run(
     events: broadcast::Sender<Event>,
     active: Arc<Mutex<HashSet<TxId>>>,
     cfg: EngineConfig,
+    ready: std::sync::mpsc::SyncSender<()>,
 ) {
     let mut space = Space::new(); // created HERE: Space is !Send
     let mut version: u64 = 0;
-    publish(&snap_tx, &space, version);
 
+    let wal: Option<Wal> = cfg.data_dir.clone().map(|dir| {
+        match recover(
+            &mut space,
+            &mut version,
+            &dir,
+            &cfg,
+            &snap_tx,
+            &events,
+            &active,
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                // Refusing to serve beats silently serving a wrong or partial space.
+                log::error!("recovery failed, refusing to serve: {e}");
+                std::process::exit(1);
+            }
+        }
+    });
+    let wal = wal.as_ref();
+
+    publish(&snap_tx, &space, version);
+    let _ = ready.send(());
+
+    let mut finished: u64 = 0; // transactions run to an outcome, for the checkpoint trigger
     loop {
         // Drain queued submissions before parking; `Idle` is only truthful when both the
         // space and the queue are empty.
         match rx.try_recv() {
             Ok(t) => {
-                run_tx(&mut space, t, &mut version, &snap_tx, &events, &active, &cfg);
+                run_tx(
+                    &mut space,
+                    t,
+                    &mut version,
+                    &snap_tx,
+                    &events,
+                    &active,
+                    &cfg,
+                    wal,
+                );
+                finished += 1;
+                maybe_checkpoint(&space, version, finished, &cfg, wal);
                 continue;
             }
             Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -78,11 +136,49 @@ fn run(
         }
         let _ = events.send(Event::Idle { version });
         match rx.blocking_recv() {
-            Some(t) => run_tx(&mut space, t, &mut version, &snap_tx, &events, &active, &cfg),
+            Some(t) => {
+                run_tx(
+                    &mut space,
+                    t,
+                    &mut version,
+                    &snap_tx,
+                    &events,
+                    &active,
+                    &cfg,
+                    wal,
+                );
+                finished += 1;
+                maybe_checkpoint(&space, version, finished, &cfg, wal);
+            }
             None => break,
         }
     }
     log::info!("engine: transaction channel closed, shutting down");
+    // Dropping the Wal (owner is still in scope) drains its queue and final-fsyncs.
+}
+
+/// Every `checkpoint_every` finished transactions, hand the WAL an O(1) COW clone of the
+/// trie to persist (the engine's whole cost is the clone; serialization runs on the
+/// checkpointer thread). Taken at a tx boundary, the clone IS the consistent image —
+/// same soundness argument as `publish`. A skip (previous checkpoint still writing) is
+/// fine: the trigger fires again `checkpoint_every` transactions later.
+fn maybe_checkpoint(space: &Space, version: u64, finished: u64, cfg: &EngineConfig, wal: Option<&Wal>) {
+    let Some(w) = wal else { return };
+    if cfg.checkpoint_every == 0 || !finished.is_multiple_of(cfg.checkpoint_every) {
+        return;
+    }
+    let btm = space.btm.clone();
+    let accepted = w.checkpoint(
+        version,
+        cfg.tx_counter.load(Ordering::Relaxed),
+        "paths",
+        Box::new(move |out| {
+            pathmap::paths_serialization::serialize_paths(btm.read_zipper(), &mut { out }).map(|_| ())
+        }),
+    );
+    if !accepted {
+        log::info!("checkpoint at version {version} skipped: previous one still writing");
+    }
 }
 
 /// Snapshots are taken strictly BETWEEN interpret calls — no write-zipper session is ever
@@ -95,9 +191,15 @@ fn publish(snap_tx: &watch::Sender<Arc<ReadSnapshot>>, space: &Space, version: u
     }));
 }
 
-/// Run one transaction start to finish: load atomically, then step until nothing in the
-/// space can step. The COW clone taken up front (same soundness argument as `publish`)
-/// makes the transaction atomic — a partial load or a failing exec rolls back to it.
+/// Run one transaction start to finish: load atomically, log + ack, then step to
+/// quiescence via [`finish_tx`]. The COW clone taken up front (same soundness argument
+/// as `publish`) makes the transaction atomic — a partial load or a failing exec rolls
+/// back to it.
+///
+/// WAL ordering: the TX record is appended AFTER the in-memory apply (we only know
+/// `TxOk` then), which is sound because redo logging requires durable-before-ACK, not
+/// durable-before-apply — a crash in between loses only an unacknowledged transaction.
+/// A failed load appends nothing at all: no TX record, no outcome needed.
 fn run_tx(
     space: &mut Space,
     t: Transaction,
@@ -106,54 +208,164 @@ fn run_tx(
     events: &broadcast::Sender<Event>,
     active: &Arc<Mutex<HashSet<TxId>>>,
     cfg: &EngineConfig,
+    wal: Option<&Wal>,
 ) {
-    let undo = space.btm.clone();
+    let Transaction { id, source, reply } = t;
+    if let Some(w) = wal {
+        if w.poisoned() {
+            // The "unavailable:" prefix maps to 503 in http.rs: not applied, retryable.
+            let _ = reply.send(Err(
+                "unavailable: wal write error; writes refused (reads still serve)".into(),
+            ));
+            return;
+        }
+    }
 
-    match space.add_all_sexpr(t.source.as_bytes()) {
+    let undo = space.btm.clone();
+    match space.add_all_sexpr(source.as_bytes()) {
         Ok(count) => {
             *version += 1;
             publish(snap_tx, space, *version);
-            let _ = events.send(Event::Tx { tx: t.id.clone(), count, version: *version });
-            active.lock().unwrap().insert(t.id.clone());
-            let _ = t.reply.send(Ok(TxOk { tx: t.id.clone(), count, version: *version }));
+            let _ = events.send(Event::Tx {
+                tx: id.clone(),
+                count,
+                version: *version,
+            });
+            active.lock().unwrap().insert(id.clone());
+            let ok = TxOk {
+                tx: id.clone(),
+                count,
+                version: *version,
+            };
+            match wal {
+                // Under `always` the 200 is gated on durability: the writer thread fires
+                // the ack after the batch fsync while the engine moves straight on to
+                // stepping. Under `everysec`/`no` durability is deferred by policy, so
+                // the engine acks right after the (queued) append.
+                Some(w) if cfg.fsync == FsyncPolicy::Always => {
+                    w.append(
+                        Rec::Tx {
+                            id: &id,
+                            source: &source,
+                        },
+                        Some(Ack { reply, ok }),
+                    );
+                }
+                Some(w) => {
+                    w.append(
+                        Rec::Tx {
+                            id: &id,
+                            source: &source,
+                        },
+                        None,
+                    );
+                    let _ = reply.send(Ok(ok));
+                }
+                None => {
+                    let _ = reply.send(Ok(ok));
+                }
+            }
         }
         Err(e) => {
             // The kernel loader writes as it parses; the clone undoes any partial load.
             // Nothing was published since the clone, so the version doesn't move.
             space.btm = undo;
             let reason = format!("load failed: {e}");
-            let _ = events.send(Event::Abort { tx: t.id.clone(), reason: reason.clone(), version: *version });
-            let _ = t.reply.send(Err(reason));
+            let _ = events.send(Event::Abort {
+                tx: id.clone(),
+                reason: reason.clone(),
+                version: *version,
+            });
+            let _ = reply.send(Err(reason));
             return;
         }
     }
 
+    finish_tx(space, &id, undo, version, snap_tx, events, active, cfg, wal);
+}
+
+/// Step `txid` to its outcome — quiescent commit, budget stop, or abort — emitting the
+/// outcome event, appending the outcome WAL record, and releasing the `active` entry.
+/// Shared by the live path and the recovery of a crash-interrupted transaction (whose
+/// TX record is already in the log).
+fn finish_tx(
+    space: &mut Space,
+    txid: &TxId,
+    undo: PathMap<()>,
+    version: &mut u64,
+    snap_tx: &watch::Sender<Arc<ReadSnapshot>>,
+    events: &broadcast::Sender<Event>,
+    active: &Arc<Mutex<HashSet<TxId>>>,
+    cfg: &EngineConfig,
+    wal: Option<&Wal>,
+) {
     let mut steps: u64 = 0;
     loop {
         if steps >= cfg.step_budget {
             match cfg.budget_action {
                 BudgetAction::Commit => {
-                    if let Err(e) = pause_pending_execs(space) {
-                        log::error!("parking execs after budget exhaustion: {e}");
+                    match pause_pending_execs(space) {
+                        Ok(true) => *version += 1, // parking is an observable change
+                        Ok(false) => {}
+                        Err(e) => log::error!("parking execs after budget exhaustion: {e}"),
                     }
-                    *version += 1;
                     publish(snap_tx, space, *version);
-                    let _ = events.send(Event::Budget { tx: t.id.clone(), steps, version: *version });
+                    let _ = events.send(Event::Budget {
+                        tx: txid.clone(),
+                        steps,
+                        version: *version,
+                    });
+                    if let Some(w) = wal {
+                        w.append(
+                            Rec::Commit {
+                                id: txid,
+                                steps,
+                                version: *version,
+                            },
+                            None,
+                        );
+                    }
                 }
                 BudgetAction::Abort => {
                     space.btm = undo;
                     *version += 1;
                     publish(snap_tx, space, *version);
                     let reason = format!("step budget exhausted ({steps} steps)");
-                    let _ = events.send(Event::Abort { tx: t.id.clone(), reason, version: *version });
+                    let _ = events.send(Event::Abort {
+                        tx: txid.clone(),
+                        reason,
+                        version: *version,
+                    });
+                    if let Some(w) = wal {
+                        w.append(
+                            Rec::Abort {
+                                id: txid,
+                                reason: "step budget exhausted",
+                            },
+                            None,
+                        );
+                    }
                 }
             }
             break;
         }
-        match step_once(space, &t.id, version, snap_tx, events) {
+        match step_once(space, txid, version, snap_tx, events) {
             StepOutcome::Stepped => steps += 1,
             StepOutcome::Done => {
-                let _ = events.send(Event::Quiescent { tx: t.id.clone(), version: *version });
+                let _ = events.send(Event::Quiescent {
+                    tx: txid.clone(),
+                    version: *version,
+                });
+                if let Some(w) = wal {
+                    w.append(
+                        Rec::Commit {
+                            id: txid,
+                            steps,
+                            version: *version,
+                        },
+                        None,
+                    );
+                }
                 break;
             }
             StepOutcome::Failed(reason) => {
@@ -162,12 +374,25 @@ fn run_tx(
                 space.btm = undo;
                 *version += 1;
                 publish(snap_tx, space, *version);
-                let _ = events.send(Event::Abort { tx: t.id.clone(), reason, version: *version });
+                if let Some(w) = wal {
+                    w.append(
+                        Rec::Abort {
+                            id: txid,
+                            reason: &reason,
+                        },
+                        None,
+                    );
+                }
+                let _ = events.send(Event::Abort {
+                    tx: txid.clone(),
+                    reason,
+                    version: *version,
+                });
                 break;
             }
         }
     }
-    active.lock().unwrap().remove(&t.id);
+    active.lock().unwrap().remove(txid);
 }
 
 /// Budget action `commit`: quiesce by force. Every still-pending `(exec …)` — all of them
@@ -180,19 +405,26 @@ fn run_tx(
 /// Text roundtrip on purpose: the kernel dump prints variables as `$a`, `$b`, … and the
 /// loader re-reads them by name into identical de Bruijn structure, so remove + re-add is
 /// exact. Leftover-exec counts at budget stop are small (the program's frontier).
-fn pause_pending_execs(space: &mut Space) -> Result<(), String> {
+///
+/// Returns whether anything was parked — `false` means the space held no pending execs
+/// (the caller skips its version bump, and WAL replay mirrors that decision exactly).
+fn pause_pending_execs(space: &mut Space) -> Result<bool, String> {
     let mut pat = crate::read::parse_expr_bytes("[4] exec $ $ $", &space.sm)?;
     let mut idt = crate::read::parse_expr_bytes("[4] exec _1 _2 _3", &space.sm)?;
     let mut out = Vec::new();
     Space::dump_sexpr_from(
         &space.btm,
         &space.sm,
-        Expr { ptr: pat.as_mut_ptr() },
-        Expr { ptr: idt.as_mut_ptr() },
+        Expr {
+            ptr: pat.as_mut_ptr(),
+        },
+        Expr {
+            ptr: idt.as_mut_ptr(),
+        },
         &mut out,
     );
     if out.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let execs = String::from_utf8_lossy(&out).into_owned();
     let paused: String = execs
@@ -202,7 +434,180 @@ fn pause_pending_execs(space: &mut Space) -> Result<(), String> {
         .collect();
     space.remove_all_sexpr(execs.as_bytes())?;
     space.add_all_sexpr(paused.as_bytes())?;
-    Ok(())
+    Ok(true)
+}
+
+/// **What**: rebuild the Space from `data_dir` — checkpoint restore + log replay — and
+/// open the WAL for append. Runs on the engine thread before the `ready` signal.
+///
+/// **Why** replay re-executes instead of loading trie changes: stepping is a pure
+/// function of trie contents (raw-byte symbols, trie-order exec picks, no clock/rand),
+/// so the durable history only needs what arrived and how far it ran — the smallest
+/// possible log (VoltDB-style command logging).
+///
+/// **How** (per plan §5.4): load `checkpoint.meta` if present (`restore_paths` +
+/// version/tx_counter/first_segment from it), then per record: `Tx` → hold as pending;
+/// `Commit{steps}` → apply + run exactly `steps` deterministic steps + mirror the
+/// live pause decision; `Abort` → drop pending unapplied. A dangling pending TX (crash
+/// mid-execution; its client is gone) is re-run fresh under the live budget and closed
+/// with a real outcome record. Any impossibility (mid-log corruption was already a hard
+/// error in the scan; replay divergence here) is a hard error — the caller exits rather
+/// than serve a wrong space. Version mismatches against `Commit.version` are logged as
+/// determinism canaries but don't stop recovery.
+///
+/// Replay publishes snapshots and events through the normal paths — nobody is
+/// subscribed yet (the listener binds after `ready`), and reusing the live code kills a
+/// whole parallel non-publishing variant.
+fn recover(
+    space: &mut Space,
+    version: &mut u64,
+    dir: &Path,
+    cfg: &EngineConfig,
+    snap_tx: &watch::Sender<Arc<ReadSnapshot>>,
+    events: &broadcast::Sender<Event>,
+    active: &Arc<Mutex<HashSet<TxId>>>,
+) -> io::Result<Wal> {
+    fs::create_dir_all(dir)?;
+    let mut first_segment = 0u64;
+    let mut max_tx = 0u64;
+
+    if let Some(m) = CkptMeta::load(dir)? {
+        if m.format != "paths" {
+            return Err(io::Error::other(format!(
+                "unsupported checkpoint format '{}'",
+                m.format
+            )));
+        }
+        let snap_path = dir.join(&m.snapshot);
+        if !snap_path.exists() {
+            return Err(io::Error::other(format!(
+                "checkpoint.meta names missing snapshot '{}'",
+                m.snapshot
+            )));
+        }
+        space.restore_paths(&snap_path)?;
+        *version = m.version;
+        max_tx = m.tx_counter;
+        first_segment = m.first_segment;
+        log::info!(
+            "recovered checkpoint '{}' at version {}",
+            m.snapshot,
+            m.version
+        );
+    }
+
+    let recs = wal::read_segments(dir, first_segment)?;
+    let n_recs = recs.len();
+    let mut pending: Option<(TxId, String)> = None;
+    for rec in recs {
+        match rec {
+            OwnedRec::Tx { id, source } => {
+                max_tx = max_tx.max(txid_count(&id).unwrap_or(0));
+                if let Some((prev, _)) = &pending {
+                    return Err(io::Error::other(format!(
+                        "TX {id} while {prev} is unfinished — malformed log"
+                    )));
+                }
+                pending = Some((id, source));
+            }
+            OwnedRec::Commit {
+                id,
+                steps,
+                version: logged,
+            } => {
+                let Some((pid, source)) = pending.take() else {
+                    return Err(io::Error::other(format!(
+                        "COMMIT for {id} with no pending TX"
+                    )));
+                };
+                if pid != id {
+                    return Err(io::Error::other(format!(
+                        "COMMIT for {id} but pending TX is {pid}"
+                    )));
+                }
+                space.add_all_sexpr(source.as_bytes()).map_err(|e| {
+                    io::Error::other(format!(
+                        "replay of {id}: load failed (determinism broken?): {e}"
+                    ))
+                })?;
+                *version += 1;
+                for i in 0..steps {
+                    match step_once(space, &id, version, snap_tx, events) {
+                        StepOutcome::Stepped => {}
+                        StepOutcome::Done => {
+                            return Err(io::Error::other(format!(
+                                "replay of {id}: log says {steps} steps but the space drained after {i}"
+                            )));
+                        }
+                        StepOutcome::Failed(r) => {
+                            return Err(io::Error::other(format!(
+                                "replay of {id}: step {i} failed: {r}"
+                            )));
+                        }
+                    }
+                }
+                if pause_pending_execs(space).map_err(io::Error::other)? {
+                    *version += 1; // mirrors the live budget-commit bump
+                }
+                if *version != logged {
+                    log::error!(
+                        "replay of {id}: version {} != logged {logged} (determinism canary)",
+                        *version
+                    );
+                }
+            }
+            OwnedRec::Abort { id, .. } => {
+                max_tx = max_tx.max(txid_count(&id).unwrap_or(0));
+                pending = None; // never applied — matches the live rollback exactly
+            }
+        }
+    }
+
+    cfg.tx_counter.store(max_tx, Ordering::Relaxed);
+    let w = Wal::open(dir, cfg.fsync)?;
+
+    if let Some((id, source)) = pending {
+        log::warn!("transaction {id} was interrupted by the crash: re-running fresh");
+        let undo = space.btm.clone();
+        match space.add_all_sexpr(source.as_bytes()) {
+            Ok(_) => {
+                *version += 1;
+                finish_tx(
+                    space,
+                    &id,
+                    undo,
+                    version,
+                    snap_tx,
+                    events,
+                    active,
+                    cfg,
+                    Some(&w),
+                );
+            }
+            Err(e) => {
+                space.btm = undo;
+                w.append(
+                    Rec::Abort {
+                        id: &id,
+                        reason: &format!("load failed on recovery: {e}"),
+                    },
+                    None,
+                );
+            }
+        }
+    }
+
+    log::info!(
+        "recovery complete: {n_recs} records replayed, version {}, tx counter {max_tx}",
+        *version
+    );
+    Ok(w)
+}
+
+/// The numeric prefix of a `tx<n>_…` id — what the shared counter must clear after
+/// recovery so fresh ids never collide with replayed ones.
+fn txid_count(id: &str) -> Option<u64> {
+    id.strip_prefix("tx")?.split_once('_')?.0.parse().ok()
 }
 
 enum StepOutcome {
@@ -256,7 +661,10 @@ fn step_at(
             None => {
                 // Stray steps (no `attributed`) are attributed by the txid parsed out of
                 // the exec's own wrapper, when it still carries one.
-                let tx = attributed.cloned().or(parsed_txid).unwrap_or_else(|| "?".into());
+                let tx = attributed
+                    .cloned()
+                    .or(parsed_txid)
+                    .unwrap_or_else(|| "?".into());
                 ev = Some(Event::Step {
                     tx,
                     exec,
@@ -293,6 +701,8 @@ pub fn exec_to_text(bytes: &[u8], sm: &SharedMappingHandle) -> String {
     let mut v = Vec::new();
     let _ = Space::dump_all_sexpr_from(&m, sm, &mut v);
     let mut s = String::from_utf8_lossy(&v).into_owned();
-    while s.ends_with('\n') { s.pop(); }
+    while s.ends_with('\n') {
+        s.pop();
+    }
     s
 }
