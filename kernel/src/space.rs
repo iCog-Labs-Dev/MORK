@@ -1849,13 +1849,17 @@ impl Space {
 
     pub fn sweep(&mut self) -> String {
         let mut groups: HashMap<String, (String, Vec<(String, Vec<Vec<u8>>)>)> = HashMap::new();
+        // We must collect paths to remove first because the zipper `rz` borrows `self.btm`.
+        // Mutating `self.btm` while the zipper is alive is not allowed by the borrow checker.
+        let mut paths_to_remove: Vec<Vec<u8>> = Vec::new();
 
         {
             let mut rz = self.btm.read_zipper();
             while rz.to_next_val() {
                 let path = rz.path();
                 if let Some((name, etype, ops)) = Self::parse_sweep_atom(path) {
-                    groups.insert(name, (etype, ops));
+                    groups.insert(name.clone(), (etype, ops));
+                    paths_to_remove.push(path.to_vec());
                 }
             }
         }
@@ -1872,6 +1876,11 @@ impl Space {
         }).collect();
 
         if valid_groups.is_empty() { return String::new(); }
+
+        // Remove the sweep configuration atoms from self.btm so they won't be processed again
+        for path in &paths_to_remove {
+            self.btm.remove(path);
+        }
 
         self.was.take_trie(std::mem::take(&mut self.btm));
 
