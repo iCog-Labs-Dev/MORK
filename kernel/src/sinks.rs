@@ -404,21 +404,19 @@ impl <const head: bool> Sink for HeadTailSink<head> {
                 self.extremum.extend_from_slice(rz.path()); // yikes, throwing away our needless allocation
             }
         } else {
-            if &self.extremum[..] <= mpath {
-                if self.extrema.insert(mpath, 1u64).is_none() {
-                    trace!(target: "sink", "head/tail adding new top at '{}'", serialize(mpath));
+            if self.extrema.insert(mpath, 1u64).is_none() {
+                trace!(target: "sink", "head/tail adding '{}'", serialize(mpath));
+                self.count += 1;
+                let update = self.extremum.is_empty()
+                    || if head { &self.extremum[..] < mpath } else { mpath < &self.extremum[..] };
+                if update {
                     self.extremum.clear();
                     self.extremum.extend_from_slice(mpath);
-                    self.count += 1;
-                }
-            } else {
-                if self.extrema.insert(mpath, 1u64).is_none() {
-                    trace!(target: "sink", "head/tail adding '{}'", serialize(mpath));
-                    self.count += 1;
                 }
             }
         }
     }
+
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It) -> bool where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
         wz.reset();

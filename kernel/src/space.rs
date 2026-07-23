@@ -920,7 +920,7 @@ impl Space {
         Self::dump_all_sexpr_from(&self.btm, &self.sm, w)
     }
 
-    pub fn dump_all_sexpr_from<W : Write>(btm: &PathMap<()>, sm: &SharedMappingHandle, w: &mut W) -> Result<usize, String> {
+    pub fn dump_all_sexpr_from<W : Write>(btm: &PathMap<u64>, sm: &SharedMappingHandle, w: &mut W) -> Result<usize, String> {
         let mut rz = btm.read_zipper();
         let mut i = 0usize;
         while rz.to_next_val() {
@@ -947,7 +947,7 @@ impl Space {
         Self::dump_sexpr_from(&self.btm, &self.sm, pattern, template, w)
     }
 
-    pub fn dump_sexpr_from<W : Write>(btm: &PathMap<()>, sm: &SharedMappingHandle, pattern: Expr, template: Expr, w: &mut W) -> usize {
+    pub fn dump_sexpr_from<W : Write>(btm: &PathMap<u64>, sm: &SharedMappingHandle, pattern: Expr, template: Expr, w: &mut W) -> usize {
         let constant_template_prefix = unsafe { template.prefix().unwrap_or_else(|_| template.span()).as_ref().unwrap() };
 
         let mut buffer = Vec::with_capacity(1 << 32);
@@ -1890,13 +1890,9 @@ impl Space {
     }
 
     pub fn metta_calculus(&mut self, steps: usize) -> usize {
-        let was_paused = self.was.map.is_some();
-        if was_paused {
-            self.btm = self.was.pause_all();
-        }
-
         self.metta_calculus_scoped(&[], steps, |_| true)
     }
+
 
     /// Steps only execs under `(exec <loc_prefix> …)`. `on_step` is called with each
     /// consumed exec's info; returning `false` stops early (cooperative cancellation).
@@ -1905,6 +1901,10 @@ impl Space {
     /// *continuing* to a next round; an available exec is always consumed first).
     pub fn metta_calculus_scoped(&mut self, loc_prefix: &[u8], steps: usize,
                                  mut on_step: impl FnMut(StepInfo) -> bool) -> usize {
+        let was_paused = self.was.map.is_some();
+        if was_paused {
+            self.btm = self.was.pause_all();
+        }
         let mut done: usize = 0;
         const PREFIX: [u8; 6] = const { [item_byte(Tag::Arity(4)), item_byte(Tag::SymbolSize(4)), b'e', b'x', b'e', b'c' ] };
         let mut full_prefix: Vec<u8> = Vec::with_capacity(PREFIX.len() + loc_prefix.len());
