@@ -78,7 +78,7 @@ impl <'a> Context<'a> {
 pub trait Parser {
   fn tokenizer<'r>(&mut self, s: &[u8]) -> &'r [u8];
 
-  fn sexpr<'a>(&mut self, it: &mut Context<'a>, target: &mut ExprZipper) -> Result<(), ParserError> {
+  fn sexpr<'a>(&mut self, it: &mut Context<'a>, target: &mut ExprZipper) -> Result<(usize, u64), ParserError> {
     use ParserError::*;
     while it.has_next() {
       match it.peek()? {
@@ -100,28 +100,67 @@ pub trait Parser {
             None => { target.write_new_var(); target.loc += 1; }
             Some(ind) => { target.write_var_ref(ind); target.loc += 1; }
           }
-          return Ok(());
+          return Ok((target.loc, 1));
         }
         b'(' => {
           let arity_loc = target.loc;
           target.write_arity(0);
           target.loc += 1;
           it.next()?;
+          let mut arity = 0u8;
+          let mut child_start = arity_loc + 1;
           while it.peek()? != b')' {
             match it.peek()? {
               c if isWhitespace(c) => { it.next()?; }
               _ => {
+                child_start = target.loc;
                 self.sexpr(it, target)?;
+                arity += 1;
                 unsafe {
-                  let p = target.root.ptr.byte_add(arity_loc);
-                  if let Tag::Arity(a) = byte_item(*p) { *p = item_byte(Tag::Arity(a + 1)); }
-                  else { return Err(NotArity) }
+                  *target.root.ptr.byte_add(arity_loc) = item_byte(Tag::Arity(arity));
                 }
               }
             }
           }
           it.next()?;
-          return Ok(())
+
+          // Weight syntax: a trailing `(# NNN)` child marks the weight of the
+          // enclosing atom, e.g. (concept a (# 100)) is stored as (concept a)
+          // with weight 100.  The `#` indicator distinguishes a weight marker
+          // from ordinary data like (concept (100)).
+          //
+          // The last child sits at byte offset `child_start`; a marker is the
+          // sub-expression `(# NNN)`, laid out as:
+          //   [Arity(2)] [SymbolSize(1) '#'] [SymbolSize(n) <ascii digits>]
+          if arity >= 1 {
+            let lc = child_start;
+            let is_marker = unsafe {
+              byte_item(*target.root.ptr.byte_add(lc)) == Tag::Arity(2)
+              && byte_item(*target.root.ptr.byte_add(lc + 1)) == Tag::SymbolSize(1)
+              && *target.root.ptr.byte_add(lc + 2) == b'#'
+            };
+            if is_marker {
+              if let Tag::SymbolSize(n) = unsafe { byte_item(*target.root.ptr.byte_add(lc + 3)) } {
+                if n > 0 && n <= 20 {
+                  let bytes = unsafe {
+                    &*std::ptr::slice_from_raw_parts(target.root.ptr.byte_add(lc + 4), n as usize)
+                  };
+                  if bytes.iter().all(u8::is_ascii_digit) {
+                    let weight = unsafe {
+                      std::str::from_utf8_unchecked(bytes)
+                    }.parse::<u64>().unwrap_or(1);
+                    // Strip the marker: drop it from this atom's arity and
+                    // truncate it off the end of the encoded expression.
+                    unsafe {
+                      *target.root.ptr.byte_add(arity_loc) = item_byte(Tag::Arity(arity - 1));
+                    }
+                    return Ok((lc, weight));
+                  }
+                }
+              }
+            }
+          }
+          return Ok((target.loc, 1));
         }
         b')' => { return Err(UnexpectedRightBracket) }
         _ => {
@@ -151,7 +190,7 @@ pub trait Parser {
           let e = self.tokenizer(unsafe { &it.src.get_unchecked(start..it.loc) });
           target.write_symbol(e);
           target.loc += 1 + e.len();
-          return Ok(());
+          return Ok((target.loc, 1));
         }
       }
     }

@@ -91,7 +91,7 @@ impl PartialOrd for WriteResourceRequest {
 }
 
 pub(crate) enum WriteResource<'w, 'a, 'k> {
-    BTM(&'w mut WriteZipperTracked<'a, 'k, ()>),
+    BTM(&'w mut WriteZipperTracked<'a, 'k, u64>),
     ACT(()),
     Z3(&'w mut subprocess::Popen)
 }
@@ -146,7 +146,7 @@ impl Sink for CompatSink {
         trace!(target: "sink", "+ (compat) at '{}' sinking raw '{}'", serialize(wz.root_prefix_path()), serialize(path));
         trace!(target: "sink", "+ (compat) sinking '{}'", serialize(mpath));
         wz.move_to_path(mpath);
-        self.changed |= wz.set_val(()).is_none();
+        self.changed |= wz.set_val(1u64).is_none();
     }
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, it: It) -> bool where 'a : 'w, 'k : 'w {
         trace!(target: "sink", "+ (compat) finalizing");
@@ -168,7 +168,7 @@ impl Sink for AddSink {
         trace!(target: "sink", "+ at '{}' sinking raw '{}'", serialize(wz.root_prefix_path()), serialize(path));
         trace!(target: "sink", "+ sinking '{}'", serialize(mpath));
         wz.move_to_path(mpath);
-        self.changed |= wz.set_val(()).is_none();
+        self.changed |= wz.set_val(1u64).is_none();
     }
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, it: It) -> bool where 'a : 'w, 'k : 'w {
         trace!(target: "sink", "+ finalizing");
@@ -258,7 +258,7 @@ impl Sink for USink {
                 trace!(target: "sink", "U unified expression '{}'", serialize(buf_slice));
                 let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
                 wz.move_to_path(&buf_slice[wz.root_prefix_path().len()..]);
-                wz.set_val(());
+                wz.set_val(1u64);
                 true
             }
         }
@@ -303,14 +303,14 @@ impl Sink for AUSink {
                 trace!(target: "sink", "AU anti-unified expression '{}'", serialize(&buf[..self.last]));
                 let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
                 wz.move_to_path(&buf[wz.root_prefix_path().len()..self.last]);
-                wz.set_val(());
+                wz.set_val(1u64);
                 true
             }
         }
     }
 }
 
-pub struct ACTSink { e: Expr, file: &'static str, tmp: PathMap<()> }
+pub struct ACTSink { e: Expr, file: &'static str, tmp: PathMap<u64> }
 impl Sink for ACTSink {
     fn new(e: Expr) -> Self {
         destruct!(e, ("ACT" {act: &str} se), {
@@ -323,7 +323,7 @@ impl Sink for ACTSink {
     }
     fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It, path: &[u8]) where 'a : 'w, 'k : 'w {
         trace!(target: "sink", "ACT sinking '{}'", serialize(&path[1+1+3+1+self.file.len()..]));
-        self.tmp.insert(&path[1+1+3+1+self.file.len()..], ());
+        self.tmp.insert(&path[1+1+3+1+self.file.len()..], 1u64);
     }
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It) -> bool where 'a : 'w, 'k : 'w {
         trace!(target: "sink", "ACT finalizing");
@@ -334,7 +334,7 @@ impl Sink for ACTSink {
     }
 }
 
-pub struct RemoveSink { e: Expr, remove: PathMap<()> }
+pub struct RemoveSink { e: Expr, remove: PathMap<u64> }
 // perhaps more performant to graft, remove*, and graft back?
 impl Sink for RemoveSink {
     fn new(e: Expr) -> Self { RemoveSink { e, remove: PathMap::new() } }
@@ -349,7 +349,7 @@ impl Sink for RemoveSink {
         let mpath = &path[3+wz.root_prefix_path().len()..];
         trace!(target: "sink", "- at '{}' sinking raw '{}'", serialize(wz.root_prefix_path()), serialize(path));
         trace!(target: "sink", "- sinking '{}'", serialize(mpath));
-        self.remove.insert(mpath, ());
+        self.remove.insert(mpath, 1u64);
     }
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It) -> bool where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
@@ -371,7 +371,7 @@ impl Sink for RemoveSink {
     }
 }
 
-pub struct HeadTailSink<const head: bool> { e: Expr, extrema: PathMap<()>, skip: usize, count: usize, max: usize, extremum: Vec<u8> }
+pub struct HeadTailSink<const head: bool> { e: Expr, extrema: PathMap<u64>, skip: usize, count: usize, max: usize, extremum: Vec<u8> }
 impl <const head: bool> Sink for HeadTailSink<head> {
     fn new(e: Expr) -> Self {
         let mut ez = ExprZipper::new(e); ez.next(); ez.next();
@@ -395,7 +395,7 @@ impl <const head: bool> Sink for HeadTailSink<head> {
                 // doesn't displace any path
             } else {
                 trace!(target: "sink", "head/tail at max capacity replacing '{}' with '{}'", serialize(&self.extremum[..]), serialize(mpath));
-                assert!(self.extrema.insert(mpath, ()).is_none());
+                assert!(self.extrema.insert(mpath, 1u64).is_none());
                 self.extrema.remove(&self.extremum[..]);
                 let mut rz = self.extrema.read_zipper();
                 if head { rz.descend_last_path(); }
@@ -404,14 +404,17 @@ impl <const head: bool> Sink for HeadTailSink<head> {
                 self.extremum.extend_from_slice(rz.path()); // yikes, throwing away our needless allocation
             }
         } else {
-            if self.extrema.insert(mpath, ()).is_none() {
-                trace!(target: "sink", "head/tail adding '{}'", serialize(mpath));
-                self.count += 1;
-                let update = self.extremum.is_empty()
-                    || if head { &self.extremum[..] < mpath } else { mpath < &self.extremum[..] };
-                if update {
+            if &self.extremum[..] <= mpath {
+                if self.extrema.insert(mpath, 1u64).is_none() {
+                    trace!(target: "sink", "head/tail adding new top at '{}'", serialize(mpath));
                     self.extremum.clear();
                     self.extremum.extend_from_slice(mpath);
+                    self.count += 1;
+                }
+            } else {
+                if self.extrema.insert(mpath, 1u64).is_none() {
+                    trace!(target: "sink", "head/tail adding '{}'", serialize(mpath));
+                    self.count += 1;
                 }
             }
         }
@@ -526,7 +529,7 @@ impl Sink for WASMSink {
                 let ospan = unsafe { Expr{ ptr: omem.as_ptr().cast_mut() }.span().as_ref().unwrap() };
                 trace!(target: "sink", "wasm output '{}'", serialize(ospan));
                 wz.move_to_path(ospan);
-                self.changed |= wz.set_val(()).is_none();
+                self.changed |= wz.set_val(1u64).is_none();
             }
             Err(e) => {
                 trace!(target: "sink", "wasm error {:?}", e);
@@ -544,7 +547,7 @@ impl Sink for WASMSink {
 // (count (count of $k is $i) $i ($x $y))   unify
 // (count (count of r2 is $i) $i (P Q))
 // (count (count of r2 is 3) 3 ($x $y))
-pub struct CountSink { e: Expr, unique: PathMap<()> }
+pub struct CountSink { e: Expr, unique: PathMap<u64> }
 impl Sink for CountSink {
     fn new(e: Expr) -> Self {
         CountSink { e, unique: PathMap::new() }
@@ -560,7 +563,7 @@ impl Sink for CountSink {
         let ctx = unsafe { Expr { ptr: mpath.as_ptr().cast_mut() } };
         trace!(target: "sink", "count at '{}' sinking raw '{}'", serialize(wz.root_prefix_path()), serialize(path));
         trace!(target: "sink", "count registering in ctx {:?}", serialize(mpath));
-        self.unique.insert(mpath, ());
+        self.unique.insert(mpath, 1u64);
     }
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It) -> bool where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
@@ -587,7 +590,7 @@ impl Sink for CountSink {
                     let fixed = &prz.path()[..prz.path().len()-(1+cnt_str.len())];
                     trace!(target: "sink", "fixed guard {}", serialize(fixed));
                     wz.move_to_path(fixed);
-                    wz.set_val(());
+                    wz.set_val(1u64);
                     changed |= true;
                 }
                 prz.ascend(descended + 1);
@@ -596,7 +599,7 @@ impl Sink for CountSink {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(());
+                wz.set_val(1u64);
                 changed |= true;
                 prz.ascend_byte();
             } 
@@ -612,7 +615,7 @@ impl Sink for CountSink {
                     unsafe { buffer.set_len(oz.loc) }
                     trace!(target: "sink", "ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                     wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                    wz.set_val(());
+                    wz.set_val(1u64);
                     changed |= true
                 }
                 prz.ascend_byte();
@@ -623,7 +626,7 @@ impl Sink for CountSink {
     }
 }
 
-pub struct HashSink { e: Expr, unique: PathMap<()> }
+pub struct HashSink { e: Expr, unique: PathMap<u64> }
 impl Sink for HashSink {
     fn new(e: Expr) -> Self {
         Self { e, unique: PathMap::new() }
@@ -639,7 +642,7 @@ impl Sink for HashSink {
         let ctx = unsafe { Expr { ptr: mpath.as_ptr().cast_mut() } };
         trace!(target: "sink", "hash at '{}' sinking raw '{}'", serialize(wz.root_prefix_path()), serialize(path));
         trace!(target: "sink", "hash registering in ctx {:?}", serialize(mpath));
-        self.unique.insert(mpath, ());
+        self.unique.insert(mpath, 1u64);
     }
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It) -> bool where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
@@ -676,7 +679,7 @@ impl Sink for HashSink {
                         let fixed = &prz.origin_path()[..prz.origin_path().len()-(1+size as usize)];
                         trace!(target: "sink", "fixed payload {}", serialize(fixed));
                         wz.move_to_path(fixed);
-                        wz.set_val(());
+                        wz.set_val(1u64);
                         changed |= true;
                     }
 
@@ -689,7 +692,7 @@ impl Sink for HashSink {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(());
+                wz.set_val(1u64);
                 changed |= true;
                 prz.ascend_byte();
             }
@@ -708,7 +711,7 @@ impl Sink for HashSink {
                     unsafe { buffer.set_len(oz.loc) }
                     trace!(target: "sink", "hash ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                     wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                    wz.set_val(());
+                    wz.set_val(1u64);
                     changed |= true
                 }
                 prz.ascend_byte();
@@ -720,7 +723,7 @@ impl Sink for HashSink {
 }
 
 
-pub struct AndSink { e: Expr, unique: PathMap<()> }
+pub struct AndSink { e: Expr, unique: PathMap<u64> }
 impl Sink for AndSink {
     fn new(e: Expr) -> Self {
         Self { e, unique: PathMap::new() }
@@ -736,7 +739,7 @@ impl Sink for AndSink {
         let ctx = unsafe { Expr { ptr: mpath.as_ptr().cast_mut() } };
         trace!(target: "sink", "and at '{}' sinking raw '{}'", serialize(wz.root_prefix_path()), serialize(path));
         trace!(target: "sink", "and registering in ctx {:?}", serialize(mpath));
-        self.unique.insert(mpath, ());
+        self.unique.insert(mpath, 1u64);
     }
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It) -> bool where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
@@ -779,7 +782,7 @@ impl Sink for AndSink {
                         let fixed = &prz.origin_path()[..prz.origin_path().len()-(1+size as usize)];
                         trace!(target: "sink", "fixed payload {}", serialize(fixed));
                         wz.move_to_path(fixed);
-                        wz.set_val(());
+                        wz.set_val(1u64);
                         changed |= true;
                     }
 
@@ -792,7 +795,7 @@ impl Sink for AndSink {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(());
+                wz.set_val(1u64);
                 changed |= true;
                 prz.ascend_byte();
             }
@@ -819,7 +822,7 @@ impl Sink for AndSink {
                     unsafe { buffer.set_len(oz.loc) }
                     trace!(target: "sink", "and ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                     wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                    wz.set_val(());
+                    wz.set_val(1u64);
                     changed |= true
                 }
                 prz.ascend_byte();
@@ -830,7 +833,7 @@ impl Sink for AndSink {
     }
 }
 
-pub struct SumSink { e: Expr, unique: PathMap<()> }
+pub struct SumSink { e: Expr, unique: PathMap<u64> }
 impl Sink for SumSink {
     fn new(e: Expr) -> Self {
         SumSink { e, unique: PathMap::new() }
@@ -846,7 +849,7 @@ impl Sink for SumSink {
         let ctx = unsafe { Expr { ptr: mpath.as_ptr().cast_mut() } };
         trace!(target: "sink", "sum at '{}' sinking raw '{}'", serialize(wz.root_prefix_path()), serialize(path));
         trace!(target: "sink", "sum registering in ctx {:?}", serialize(mpath));
-        self.unique.insert(mpath, ());
+        self.unique.insert(mpath, 1u64);
     }
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It) -> bool where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
@@ -888,7 +891,7 @@ impl Sink for SumSink {
                         let fixed = &prz.origin_path()[..prz.origin_path().len()-(1+size as usize)];
                         trace!(target: "sink", "fixed payload {}", serialize(fixed));
                         wz.move_to_path(fixed);
-                        wz.set_val(());
+                        wz.set_val(1u64);
                         changed |= true;
                     }
 
@@ -901,7 +904,7 @@ impl Sink for SumSink {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(());
+                wz.set_val(1u64);
                 changed |= true;
                 prz.ascend_byte();
             }
@@ -928,7 +931,7 @@ impl Sink for SumSink {
                     unsafe { buffer.set_len(oz.loc) }
                     trace!(target: "sink", "ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                     wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                    wz.set_val(());
+                    wz.set_val(1u64);
                     changed |= true
                 }
                 prz.ascend_byte();
@@ -972,7 +975,7 @@ impl FloatReduction for Prod {
 }
 
 
-pub struct FloatReductionSink<Reduction> { e: Expr, unique: PathMap<()>, boo : PhantomData<Reduction> }
+pub struct FloatReductionSink<Reduction> { e: Expr, unique: PathMap<u64>, boo : PhantomData<Reduction> }
 impl<Reduction : FloatReduction> Sink for FloatReductionSink<Reduction> {
     fn new(e: Expr) -> Self {
         Self { e, unique: PathMap::new(), boo : PhantomData }
@@ -988,7 +991,7 @@ impl<Reduction : FloatReduction> Sink for FloatReductionSink<Reduction> {
         let ctx = unsafe { Expr { ptr: mpath.as_ptr().cast_mut() } };
         trace!(target: "sink", "{} at '{}' sinking raw '{}'", Reduction::NAME, serialize(wz.root_prefix_path()), serialize(path));
         trace!(target: "sink", "{} registering in ctx {:?}", Reduction::NAME, serialize(mpath));
-        self.unique.insert(mpath, ());
+        self.unique.insert(mpath, 1u64);
     }
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It) -> bool where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
@@ -1030,7 +1033,7 @@ impl<Reduction : FloatReduction> Sink for FloatReductionSink<Reduction> {
                         let fixed = &prz.origin_path()[..prz.origin_path().len()-(1+size as usize)];
                         trace!(target: "sink", "fixed payload {}", serialize(fixed));
                         wz.move_to_path(fixed);
-                        wz.set_val(());
+                        wz.set_val(1u64);
                         changed |= true;
                     }
 
@@ -1043,7 +1046,7 @@ impl<Reduction : FloatReduction> Sink for FloatReductionSink<Reduction> {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(());
+                wz.set_val(1u64);
                 changed |= true;
                 prz.ascend_byte();
             }
@@ -1070,7 +1073,7 @@ impl<Reduction : FloatReduction> Sink for FloatReductionSink<Reduction> {
                     unsafe { buffer.set_len(oz.loc) }
                     trace!(target: "sink", "ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                     wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                    wz.set_val(());
+                    wz.set_val(1u64);
                     changed |= true
                 }
                 prz.ascend_byte();
@@ -1084,7 +1087,7 @@ impl<Reduction : FloatReduction> Sink for FloatReductionSink<Reduction> {
 
 // (pure (result $x) $x (f32_from_string 0.2))
 #[cfg(feature = "grounding")]
-pub struct PureSink { e: Expr, unique: PathMap<()> , scope: EvalScope }
+pub struct PureSink { e: Expr, unique: PathMap<u64> , scope: EvalScope }
 impl Sink for PureSink {
     fn new(e: Expr) -> Self {
         let mut scope = EvalScope::new();
@@ -1102,7 +1105,7 @@ impl Sink for PureSink {
         let ctx = unsafe { Expr { ptr: mpath.as_ptr().cast_mut() } };
         trace!(target: "sink", "pure at '{}' sinking raw '{}'", serialize(wz.root_prefix_path()), serialize(path));
         trace!(target: "sink", "pure registering in ctx {:?}", serialize(mpath));
-        self.unique.insert(mpath, ());
+        self.unique.insert(mpath, 1u64);
 
     }
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It) -> bool where 'a : 'w, 'k : 'w {
@@ -1149,7 +1152,7 @@ impl Sink for PureSink {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(());
+                wz.set_val(1u64);
                 changed |= true;
                 prz.ascend_byte();
             }
@@ -1177,7 +1180,7 @@ impl Sink for PureSink {
                         unsafe { buffer.set_len(oz.loc) }
                         trace!(target: "sink", "ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                         wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                        wz.set_val(());
+                        wz.set_val(1u64);
                         changed |= true;
                         self.scope.return_alloc(res);
                     }

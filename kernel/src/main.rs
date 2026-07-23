@@ -5,7 +5,7 @@ use mork::space::{transitions, unifications, writes, Space, ACT_PATH};
 use mork_frontend::bytestring_parser::Parser;
 use mork_expr::{item_byte, serialize, SourceItem, Tag};
 use pathmap::PathMap;
-use pathmap::zipper::{Zipper, ZipperAbsolutePath, ZipperIteration, ZipperMoving};
+use pathmap::zipper::{Zipper, ZipperAbsolutePath, ZipperIteration, ZipperMoving, ZipperValues};
 use std::collections::{BTreeSet, HashSet};
 use std::time::Instant;
 use std::ffi::OsStr;
@@ -3329,7 +3329,7 @@ fn sink_wasm_add() {
             e.extend_from_slice(is.as_bytes());
             e.push(item_byte(Tag::SymbolSize(4)));
             e.extend_from_slice(((options.len() as i32)*i + (k as i32)).to_be_bytes().as_slice());
-            s.btm.insert(&e[..], ());
+            s.btm.insert(&e[..], 1u64);
         }
     }
     s.add_all_sexpr(&args[..]).unwrap();
@@ -4835,7 +4835,7 @@ fn json_upaths_smoke() {
     let written = s.json_to_paths(test.as_bytes(), &mut cv).unwrap();
     // println!("{:?}", pathmap::path_serialization::serialize_paths_(btm.read_zipper(), &mut cv));
     println!("written {written}");
-    pathmap::paths_serialization::deserialize_paths(s.btm.write_zipper(), &cv[..], ()).unwrap();
+    pathmap::paths_serialization::deserialize_paths(s.btm.write_zipper(), &cv[..], 1u64).unwrap();
 
     let mut v = vec![];
     s.dump_all_sexpr(&mut v).unwrap();
@@ -6069,6 +6069,98 @@ const SEXPRS0: &str = r#"(first_name John)
 (spouse null)
 "#;
 
+fn weight_basics() {
+    let mut s = Space::new();
+    s.add_all_sexpr(b"(a)(b)").unwrap();
+    assert_eq!(s.btm.val_count(), 2, "should have 2 atoms");
+    let root_w = s.btm.read_zipper_at_path(&[]).agg_w();
+    assert_eq!(root_w, 2, "root agg_w should be 2 (2 default weights), got {root_w}");
+    println!("weight basics: default weight 1, root_agg_w={}", root_w);
+}
+
+fn weight_explicit() {
+    let mut s = Space::new();
+    s.add_all_sexpr(b"(x (# 100))(y (# 200))(z)").unwrap();
+    assert_eq!(s.btm.val_count(), 3, "should have 3 atoms");
+    let root_w = s.btm.read_zipper_at_path(&[]).agg_w();
+    assert_eq!(root_w, 301, "root agg_w should be 100+200+1=301, got {root_w}");
+
+    // (# N) marker is NOT stored as part of the expression path or dump output
+    let mut dumped = vec![];
+    s.dump_all_sexpr(&mut dumped).unwrap();
+    let text = String::from_utf8_lossy_owned(dumped);
+    assert!(!text.contains('#'), "(# N) marker must not appear in dumped output: {text}");
+    assert!(text.contains("(x)"), "dumped output must include (x)");
+    assert!(text.contains("(y)"), "dumped output must include (y)");
+    assert!(text.contains("(z)"), "dumped output must include (z)");
+
+    // Verify individual atom weights via the zipper
+    let mut rz = s.btm.read_zipper();
+    let mut weight_sum = 0u64;
+    while rz.to_next_val() {
+        weight_sum += rz.val().copied().unwrap_or(0);
+    }
+    assert_eq!(weight_sum, 301, "sum of individual weights should equal root agg_w");
+
+    println!("weight explicit: 3 atoms with varied weights, root_agg_w={}", root_w);
+}
+
+fn sweep_parser_one_engine() {
+    let mut s = Space::new();
+    s.add_all_sexpr(b"(sweep imp (e random_walk) (o decay))").unwrap();
+    let handle = s.sweep();
+    assert!(!handle.is_empty(), "one sweep handle");
+    assert_eq!(s.was.controllers.len(), 1, "one controller");
+    assert!(s.was.map.is_some(), "STATE B");
+    assert_eq!(s.btm.val_count(), 0, "btm emptied in STATE B");
+    s.was.shutdown_all();
+    println!("sweep_parser_one_engine: 1 controller");
+}
+
+fn sweep_parser_two_engines() {
+    let mut s = Space::new();
+    s.add_all_sexpr(b"(sweep a (e random_walk))(sweep b (e cpq))").unwrap();
+    let handle = s.sweep();
+    assert!(!handle.is_empty(), "one sweep handle for two engines");
+    assert_eq!(s.was.controllers.len(), 1, "one controller for all engines");
+    s.was.shutdown_all();
+    println!("sweep_parser_two_engines: 1 controller");
+}
+
+fn sweep_parser_empty() {
+    let mut s = Space::new();
+    s.add_all_sexpr(b"(a)(b)").unwrap();
+    let handle = s.sweep();
+    assert!(handle.is_empty(), "no sweep atoms");
+    assert!(s.was.map.is_none(), "STATE A unchanged");
+    assert_eq!(s.btm.val_count(), 2, "btm untouched");
+    println!("sweep_parser_empty: no sweep atoms");
+}
+
+fn sweep_parser_bogus_type() {
+    let mut s = Space::new();
+    s.add_all_sexpr(b"(sweep imp (e bogus_type))").unwrap();
+    let handle = s.sweep();
+    assert!(handle.is_empty(), "bogus engine type skipped");
+    println!("sweep_parser_bogus_type: engine skipped, no crash");
+}
+
+fn sweep_pause_resume() {
+    let mut s = Space::new();
+    s.add_all_sexpr(b"(sweep e (e random_walk) (o decay))").unwrap();
+    let handle = s.sweep();
+    assert!(!handle.is_empty(), "sweep started");
+    assert!(s.was.map.is_some(), "STATE B after sweep");
+    assert_eq!(s.btm.val_count(), 0, "btm emptied in STATE B");
+
+    let _done = s.metta_calculus(100);
+    assert!(s.was.map.is_some(), "STATE B restored after metta_calculus");
+    assert_eq!(s.btm.val_count(), 0, "btm empty in STATE B");
+
+    s.was.shutdown_all();
+    println!("sweep_pause_resume: pause/resume OK");
+}
+
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 enum Format { MeTTa, JSON, CSV, UPaths, Paths, ACT }
@@ -6232,6 +6324,14 @@ fn main() {
 
             parse_csv();
             parse_json();
+
+            weight_basics();
+            weight_explicit();
+            sweep_parser_one_engine();
+            sweep_parser_two_engines();
+            sweep_parser_empty();
+            sweep_parser_bogus_type();
+            sweep_pause_resume();
 
             #[cfg(target_os = "linux")]
             sink_act_readback();
