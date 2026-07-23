@@ -12,13 +12,23 @@ use serde_json::{json, Value};
 /// `tx<count>_<unique 8-char alphanumeric>`, e.g. `tx17_si49f8v6`.
 pub type TxId = String;
 
-/// The one and only engine command: an atomically-applied, auto-running unit of data +
-/// execs, already loc-wrapped into its namespace by `wrap::rewrite`.
+/// A transaction: an atomically-applied, auto-running unit of data + execs, already
+/// loc-wrapped into its namespace by `wrap::rewrite`.
 pub struct Transaction {
     pub id: TxId,
     /// Rewritten MeTTa source, ready for `Space::add_all_sexpr` verbatim.
     pub source: String,
     pub reply: tokio::sync::oneshot::Sender<Result<TxOk, String>>,
+}
+
+/// Commands the HTTP layer sends to the engine thread. Everything that mutates `Space`
+/// goes through this channel — `Space` is `!Send`, so only the engine thread touches it.
+pub enum EngineCmd {
+    Tx(Transaction),
+    SweepStart { reply: tokio::sync::oneshot::Sender<Result<String, String>> },
+    SweepPause { reply: tokio::sync::oneshot::Sender<Result<(), String>> },
+    SweepResume { reply: tokio::sync::oneshot::Sender<Result<(), String>> },
+    SweepStop { reply: tokio::sync::oneshot::Sender<Result<(), String>> },
 }
 
 pub struct TxOk {
@@ -100,7 +110,7 @@ impl Event {
 /// A consistent, immutable view of the space: an O(1) copy-on-write clone of the trie plus
 /// the (shared, thread-safe) symbol table, stamped with the step version it was taken at.
 pub struct ReadSnapshot {
-    pub btm: PathMap<()>,
+    pub btm: PathMap<u64>,
     pub sm: SharedMappingHandle,
     pub version: u64,
 }
@@ -114,7 +124,7 @@ impl ReadSnapshot {
 /// What the HTTP layer holds: submit transactions, read the latest snapshot, subscribe to
 /// events. The `Space` itself is owned exclusively by the engine thread.
 pub struct ServerState {
-    pub tx_send: tokio::sync::mpsc::Sender<Transaction>,
+    pub tx_send: tokio::sync::mpsc::Sender<EngineCmd>,
     pub snapshot: tokio::sync::watch::Receiver<Arc<ReadSnapshot>>,
     pub events: tokio::sync::broadcast::Sender<Event>,
     /// Shared with the engine: recovery restores it to the highest replayed txid count

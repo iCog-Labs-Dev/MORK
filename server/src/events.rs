@@ -115,7 +115,7 @@ pub async fn delta_task(
     }
 }
 
-fn dump_lines(m: &pathmap::PathMap<()>, sm: &mork_interning::SharedMappingHandle) -> Vec<String> {
+fn dump_lines(m: &pathmap::PathMap<u64>, sm: &mork_interning::SharedMappingHandle) -> Vec<String> {
     let mut v = Vec::new();
     let _ = Space::dump_all_sexpr_from(m, sm, &mut v);
     String::from_utf8_lossy(&v)

@@ -22,7 +22,7 @@ use mork_interning::SharedMappingHandle;
 use pathmap::PathMap;
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::transaction::{Event, ReadSnapshot, Transaction, TxId, TxOk};
+use crate::transaction::{EngineCmd, Event, ReadSnapshot, Transaction, TxId, TxOk};
 use crate::wal::{Ack, CkptMeta, FsyncPolicy, OwnedRec, Rec, Wal};
 use crate::{wal, wrap};
 
@@ -58,12 +58,12 @@ pub fn spawn_engine(
     active: Arc<Mutex<HashSet<TxId>>>,
     cfg: EngineConfig,
 ) -> (
-    mpsc::Sender<Transaction>,
+    mpsc::Sender<EngineCmd>,
     watch::Receiver<Arc<ReadSnapshot>>,
     ReadySignal,
     std::thread::JoinHandle<()>,
 ) {
-    let (tx_send, rx) = mpsc::channel::<Transaction>(1024);
+    let (tx_send, rx) = mpsc::channel::<EngineCmd>(1024);
     let (snap_tx, snap_rx) = watch::channel(Arc::new(ReadSnapshot::empty()));
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let handle = std::thread::Builder::new()
@@ -78,7 +78,7 @@ pub fn spawn_engine(
 }
 
 fn run(
-    mut rx: mpsc::Receiver<Transaction>,
+    mut rx: mpsc::Receiver<EngineCmd>,
     snap_tx: watch::Sender<Arc<ReadSnapshot>>,
     events: broadcast::Sender<Event>,
     active: Arc<Mutex<HashSet<TxId>>>,
@@ -116,19 +116,8 @@ fn run(
         // Drain queued submissions before parking; `Idle` is only truthful when both the
         // space and the queue are empty.
         match rx.try_recv() {
-            Ok(t) => {
-                run_tx(
-                    &mut space,
-                    t,
-                    &mut version,
-                    &snap_tx,
-                    &events,
-                    &active,
-                    &cfg,
-                    wal,
-                );
-                finished += 1;
-                maybe_checkpoint(&space, version, finished, &cfg, wal);
+            Ok(cmd) => {
+                dispatch_cmd(cmd, &mut space, &mut version, &snap_tx, &events, &active, &cfg, wal, &mut finished);
                 continue;
             }
             Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -136,25 +125,76 @@ fn run(
         }
         let _ = events.send(Event::Idle { version });
         match rx.blocking_recv() {
-            Some(t) => {
-                run_tx(
-                    &mut space,
-                    t,
-                    &mut version,
-                    &snap_tx,
-                    &events,
-                    &active,
-                    &cfg,
-                    wal,
-                );
-                finished += 1;
-                maybe_checkpoint(&space, version, finished, &cfg, wal);
+            Some(cmd) => {
+                dispatch_cmd(cmd, &mut space, &mut version, &snap_tx, &events, &active, &cfg, wal, &mut finished);
             }
             None => break,
         }
     }
     log::info!("engine: transaction channel closed, shutting down");
     // Dropping the Wal (owner is still in scope) drains its queue and final-fsyncs.
+}
+
+/// Dispatch one command from the engine channel.
+fn dispatch_cmd(
+    cmd: EngineCmd,
+    space: &mut Space,
+    version: &mut u64,
+    snap_tx: &watch::Sender<Arc<ReadSnapshot>>,
+    events: &broadcast::Sender<Event>,
+    active: &Arc<Mutex<HashSet<TxId>>>,
+    cfg: &EngineConfig,
+    wal: Option<&Wal>,
+    finished: &mut u64,
+) {
+    match cmd {
+        EngineCmd::Tx(t) => {
+            run_tx(space, t, version, snap_tx, events, active, cfg, wal);
+            *finished += 1;
+            maybe_checkpoint(space, *version, *finished, cfg, wal);
+        }
+        EngineCmd::SweepStart { reply } => {
+            println!("SERVER DEBUG: btm val_count BEFORE sweep = {}, root agg_w = {}", space.btm.val_count(), space.btm.read_zipper_at_path(&[]).agg_w());
+            let handle_name = space.sweep();
+            println!("SERVER DEBUG: btm val_count AFTER sweep = {}", space.btm.val_count());
+            if handle_name.is_empty() {
+                let _ = reply.send(Err("No (sweep ...) configuration found in space".into()));
+            } else {
+                let _ = reply.send(Ok(handle_name));
+            }
+        }
+        EngineCmd::SweepPause { reply } => {
+            if !space.was.controllers.is_empty() {
+                space.btm = space.was.pause_all();
+                *version += 1;
+                publish(snap_tx, space, *version);
+                let _ = reply.send(Ok(()));
+            } else {
+                let _ = reply.send(Err("No active sweep controllers to pause".into()));
+            }
+        }
+        EngineCmd::SweepResume { reply } => {
+            if !space.was.controllers.is_empty() {
+                let btm = std::mem::take(&mut space.btm);
+                space.was.resume_all(btm);
+                let _ = reply.send(Ok(()));
+            } else {
+                let _ = reply.send(Err("No sweep controllers to resume".into()));
+            }
+        }
+        EngineCmd::SweepStop { reply } => {
+            if !space.was.controllers.is_empty() {
+                if let Some(btm) = space.was.shutdown_all() {
+                    space.btm = btm;
+                }
+                *version += 1;
+                publish(snap_tx, space, *version);
+                let _ = reply.send(Ok(()));
+            } else {
+                let _ = reply.send(Err("No sweep controllers running".into()));
+            }
+        }
+    }
 }
 
 /// Every `checkpoint_every` finished transactions, hand the WAL an O(1) COW clone of the
@@ -291,7 +331,7 @@ fn run_tx(
 fn finish_tx(
     space: &mut Space,
     txid: &TxId,
-    undo: PathMap<()>,
+    undo: PathMap<u64>,
     version: &mut u64,
     snap_tx: &watch::Sender<Arc<ReadSnapshot>>,
     events: &broadcast::Sender<Event>,
@@ -696,8 +736,8 @@ fn step_at(
 /// throwaway map and reuse the kernel's own dump (handles the `interning` feature
 /// consistently).
 pub fn exec_to_text(bytes: &[u8], sm: &SharedMappingHandle) -> String {
-    let mut m: PathMap<()> = PathMap::new();
-    m.insert(bytes, ());
+    let mut m: PathMap<u64> = PathMap::new();
+    m.insert(bytes, 1u64);
     let mut v = Vec::new();
     let _ = Space::dump_all_sexpr_from(&m, sm, &mut v);
     let mut s = String::from_utf8_lossy(&v).into_owned();
