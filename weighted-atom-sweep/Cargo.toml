@@ -1,0 +1,22 @@
+[package]
+name = "weighted-atom-sweep"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tracing = "0.1"
+rand = "0.9"
+
+[dependencies.pathmap]
+git = "https://github.com/abnsol/PathMap.git"
+branch = "aggregate_weight"
+features = ["zipper_tracking", "arena_compact"]
+
+[dependencies.mork-expr]
+path = "../expr"
+default-features = false
+features = ["nightly"]
+
+[dev-dependencies]
+tracing = "0.1"
+tracing-subscriber = "0.3"

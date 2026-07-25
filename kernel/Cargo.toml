@@ -26,7 +26,7 @@ itertools = "0.14.0"
 base64 = "0.22.1"
 hex = "0.4.3"
 subprocess = { version = "0.2.13" }
-weighted-atom-sweep = { path = "../../weighted-atom-sweep" }
+weighted-atom-sweep = { path = "../weighted-atom-sweep" }
 
 [features]
 default = ["grounding", "specialize_io"]
