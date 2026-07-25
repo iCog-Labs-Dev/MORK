@@ -261,6 +261,11 @@ fn run_tx(
         }
     }
 
+    let was_running = space.was.map.is_some();
+    if was_running {
+        space.btm = space.was.pause_all();
+    }
+
     let undo = space.btm.clone();
     match space.add_all_sexpr(source.as_bytes()) {
         Ok(count) => {
@@ -317,11 +322,20 @@ fn run_tx(
                 version: *version,
             });
             let _ = reply.send(Err(reason));
+            if was_running {
+                let btm = std::mem::take(&mut space.btm);
+                space.was.resume_all(btm);
+            }
             return;
         }
     }
 
     finish_tx(space, &id, undo, version, snap_tx, events, active, cfg, wal);
+
+    if was_running {
+        let btm = std::mem::take(&mut space.btm);
+        space.was.resume_all(btm);
+    }
 }
 
 /// Step `txid` to its outcome — quiescent commit, budget stop, or abort — emitting the
