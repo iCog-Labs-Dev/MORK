@@ -126,6 +126,30 @@ class MorkClient:
         """Raw `POST /run` for exercising error paths (bad syntax, non-UTF-8, …)."""
         return self._session.post(f"{self.base_url}/run", data=body, timeout=30.0)
 
+    def sweep_start(self) -> str:
+        """`POST /sweep/start`; returns the server's sweep handle name."""
+        body = self._sweep_control("start")
+        return str(body["handle"])
+
+    def sweep_pause(self) -> None:
+        """`POST /sweep/pause`."""
+        self._sweep_control("pause")
+
+    def sweep_resume(self) -> None:
+        """`POST /sweep/resume`."""
+        self._sweep_control("resume")
+
+    def sweep_stop(self) -> None:
+        """`POST /sweep/stop`."""
+        self._sweep_control("stop")
+
+    def _sweep_control(self, action: str) -> dict[str, Any]:
+        resp = self._session.post(f"{self.base_url}/sweep/{action}", timeout=30.0)
+        body: dict[str, Any] = resp.json()
+        if resp.status_code != 200 or not body.get("ok"):
+            raise MorkError(resp.status_code, str(body.get("error", body)))
+        return body
+
     def export(self, pattern: str | None = None, template: str | None = None) -> list[str]:
         """`GET /export` — full dump with no args, query with both."""
         if (pattern is None) != (template is None):

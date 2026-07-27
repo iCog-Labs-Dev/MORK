@@ -457,6 +457,15 @@ pub struct StepInfo<'e> {
     pub error: Option<&'static str>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CycleSchedulerStats {
+    pub cycles: usize,
+    pub sweep_steps: usize,
+    pub sweep_touched: usize,
+    pub sweep_new: bool,
+    pub metta_steps: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryPolicy {
     All,
@@ -2219,6 +2228,39 @@ impl Space {
         }
 
         result
+    }
+
+    fn metta_calculus_bounded(&mut self, steps: usize) -> usize {
+        if steps == 0 {
+            return 0;
+        }
+
+        let mut performed = 0;
+        self.metta_calculus_scoped(&[], steps, |_| {
+            performed += 1;
+            performed < steps
+        });
+        performed
+    }
+
+    pub fn cycle_scheduler(
+        &mut self,
+        sweep_steps: usize,
+        metta_steps: usize,
+        cycles: usize,
+    ) -> Result<CycleSchedulerStats, &'static str> {
+        let mut stats = CycleSchedulerStats::default();
+        for _ in 0..cycles {
+            if sweep_steps > 0 {
+                let (touched, new) = self.run_sweep_cycles(sweep_steps)?;
+                stats.sweep_steps += sweep_steps;
+                stats.sweep_touched += touched;
+                stats.sweep_new |= new;
+            }
+            stats.metta_steps += self.metta_calculus_bounded(metta_steps);
+            stats.cycles += 1;
+        }
+        Ok(stats)
     }
 
     pub fn metta_calculus(&mut self, steps: usize) -> usize {

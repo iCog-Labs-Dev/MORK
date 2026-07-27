@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::{fs, io};
 
 use mork::space::Space;
@@ -38,6 +39,12 @@ pub enum BudgetAction {
 pub struct EngineConfig {
     pub step_budget: u64,
     pub budget_action: BudgetAction,
+    /// Source/sink sweep passes per cooperative scheduler cycle.
+    pub sweep_steps_per_cycle: usize,
+    /// Whole-space metta-calculus steps after each weighted sweep batch.
+    pub sweep_metta_steps: usize,
+    /// Backoff when an active source/sink sweep cycle makes no observable progress.
+    pub sweep_idle_ms: u64,
     /// Persistence root; `None` = pure in-memory (no WAL, no recovery).
     pub data_dir: Option<std::path::PathBuf>,
     pub fsync: FsyncPolicy,
@@ -46,6 +53,41 @@ pub struct EngineConfig {
     pub checkpoint_every: u64,
     /// Shared with the HTTP layer; recovery restores it before `ready` fires.
     pub tx_counter: Arc<AtomicU64>,
+}
+
+#[derive(Default)]
+struct SweepSchedulerState {
+    running: bool,
+    paused: bool,
+    idle_version: Option<u64>,
+}
+
+impl SweepSchedulerState {
+    fn active(&self) -> bool {
+        self.running && !self.paused
+    }
+
+    fn start(&mut self) {
+        self.running = true;
+        self.paused = false;
+        self.idle_version = None;
+    }
+
+    fn pause(&mut self) {
+        self.paused = true;
+        self.idle_version = None;
+    }
+
+    fn resume(&mut self) {
+        self.paused = false;
+        self.idle_version = None;
+    }
+
+    fn stop(&mut self) {
+        self.running = false;
+        self.paused = false;
+        self.idle_version = None;
+    }
 }
 
 /// Returned alongside the channels: fires once recovery is done and the snapshot is
@@ -112,21 +154,41 @@ fn run(
     let _ = ready.send(());
 
     let mut finished: u64 = 0; // transactions run to an outcome, for the checkpoint trigger
+    let mut scheduler = SweepSchedulerState::default();
     loop {
         // Drain queued submissions before parking; `Idle` is only truthful when both the
         // space and the queue are empty.
         match rx.try_recv() {
             Ok(cmd) => {
-                dispatch_cmd(cmd, &mut space, &mut version, &snap_tx, &events, &active, &cfg, wal, &mut finished);
+                scheduler.idle_version = None;
+                dispatch_cmd(cmd, &mut space, &mut version, &snap_tx, &events, &active, &cfg, wal, &mut finished, &mut scheduler);
                 continue;
             }
             Err(mpsc::error::TryRecvError::Disconnected) => break,
             Err(mpsc::error::TryRecvError::Empty) => {}
         }
+        if scheduler.active() {
+            match run_sweep_scheduler_tick(&mut space, &mut version, &snap_tx, &events, &cfg) {
+                Ok(true) => scheduler.idle_version = None,
+                Ok(false) => {
+                    if scheduler.idle_version != Some(version) {
+                        let _ = events.send(Event::Idle { version });
+                        scheduler.idle_version = Some(version);
+                    }
+                    sleep_scheduler_idle(cfg.sweep_idle_ms);
+                }
+                Err(e) => {
+                    log::error!("sweep scheduler stopped: {e}");
+                    scheduler.stop();
+                }
+            }
+            continue;
+        }
         let _ = events.send(Event::Idle { version });
         match rx.blocking_recv() {
             Some(cmd) => {
-                dispatch_cmd(cmd, &mut space, &mut version, &snap_tx, &events, &active, &cfg, wal, &mut finished);
+                scheduler.idle_version = None;
+                dispatch_cmd(cmd, &mut space, &mut version, &snap_tx, &events, &active, &cfg, wal, &mut finished, &mut scheduler);
             }
             None => break,
         }
@@ -146,6 +208,7 @@ fn dispatch_cmd(
     cfg: &EngineConfig,
     wal: Option<&Wal>,
     finished: &mut u64,
+    scheduler: &mut SweepSchedulerState,
 ) {
     match cmd {
         EngineCmd::Tx(t) => {
@@ -154,47 +217,192 @@ fn dispatch_cmd(
             maybe_checkpoint(space, *version, *finished, cfg, wal);
         }
         EngineCmd::SweepStart { reply } => {
-            println!("SERVER DEBUG: btm val_count BEFORE sweep = {}, root agg_w = {}", space.btm.val_count(), space.btm.read_zipper_at_path(&[]).agg_w());
             let handle_name = space.sweep();
-            println!("SERVER DEBUG: btm val_count AFTER sweep = {}", space.btm.val_count());
-            if handle_name.is_empty() {
+            let source_sink_sweeps = has_source_sink_sweeps(space);
+            let legacy_sweeps = !space.was.controllers.is_empty();
+            if handle_name.is_empty() && !source_sink_sweeps && !legacy_sweeps {
                 let _ = reply.send(Err("No (sweep ...) configuration found in space".into()));
             } else {
-                let _ = reply.send(Ok(handle_name));
+                if source_sink_sweeps {
+                    scheduler.start();
+                }
+                if !handle_name.is_empty() && space.was.map.is_none() {
+                    *version += 1;
+                    publish(snap_tx, space, *version);
+                }
+                let handle = if source_sink_sweeps
+                    && (handle_name.is_empty() || handle_name == "sweep-config")
+                {
+                    "sweep-scheduler".to_string()
+                } else if handle_name.is_empty() && legacy_sweeps {
+                    "sweep-running".to_string()
+                } else {
+                    handle_name
+                };
+                let _ = reply.send(Ok(handle));
             }
         }
         EngineCmd::SweepPause { reply } => {
+            let mut handled = false;
             if !space.was.controllers.is_empty() {
-                space.btm = space.was.pause_all();
-                *version += 1;
-                publish(snap_tx, space, *version);
+                handled = true;
+                if space.was.map.is_some() {
+                    space.btm = space.was.pause_all();
+                    *version += 1;
+                    publish(snap_tx, space, *version);
+                }
+            }
+            if scheduler.running {
+                handled = true;
+                scheduler.pause();
+            }
+            if handled {
                 let _ = reply.send(Ok(()));
             } else {
                 let _ = reply.send(Err("No active sweep controllers to pause".into()));
             }
         }
         EngineCmd::SweepResume { reply } => {
+            let mut handled = false;
             if !space.was.controllers.is_empty() {
-                let btm = std::mem::take(&mut space.btm);
-                space.was.resume_all(btm);
+                handled = true;
+                if space.was.map.is_none() {
+                    let btm = std::mem::take(&mut space.btm);
+                    space.was.resume_all(btm);
+                }
+            }
+            if scheduler.running {
+                handled = true;
+                scheduler.resume();
+            }
+            if handled {
                 let _ = reply.send(Ok(()));
             } else {
                 let _ = reply.send(Err("No sweep controllers to resume".into()));
             }
         }
         EngineCmd::SweepStop { reply } => {
+            let mut handled = false;
+            let mut old_was_changed = false;
             if !space.was.controllers.is_empty() {
+                handled = true;
+                if space.was.map.is_some() {
+                    space.btm = space.was.pause_all();
+                    old_was_changed = true;
+                }
                 if let Some(btm) = space.was.shutdown_all() {
                     space.btm = btm;
+                    old_was_changed = true;
                 }
-                *version += 1;
-                publish(snap_tx, space, *version);
+            }
+            if scheduler.running {
+                handled = true;
+                scheduler.stop();
+            }
+            if handled {
+                if old_was_changed {
+                    *version += 1;
+                    publish(snap_tx, space, *version);
+                }
                 let _ = reply.send(Ok(()));
             } else {
                 let _ = reply.send(Err("No sweep controllers running".into()));
             }
         }
     }
+}
+
+fn has_source_sink_sweeps(space: &Space) -> bool {
+    space.sweep_specs.values().any(|spec| spec.rule.is_some())
+}
+
+fn sleep_scheduler_idle(ms: u64) {
+    if ms == 0 {
+        std::thread::yield_now();
+    } else {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+fn run_sweep_scheduler_tick(
+    space: &mut Space,
+    version: &mut u64,
+    snap_tx: &watch::Sender<Arc<ReadSnapshot>>,
+    events: &broadcast::Sender<Event>,
+    cfg: &EngineConfig,
+) -> Result<bool, String> {
+    let was_running = space.was.map.is_some();
+    if was_running {
+        space.btm = space.was.pause_all();
+    }
+
+    let result = run_sweep_scheduler_tick_foreground(space, version, snap_tx, events, cfg);
+
+    if was_running {
+        let btm = std::mem::take(&mut space.btm);
+        space.was.resume_all(btm);
+    }
+
+    result
+}
+
+fn run_sweep_scheduler_tick_foreground(
+    space: &mut Space,
+    version: &mut u64,
+    snap_tx: &watch::Sender<Arc<ReadSnapshot>>,
+    events: &broadcast::Sender<Event>,
+    cfg: &EngineConfig,
+) -> Result<bool, String> {
+    let mut progressed = false;
+
+    if cfg.sweep_steps_per_cycle > 0 {
+        let (_touched, changed) = space
+            .run_sweep_cycles(cfg.sweep_steps_per_cycle)
+            .map_err(|e| e.to_string())?;
+        if changed {
+            *version += 1;
+            publish(snap_tx, space, *version);
+            progressed = true;
+        }
+    }
+
+    if cfg.sweep_metta_steps == 0 {
+        return Ok(progressed);
+    }
+
+    let undo = space.btm.clone();
+    let tx = "sweep".to_string();
+    let mut stepped = false;
+    for _ in 0..cfg.sweep_metta_steps {
+        match step_at(space, &[], Some(&tx), version, snap_tx, events) {
+            Some(StepOutcome::Stepped) => {
+                progressed = true;
+                stepped = true;
+            }
+            Some(StepOutcome::Done) | None => {
+                if stepped {
+                    let _ = events.send(Event::Quiescent {
+                        tx: tx.clone(),
+                        version: *version,
+                    });
+                }
+                break;
+            }
+            Some(StepOutcome::Failed(reason)) => {
+                space.btm = undo;
+                *version += 1;
+                publish(snap_tx, space, *version);
+                let _ = events.send(Event::Abort {
+                    tx: tx.clone(),
+                    reason: reason.clone(),
+                    version: *version,
+                });
+                return Err(reason);
+            }
+        }
+    }
+
+    Ok(progressed)
 }
 
 /// Every `checkpoint_every` finished transactions, hand the WAL an O(1) COW clone of the

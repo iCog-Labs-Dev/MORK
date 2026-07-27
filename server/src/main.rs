@@ -46,6 +46,15 @@ struct Args {
     /// `(paused …)` data; `abort` rolls the whole transaction back.
     #[arg(long, value_enum, default_value = "commit")]
     budget_action: engine::BudgetAction,
+    /// Source/sink sweep passes per cooperative scheduler cycle.
+    #[arg(long, default_value_t = 1)]
+    sweep_steps_per_cycle: usize,
+    /// Whole-space metta-calculus steps after each weighted sweep batch.
+    #[arg(long, default_value_t = 32)]
+    sweep_metta_steps: usize,
+    /// Milliseconds to back off when an active source/sink sweep cycle changes nothing.
+    #[arg(long, default_value_t = 10)]
+    sweep_idle_ms: u64,
     /// Enable persistence: WAL + crash recovery rooted at this directory. Absent = pure
     /// in-memory (today's behavior).
     #[arg(long)]
@@ -69,6 +78,9 @@ fn main() {
     let cfg = engine::EngineConfig {
         step_budget: args.step_budget,
         budget_action: args.budget_action,
+        sweep_steps_per_cycle: args.sweep_steps_per_cycle,
+        sweep_metta_steps: args.sweep_metta_steps,
+        sweep_idle_ms: args.sweep_idle_ms,
         data_dir: args.data_dir.clone(),
         fsync: args.fsync,
         checkpoint_every: args.checkpoint_every,
