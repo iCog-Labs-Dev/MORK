@@ -304,3 +304,32 @@ fn invalid_weight_clause_sweep_is_not_registered_or_removed() {
         "invalid sweep should remain:\n{dumped}"
     );
 }
+
+#[test]
+fn duplicate_weight_clause_sweep_is_not_registered_or_removed() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(
+            b"
+            (sweep duplicate-weight
+              (e cpq)
+              (src (, (mln-site $x)))
+              (weight first)
+              (weight sum)
+              (sink (O (+ (was-sampled duplicate-weight (mln-site $x))))))
+            ",
+        )
+        .unwrap();
+
+    let handle = space.sweep();
+
+    assert!(handle.is_empty());
+    assert!(!space.sweep_specs.contains_key("duplicate-weight"));
+    assert!(space.was.map.is_none());
+
+    let dumped = dump_all(&space);
+    assert!(
+        dumped.contains("(sweep duplicate-weight"),
+        "duplicate weight sweep should remain:\n{dumped}"
+    );
+}

@@ -120,6 +120,86 @@ fn run_sweep_once_random_walk_uses_source_weight_prefix() {
 }
 
 #[test]
+fn run_sweep_once_random_walk_uses_explicit_btm_source_weight_prefix() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(
+            b"
+            (mln-site A (# 7))
+            (mln-site B (# 0))
+            (other Z (# 1000))
+            (sweep mln
+              (e random_walk)
+              (src (I (BTM (mln-site $x))))
+              (weight first)
+              (sink (O (+ (was-sampled mln (mln-site $x))))))
+            ",
+        )
+        .unwrap();
+
+    assert_eq!(space.sweep(), "sweep-config");
+
+    let (touched, changed) = space.run_sweep_once("mln").unwrap();
+
+    assert_eq!(touched, 1);
+    assert!(changed);
+
+    let sampled = dump(
+        &space,
+        expr!(space, "[3] was-sampled mln [2] mln-site $"),
+        expr!(space, "[3] was-sampled mln [2] mln-site _1"),
+    );
+    assert!(
+        sampled.contains("(was-sampled mln (mln-site A))"),
+        "explicit BTM random walk should emit the non-zero matching source atom:\n{sampled}"
+    );
+    assert!(
+        !sampled.contains("(was-sampled mln (mln-site B))"),
+        "zero-weight explicit BTM source atom should not be emitted:\n{sampled}"
+    );
+}
+
+#[test]
+fn run_sweep_once_cpq_uses_explicit_btm_source_weight_prefix() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(
+            b"
+            (mln-site A (# 7))
+            (mln-site B (# 1))
+            (other Z (# 1000000))
+            (sweep mln
+              (e cpq)
+              (src (I (BTM (mln-site $x))))
+              (weight first)
+              (sink (O (+ (was-sampled mln (mln-site $x))))))
+            ",
+        )
+        .unwrap();
+
+    assert_eq!(space.sweep(), "sweep-config");
+
+    let (touched, changed) = space.run_sweep_once("mln").unwrap();
+
+    assert_eq!(touched, 1);
+    assert!(changed);
+
+    let sampled = dump(
+        &space,
+        expr!(space, "[3] was-sampled mln [2] mln-site $"),
+        expr!(space, "[3] was-sampled mln [2] mln-site _1"),
+    );
+    assert!(
+        sampled.contains("(was-sampled mln (mln-site A))"),
+        "explicit BTM cpq should emit the highest matching source atom:\n{sampled}"
+    );
+    assert!(
+        !sampled.contains("(was-sampled mln (mln-site B))"),
+        "cpq should emit only the highest matching source atom:\n{sampled}"
+    );
+}
+
+#[test]
 fn run_sweep_once_uses_product_weight_policy() {
     let mut space = Space::new();
     space
@@ -194,6 +274,47 @@ fn run_sweep_once_uses_expr_weight_policy() {
     assert!(
         sampled.contains("(was-sampled planner (task B))"),
         "expr weight should use the bound priority value:\n{sampled}"
+    );
+    assert!(
+        !sampled.contains("(was-sampled planner (task A))"),
+        "weighted sweep should emit one event:\n{sampled}"
+    );
+}
+
+#[test]
+fn run_sweep_once_uses_pure_expr_weight_policy() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(
+            b"
+            (task A)
+            (priority A 2)
+            (task B)
+            (priority B 20)
+            (sweep planner
+              (e cpq)
+              (src (, (task $t) (priority $t $w)))
+              (weight expr (f64_to_string (div_f64 (f64_from_string $w) (f64_from_string 2))))
+              (sink (O (+ (was-sampled planner (task $t))))))
+            ",
+        )
+        .unwrap();
+
+    assert_eq!(space.sweep(), "sweep-config");
+
+    let (touched, changed) = space.run_sweep_once("planner").unwrap();
+
+    assert_eq!(touched, 1);
+    assert!(changed);
+
+    let sampled = dump(
+        &space,
+        expr!(space, "[3] was-sampled planner [2] task $"),
+        expr!(space, "[3] was-sampled planner [2] task _1"),
+    );
+    assert!(
+        sampled.contains("(was-sampled planner (task B))"),
+        "pure expr weight should use the bound priority value:\n{sampled}"
     );
     assert!(
         !sampled.contains("(was-sampled planner (task A))"),

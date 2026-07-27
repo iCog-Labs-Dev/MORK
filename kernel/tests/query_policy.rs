@@ -186,6 +186,59 @@ fn query_policy_weighted_one_cpq_selects_highest_weight_candidate() {
 }
 
 #[test]
+fn query_policy_weighted_one_cpq_selects_highest_leaf_not_highest_aggregate_branch() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(b"(mln-site A (# 10))(mln-site B1 (# 6))(mln-site B2 (# 6))")
+        .unwrap();
+
+    for _ in 0..5 {
+        let picked = run_weighted_pick(&mut space, "cpq");
+        assert!(
+            picked.contains("(picked A)"),
+            "cpq should pick the highest individual candidate, not the highest aggregate subtree:\n{picked}"
+        );
+    }
+}
+
+#[test]
+fn query_policy_weighted_one_cpq_direct_prefix_ignores_out_of_scope_atoms() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(b"(mln-site A (# 10))(mln-site B (# 1))(other Z (# 1000000))")
+        .unwrap();
+
+    for _ in 0..5 {
+        let picked = run_weighted_pick(&mut space, "cpq");
+        assert!(
+            picked.contains("(picked A)"),
+            "cpq should pick the highest candidate under the source prefix only:\n{picked}"
+        );
+        assert!(
+            !picked.contains("(picked Z)"),
+            "out-of-scope high-weight atoms must not be selected:\n{picked}"
+        );
+    }
+}
+
+#[test]
+fn query_policy_single_source_product_and_sum_use_source_weight() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(b"(mln-site A (# 7))(mln-site B (# 0))(other Z (# 1000))")
+        .unwrap();
+
+    for policy in [WeightPolicy::Product, WeightPolicy::Sum] {
+        let pattern = expr!(space, "[2] , [2] mln-site $");
+        let picked = run_weighted_pick_with_policy(&mut space, "random_walk", policy, pattern);
+        assert!(
+            picked.contains("(picked A)"),
+            "single-source product/sum should use the source atom weight:\n{picked}"
+        );
+    }
+}
+
+#[test]
 fn query_policy_weight_product_uses_all_btm_source_weights() {
     let mut space = Space::new();
     space
@@ -240,4 +293,86 @@ fn query_policy_weight_expr_uses_bound_numeric_expression() {
         "expr weight should prefer the candidate whose bound weight expression is 20:\n{picked}"
     );
     assert!(!picked.contains("(picked A)"), "cpq should only pick one candidate:\n{picked}");
+}
+
+#[test]
+fn query_policy_weight_expr_evaluates_pure_numeric_expression() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(b"(task A)(priority A 2)(task B)(priority B 20)")
+        .unwrap();
+
+    let pattern = expr!(space, "[3] , [2] task $ [3] priority _1 $");
+    let weight_expr = expr!(
+        space,
+        "[2] f64_to_string [3] div_f64 [2] f64_from_string _2 [2] f64_from_string 2"
+    );
+    let picked = run_weighted_pick_with_policy(
+        &mut space,
+        "cpq",
+        WeightPolicy::Expr(expr_bytes(weight_expr)),
+        pattern,
+    );
+
+    assert!(
+        picked.contains("(picked B)"),
+        "pure expr weight should prefer B: 20 / 2 > 2 / 2\n{picked}"
+    );
+    assert!(!picked.contains("(picked A)"), "cpq should only pick one candidate:\n{picked}");
+}
+
+#[test]
+fn query_policy_weight_expr_accepts_positive_float_and_rejects_negative() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(b"(task A)(priority A -1.0)(task B)(priority B 0.5)")
+        .unwrap();
+
+    let pattern = expr!(space, "[3] , [2] task $ [3] priority _1 $");
+    let weight_expr = expr!(space, "_2");
+    let picked = run_weighted_pick_with_policy(
+        &mut space,
+        "cpq",
+        WeightPolicy::Expr(expr_bytes(weight_expr)),
+        pattern,
+    );
+
+    assert!(
+        picked.contains("(picked B)"),
+        "positive float weight should remain selectable while negative weight is skipped:\n{picked}"
+    );
+    assert!(!picked.contains("(picked A)"), "negative weight should be skipped:\n{picked}");
+}
+
+#[test]
+fn query_policy_weight_expr_invalid_numeric_value_is_not_selected() {
+    let mut space = Space::new();
+    space.add_all_sexpr(b"(task A)(priority A nope)").unwrap();
+
+    let pattern = expr!(space, "[3] , [2] task $ [3] priority _1 $");
+    let template = expr!(space, "[2] O [2] + [2] picked _1");
+    let marker = expr!(space, "[1] query-policy-invalid-weight");
+    let weight_expr = expr!(space, "_2");
+
+    let (touched, changed) = space.transform_multi_multi_io_with_policy(
+        pattern,
+        template,
+        marker,
+        true,
+        false,
+        QueryPolicy::WeightedOne {
+            engine: "cpq".to_string(),
+            weight_policy: WeightPolicy::Expr(expr_bytes(weight_expr)),
+        },
+    );
+
+    assert_eq!(touched, 0);
+    assert!(!changed);
+
+    let picked = dump(
+        &space,
+        expr!(space, "[2] picked $"),
+        expr!(space, "[2] picked _1"),
+    );
+    assert!(picked.is_empty(), "invalid weight candidate should be skipped:\n{picked}");
 }

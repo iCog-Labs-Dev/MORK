@@ -487,7 +487,7 @@ impl Default for WeightPolicy {
 }
 
 struct WeightedQueryCandidate {
-    weight: u64,
+    weight: f64,
     source_matches: Vec<Vec<u8>>,
 }
 
@@ -496,6 +496,43 @@ enum SourceWeightKind {
     DirectBtm,
     WrappedBtm,
     NonBtm,
+}
+
+#[derive(Debug)]
+enum WeightEvalError {
+    InstantiationFailed,
+    InvalidNumeric(Vec<u8>),
+    NegativeOrNonFinite(f64),
+    PureEval(String),
+    MissingWeight(Vec<u8>),
+}
+
+impl WeightEvalError {
+    fn byte_text(bytes: &[u8]) -> String {
+        std::str::from_utf8(bytes)
+            .map(|text| text.to_owned())
+            .unwrap_or_else(|_| format!("{bytes:?}"))
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            WeightEvalError::InstantiationFailed => {
+                "weight expression could not be instantiated from query bindings".to_string()
+            }
+            WeightEvalError::InvalidNumeric(bytes) => {
+                format!("weight result is not numeric: {}", Self::byte_text(bytes))
+            }
+            WeightEvalError::NegativeOrNonFinite(weight) => {
+                format!("weight must be finite and non-negative, got {weight}")
+            }
+            WeightEvalError::PureEval(error) => {
+                format!("pure weight expression failed: {error}")
+            }
+            WeightEvalError::MissingWeight(bytes) => {
+                format!("no numeric, BTM, or pure weight for {}", serialize(bytes))
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1792,6 +1829,10 @@ impl Space {
         btm.read_zipper_at_path(&path).val().copied().unwrap_or(1)
     }
 
+    fn query_match_weight_f64(btm: &PathMap<u64>, path: &[u8]) -> f64 {
+        Self::query_match_weight(btm, path) as f64
+    }
+
     fn source_weight_path(bytes: &[u8], kind: SourceWeightKind) -> Option<Vec<u8>> {
         match kind {
             SourceWeightKind::DirectBtm => Some(bytes.to_vec()),
@@ -1803,23 +1844,51 @@ impl Space {
         }
     }
 
-    fn source_pattern_prefix(e: Expr, kind: SourceWeightKind) -> Option<Vec<u8>> {
+    fn source_pattern_bytes_for_weight(e: Expr, kind: SourceWeightKind) -> Option<Vec<u8>> {
         match kind {
-            SourceWeightKind::DirectBtm => unsafe {
-                let span = e.span().as_ref()?;
-                let prefix = e
-                    .prefix()
-                    .unwrap_or_else(|full| full)
-                    .as_ref()?;
-                if prefix.len() == span.len()
-                    || matches!(span.get(prefix.len()..), Some([b]) if matches!(byte_item(*b), Tag::NewVar))
-                {
-                    Some(prefix.to_vec())
-                } else {
-                    None
-                }
-            },
-            SourceWeightKind::WrappedBtm | SourceWeightKind::NonBtm => None,
+            SourceWeightKind::DirectBtm => Some(Self::expr_bytes(e)),
+            SourceWeightKind::WrappedBtm => Self::strip_btm_source_wrapper(e),
+            SourceWeightKind::NonBtm => None,
+        }
+    }
+
+    fn source_pattern_prefix_from_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+        let e = Expr { ptr: bytes.as_ptr().cast_mut() };
+        let prefix = unsafe {
+            e.prefix()
+                .unwrap_or_else(|full| full)
+                .as_ref()?
+                .to_vec()
+        };
+
+        if prefix.len() == bytes.len()
+            || matches!(
+                bytes.get(prefix.len()..),
+                Some([b]) if matches!(byte_item(*b), Tag::NewVar | Tag::VarRef(_))
+            )
+        {
+            Some(prefix)
+        } else {
+            None
+        }
+    }
+
+    fn source_pattern_prefix(e: Expr, kind: SourceWeightKind) -> Option<Vec<u8>> {
+        let bytes = Self::source_pattern_bytes_for_weight(e, kind)?;
+        Self::source_pattern_prefix_from_bytes(&bytes)
+    }
+
+    fn wrap_btm_source_match(path: &[u8]) -> Vec<u8> {
+        let mut wrapped = vec![item_byte(Tag::Arity(2)), item_byte(Tag::SymbolSize(3)), b'B', b'T', b'M'];
+        wrapped.extend_from_slice(path);
+        wrapped
+    }
+
+    fn source_match_from_weight_path(path: &[u8], kind: SourceWeightKind) -> Option<Vec<u8>> {
+        match kind {
+            SourceWeightKind::DirectBtm => Some(path.to_vec()),
+            SourceWeightKind::WrappedBtm => Some(Self::wrap_btm_source_match(path)),
+            SourceWeightKind::NonBtm => None,
         }
     }
 
@@ -1858,6 +1927,33 @@ impl Space {
         }
     }
 
+    fn weighted_cpq_btm_path_from_prefix(btm: &PathMap<u64>, prefix: &[u8]) -> Option<Vec<u8>> {
+        let mut z = btm.read_zipper_at_path(prefix);
+        let mut best: Option<(u64, Vec<u8>)> = None;
+        if let Some(value) = z.val() {
+            if *value > 0 {
+                best = Some((*value, z.origin_path().to_vec()));
+            }
+        }
+
+        while z.to_next_val() {
+            if !z.origin_path().starts_with(prefix) {
+                break;
+            }
+            let Some(value) = z.val() else {
+                continue;
+            };
+            if *value == 0 {
+                continue;
+            }
+            if best.as_ref().map(|(best_weight, _)| *value >= *best_weight).unwrap_or(true) {
+                best = Some((*value, z.origin_path().to_vec()));
+            }
+        }
+
+        best.map(|(_, path)| path)
+    }
+
     fn try_weighted_btm_prefix_candidate(
         btm: &PathMap<u64>,
         source_envs: &[ExprEnv],
@@ -1865,24 +1961,30 @@ impl Space {
         engine: &str,
         weight_policy: &WeightPolicy,
     ) -> Option<Option<WeightedQueryCandidate>> {
-        if engine != "random_walk"
-            || !matches!(weight_policy, WeightPolicy::First)
+        if !matches!(engine, "random_walk" | "cpq")
+            || !matches!(weight_policy, WeightPolicy::First | WeightPolicy::Product | WeightPolicy::Sum)
             || source_envs.len() != 1
-            || source_weight_kinds != [SourceWeightKind::DirectBtm]
+            || !matches!(source_weight_kinds.first(), Some(SourceWeightKind::DirectBtm | SourceWeightKind::WrappedBtm))
         {
             return None;
         }
 
-        let prefix = Self::source_pattern_prefix(source_envs[0].subsexpr(), source_weight_kinds[0])?;
-        let Some(path) = Self::weighted_random_btm_path_from_prefix(btm, &prefix) else {
+        let source_weight_kind = source_weight_kinds[0];
+        let prefix = Self::source_pattern_prefix(source_envs[0].subsexpr(), source_weight_kind)?;
+        let path = match engine {
+            "random_walk" => Self::weighted_random_btm_path_from_prefix(btm, &prefix),
+            "cpq" => Self::weighted_cpq_btm_path_from_prefix(btm, &prefix),
+            _ => unreachable!(),
+        };
+        let Some(path) = path else {
             return Some(None);
         };
-        let weight = Self::query_match_weight(btm, &path);
-        if weight == 0 {
+        let weight = Self::query_match_weight_f64(btm, &path);
+        if weight <= 0.0 {
             return Some(None);
         }
 
-        let source_matches = vec![path];
+        let source_matches = vec![Self::source_match_from_weight_path(&path, source_weight_kind)?];
         if Self::source_match_bindings(source_envs, &source_matches).is_none() {
             return None;
         }
@@ -1908,35 +2010,102 @@ impl Space {
         }
     }
 
-    fn symbol_name_with_sm(sm: &SharedMappingHandle, e: Expr) -> Option<String> {
+    fn symbol_payload_bytes_with(sm: &SharedMappingHandle, e: Expr) -> Option<Vec<u8>> {
         unsafe {
             let Tag::SymbolSize(size) = byte_item(*e.ptr) else { return None; };
             let bytes = slice_from_raw_parts(e.ptr.add(1), size as usize).as_ref().unwrap();
-            Self::symbol_bytes_to_name_with(sm, bytes)
+            #[cfg(feature = "interning")]
+            {
+                if bytes.len() != mork_interning::SYM_LEN {
+                    return None;
+                }
+                let symbol = i64::from_be_bytes(bytes.try_into().ok()?).to_be_bytes();
+                sm.get_bytes(symbol).map(|s| s.to_vec())
+            }
+            #[cfg(not(feature = "interning"))]
+            {
+                let _ = sm;
+                Some(bytes.to_vec())
+            }
         }
     }
 
-    fn explicit_expr_weight(sm: &SharedMappingHandle, btm: &PathMap<u64>, bytes: &[u8]) -> Option<u64> {
-        let expr = Expr { ptr: bytes.as_ptr().cast_mut() };
-        if let Some(text) = Self::symbol_name_with_sm(sm, expr) {
-            return text.parse::<u64>().ok();
+    fn validate_weight(weight: f64) -> Result<f64, WeightEvalError> {
+        if weight.is_finite() && weight >= 0.0 {
+            Ok(weight)
+        } else {
+            Err(WeightEvalError::NegativeOrNonFinite(weight))
+        }
+    }
+
+    fn numeric_symbol_weight(bytes: &[u8]) -> Result<f64, WeightEvalError> {
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            if let Ok(weight) = text.parse::<u64>() {
+                return Ok(weight as f64);
+            }
+            if let Ok(weight) = text.parse::<f64>() {
+                return Self::validate_weight(weight);
+            }
         }
 
-        btm.read_zipper_at_path(bytes).val().copied()
+        Err(WeightEvalError::InvalidNumeric(bytes.to_vec()))
+    }
+
+    fn concrete_expr_weight(sm: &SharedMappingHandle, btm: &PathMap<u64>, bytes: &[u8]) -> Result<f64, WeightEvalError> {
+        let expr = Expr { ptr: bytes.as_ptr().cast_mut() };
+        if let Some(symbol_bytes) = Self::symbol_payload_bytes_with(sm, expr) {
+            return Self::numeric_symbol_weight(&symbol_bytes);
+        }
+
+        if let Some(weight) = btm.read_zipper_at_path(bytes).val().copied() {
+            return Ok(weight as f64);
+        }
+
+        Err(WeightEvalError::MissingWeight(bytes.to_vec()))
+    }
+
+    fn explicit_expr_weight(sm: &SharedMappingHandle, btm: &PathMap<u64>, bytes: &[u8]) -> Result<f64, WeightEvalError> {
+        match Self::concrete_expr_weight(sm, btm, bytes) {
+            Ok(weight) => return Ok(weight),
+            Err(WeightEvalError::MissingWeight(_)) => {}
+            Err(error) => return Err(error),
+        }
+
+        Self::pure_expr_weight(sm, btm, bytes)
+    }
+
+    #[cfg(feature = "grounding")]
+    fn pure_expr_weight(sm: &SharedMappingHandle, btm: &PathMap<u64>, bytes: &[u8]) -> Result<f64, WeightEvalError> {
+        let expr = Expr { ptr: bytes.as_ptr().cast_mut() };
+        if expr.arity().is_none() {
+            return Err(WeightEvalError::MissingWeight(bytes.to_vec()));
+        }
+
+        let mut scope = eval::EvalScope::new();
+        crate::pure::register(&mut scope);
+        let result = scope
+            .eval(eval_ffi::ExprSource::new(bytes.as_ptr()))
+            .map_err(|error| WeightEvalError::PureEval(error.to_string()))?;
+        Self::concrete_expr_weight(sm, btm, &result)
+    }
+
+    #[cfg(not(feature = "grounding"))]
+    fn pure_expr_weight(_sm: &SharedMappingHandle, _btm: &PathMap<u64>, bytes: &[u8]) -> Result<f64, WeightEvalError> {
+        Err(WeightEvalError::MissingWeight(bytes.to_vec()))
     }
 
     fn source_match_weights(
         btm: &PathMap<u64>,
         source_matches: &[Expr],
         source_weight_kinds: &[SourceWeightKind],
-    ) -> Vec<u64> {
+    ) -> Vec<f64> {
         source_matches
             .iter()
             .zip(source_weight_kinds)
             .filter_map(|(source_match, kind)| {
                 let bytes = Self::expr_bytes(*source_match);
                 let path = Self::source_weight_path(&bytes, *kind)?;
-                Some(Self::query_match_weight(btm, &path))
+                Some(Self::query_match_weight_f64(btm, &path))
             })
             .collect()
     }
@@ -1949,55 +2118,55 @@ impl Space {
         source_weight_kinds: &[SourceWeightKind],
         weight_policy: &WeightPolicy,
         bindings: &BTreeMap<(u8, u8), ExprEnv>,
-    ) -> u64 {
+    ) -> Result<f64, WeightEvalError> {
         match weight_policy {
             WeightPolicy::First => {
                 let weights = Self::source_match_weights(btm, source_matches, source_weight_kinds);
-                weights.first().copied().unwrap_or(1)
+                Ok(weights.first().copied().unwrap_or(1.0))
             }
             WeightPolicy::Product => {
                 let weights = Self::source_match_weights(btm, source_matches, source_weight_kinds);
                 if weights.is_empty() {
-                    1
+                    Ok(1.0)
                 } else {
-                    weights.into_iter().fold(1u64, u64::saturating_mul)
+                    Ok(weights.into_iter().fold(1.0f64, |acc, weight| acc * weight))
                 }
             }
             WeightPolicy::Sum => {
                 let weights = Self::source_match_weights(btm, source_matches, source_weight_kinds);
                 if weights.is_empty() {
-                    1
+                    Ok(1.0)
                 } else {
-                    weights.into_iter().fold(0u64, u64::saturating_add)
+                    Ok(weights.into_iter().sum())
                 }
             }
             WeightPolicy::Expr(weight_expr) => {
                 let weight_expr = Expr { ptr: weight_expr.as_ptr().cast_mut() };
                 let Some(mut instantiated) = Self::instantiate_exprs(pat_expr, &[weight_expr], bindings) else {
-                    return 0;
+                    return Err(WeightEvalError::InstantiationFailed);
                 };
                 let Some(weight_expr) = instantiated.pop() else {
-                    return 0;
+                    return Err(WeightEvalError::InstantiationFailed);
                 };
-                Self::explicit_expr_weight(sm, btm, &weight_expr).unwrap_or(0)
+                Self::explicit_expr_weight(sm, btm, &weight_expr)
             }
         }
     }
 
     fn weighted_candidate_should_replace(
         engine: &str,
-        selected_weight: Option<u64>,
-        total_weight: &mut u128,
-        weight: u64,
+        selected_weight: Option<f64>,
+        total_weight: &mut f64,
+        weight: f64,
     ) -> bool {
-        if weight == 0 {
+        if !weight.is_finite() || weight <= 0.0 {
             return false;
         }
 
         match engine {
             "random_walk" => {
-                *total_weight = total_weight.saturating_add(weight as u128);
-                rand::random_range(0..*total_weight) < weight as u128
+                *total_weight += weight;
+                rand::random_range(0.0..*total_weight) < weight
             }
             "cpq" => selected_weight.map(|selected_weight| weight >= selected_weight).unwrap_or(true),
             _ => false,
@@ -2091,7 +2260,7 @@ impl Space {
                 Some(candidate) => candidate,
                 None => {
                     let mut selected_candidate = None;
-                    let mut total_weight = 0u128;
+                    let mut total_weight = 0.0f64;
                     Self::query_multi_i_with_sources(no_source, &mut self.mmaps, &mut self.z3s, &read_copy, pat_expr, |refs_bindings, _loc, source_matches| {
                         match refs_bindings {
                             Ok(_) => {
@@ -2101,7 +2270,7 @@ impl Space {
                                 #[cfg(debug_assertions)]
                                 bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
 
-                                let weight = Self::candidate_weight(
+                                let weight = match Self::candidate_weight(
                                     &sm,
                                     &read_copy,
                                     pat_expr,
@@ -2109,7 +2278,13 @@ impl Space {
                                     &source_weight_kinds,
                                     &weight_policy,
                                     bindings,
-                                );
+                                ) {
+                                    Ok(weight) => weight,
+                                    Err(error) => {
+                                        warn!("weighted query candidate ignored for {:?}: {}", weight_policy, error.describe());
+                                        return true;
+                                    }
+                                };
                                 let selected_weight = selected_candidate.as_ref().map(|candidate: &WeightedQueryCandidate| candidate.weight);
                                 if Self::weighted_candidate_should_replace(&engine, selected_weight, &mut total_weight, weight) {
                                     selected_candidate = Some(WeightedQueryCandidate {
@@ -2372,6 +2547,7 @@ impl Space {
         let mut source: Option<Vec<u8>> = None;
         let mut sink: Option<Vec<u8>> = None;
         let mut weight_policy = WeightPolicy::First;
+        let mut weight_seen = false;
 
         for clause in &args[2..] {
             let Some(clause_args) = Self::expr_args(clause.subsexpr()) else {
@@ -2424,6 +2600,11 @@ impl Space {
                     sink = Some(Self::expr_bytes(sink_expr));
                 }
                 "weight" => {
+                    if weight_seen {
+                        warn!("sweep '{}' has duplicate weight clauses", name);
+                        return None;
+                    }
+                    weight_seen = true;
                     weight_policy = self.parse_sweep_weight_clause(&name, &clause_args)?;
                 }
                 other => {
