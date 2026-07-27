@@ -1,0 +1,326 @@
+; Serial grounded Boolean MLN for a three-person social network.
+;
+; Ground predicates:
+;   Smokes(person)
+;   Cancer(person)
+;   Friends(person, person)
+;
+; Formula families are eagerly grounded below:
+;   1.5  Smokes(x) => Cancer(x)
+;   1.1  Friends(x,y) and Smokes(x) => Smokes(y)
+;  -0.35 Smokes(x)
+;  -0.8  Cancer(x)
+;
+; Friendship is evidence. Smoking and cancer variables are sampled.
+
+(mln-person Alice)
+(mln-person Bob)
+(mln-person Carol)
+
+(mln-var (Smokes Alice))
+(mln-var (Smokes Bob))
+(mln-var (Smokes Carol))
+(mln-var (Cancer Alice))
+(mln-var (Cancer Bob))
+(mln-var (Cancer Carol))
+(mln-var (Friends Alice Bob))
+(mln-var (Friends Bob Carol))
+(mln-var (Friends Carol Alice))
+
+(mln-mutable (Smokes Alice))
+(mln-mutable (Smokes Bob))
+(mln-mutable (Smokes Carol))
+(mln-mutable (Cancer Alice))
+(mln-mutable (Cancer Bob))
+(mln-mutable (Cancer Carol))
+
+(mln-evidence (Friends Alice Bob) true)
+(mln-evidence (Friends Bob Carol) true)
+(mln-evidence (Friends Carol Alice) false)
+
+(mln-val (Smokes Alice) false)
+(mln-val (Smokes Bob) true)
+(mln-val (Smokes Carol) false)
+(mln-val (Cancer Alice) false)
+(mln-val (Cancer Bob) false)
+(mln-val (Cancer Carol) false)
+(mln-val (Friends Alice Bob) true)
+(mln-val (Friends Bob Carol) true)
+(mln-val (Friends Carol Alice) false)
+
+; Smokes(x) => Cancer(x), encoded as !Smokes(x) or Cancer(x).
+(mln-clause health-alice 1.5)
+(mln-lit health-alice (Smokes Alice) negative)
+(mln-lit health-alice (Cancer Alice) positive)
+(mln-in-clause (Smokes Alice) health-alice negative)
+(mln-in-clause (Cancer Alice) health-alice positive)
+(mln-sat-count health-alice 1)
+
+(mln-clause health-bob 1.5)
+(mln-lit health-bob (Smokes Bob) negative)
+(mln-lit health-bob (Cancer Bob) positive)
+(mln-in-clause (Smokes Bob) health-bob negative)
+(mln-in-clause (Cancer Bob) health-bob positive)
+(mln-sat-count health-bob 0)
+
+(mln-clause health-carol 1.5)
+(mln-lit health-carol (Smokes Carol) negative)
+(mln-lit health-carol (Cancer Carol) positive)
+(mln-in-clause (Smokes Carol) health-carol negative)
+(mln-in-clause (Cancer Carol) health-carol positive)
+(mln-sat-count health-carol 1)
+
+; Friends(x,y) and Smokes(x) => Smokes(y).
+(mln-clause influence-alice-bob 1.1)
+(mln-lit influence-alice-bob (Friends Alice Bob) negative)
+(mln-lit influence-alice-bob (Smokes Alice) negative)
+(mln-lit influence-alice-bob (Smokes Bob) positive)
+(mln-in-clause (Friends Alice Bob) influence-alice-bob negative)
+(mln-in-clause (Smokes Alice) influence-alice-bob negative)
+(mln-in-clause (Smokes Bob) influence-alice-bob positive)
+(mln-sat-count influence-alice-bob 2)
+
+(mln-clause influence-bob-carol 1.1)
+(mln-lit influence-bob-carol (Friends Bob Carol) negative)
+(mln-lit influence-bob-carol (Smokes Bob) negative)
+(mln-lit influence-bob-carol (Smokes Carol) positive)
+(mln-in-clause (Friends Bob Carol) influence-bob-carol negative)
+(mln-in-clause (Smokes Bob) influence-bob-carol negative)
+(mln-in-clause (Smokes Carol) influence-bob-carol positive)
+(mln-sat-count influence-bob-carol 0)
+
+(mln-clause influence-carol-alice 1.1)
+(mln-lit influence-carol-alice (Friends Carol Alice) negative)
+(mln-lit influence-carol-alice (Smokes Carol) negative)
+(mln-lit influence-carol-alice (Smokes Alice) positive)
+(mln-in-clause (Friends Carol Alice) influence-carol-alice negative)
+(mln-in-clause (Smokes Carol) influence-carol-alice negative)
+(mln-in-clause (Smokes Alice) influence-carol-alice positive)
+(mln-sat-count influence-carol-alice 2)
+
+; Negative unit-clause weights discourage smoking and cancer.
+(mln-clause smoke-prior-alice -0.35)
+(mln-lit smoke-prior-alice (Smokes Alice) positive)
+(mln-in-clause (Smokes Alice) smoke-prior-alice positive)
+(mln-sat-count smoke-prior-alice 0)
+
+(mln-clause smoke-prior-bob -0.35)
+(mln-lit smoke-prior-bob (Smokes Bob) positive)
+(mln-in-clause (Smokes Bob) smoke-prior-bob positive)
+(mln-sat-count smoke-prior-bob 1)
+
+(mln-clause smoke-prior-carol -0.35)
+(mln-lit smoke-prior-carol (Smokes Carol) positive)
+(mln-in-clause (Smokes Carol) smoke-prior-carol positive)
+(mln-sat-count smoke-prior-carol 0)
+
+(mln-clause cancer-prior-alice -0.8)
+(mln-lit cancer-prior-alice (Cancer Alice) positive)
+(mln-in-clause (Cancer Alice) cancer-prior-alice positive)
+(mln-sat-count cancer-prior-alice 0)
+
+(mln-clause cancer-prior-bob -0.8)
+(mln-lit cancer-prior-bob (Cancer Bob) positive)
+(mln-in-clause (Cancer Bob) cancer-prior-bob positive)
+(mln-sat-count cancer-prior-bob 0)
+
+(mln-clause cancer-prior-carol -0.8)
+(mln-lit cancer-prior-carol (Cancer Carol) positive)
+(mln-in-clause (Cancer Carol) cancer-prior-carol positive)
+(mln-sat-count cancer-prior-carol 0)
+
+; Fixed degree-based scheduling weights. These remain constant while sampling.
+(mln-site (Smokes Alice) (# 4))
+(mln-site (Smokes Bob) (# 4))
+(mln-site (Smokes Carol) (# 4))
+(mln-site (Cancer Alice) (# 2))
+(mln-site (Cancer Bob) (# 2))
+(mln-site (Cancer Carol) (# 2))
+
+(mln-rng 424242 0)
+
+(mln-flip false true)
+(mln-flip true false)
+(mln-lit-sat positive false 0)
+(mln-lit-sat positive true 1)
+(mln-lit-sat negative false 1)
+(mln-lit-sat negative true 0)
+
+; Build one local score delta and proposed cache update per incident clause.
+(mln-process $step $x $old $new
+  (exec (mln p10 $step)
+    (, (mln-proposal $step $x $old $new)
+       (mln-in-clause $x $c $polarity)
+       (mln-clause $c $weight)
+       (mln-sat-count $c $old_count)
+       (mln-lit-sat $polarity $old $old_lit_sat)
+       (mln-lit-sat $polarity $new $new_lit_sat))
+    (O
+      (pure
+        (mln-clause-update $step $x $c $old_count $new_count)
+        $new_count
+        (i64_to_string
+          (sum_i64
+            (i64_from_string $old_count)
+            (neg_i64 (i64_from_string $old_lit_sat))
+            (i64_from_string $new_lit_sat))))
+      (pure
+        (mln-delta-part $step $x $c $part)
+        $part
+        (f64_to_string
+          (product_f64
+            (f64_from_string $weight)
+            (i8_as_f64
+              (sub_i8
+                (gt_i64
+                  (sum_i64
+                    (i64_from_string $old_count)
+                    (neg_i64 (i64_from_string $old_lit_sat))
+                    (i64_from_string $new_lit_sat))
+                  (i64_from_string 0))
+                (gt_i64
+                  (i64_from_string $old_count)
+                  (i64_from_string 0))))))))))
+
+; Aggregate all incident-clause score changes.
+(mln-process $step $x $old $new
+  (exec (mln p20 $step)
+    (, (mln-delta-part $step $x $c $part))
+    (O
+      (fsum (mln-delta $step $x $delta) $delta $part))))
+
+; Metropolis acceptance in log space.
+(mln-process $step $x $old $new
+  (exec (mln p30 $step)
+    (, (mln-delta $step $x $delta)
+       (mln-random $step $x $u))
+    (O
+      (pure (mln-decision $step $x $decision) $decision
+        (ifnz
+          (gte_f64
+            (f64_from_string $delta)
+            (f64_from_string 0.0))
+          then accept
+          else
+            (ifnz
+              (lte_f64
+                (ln_f64 (f64_from_string $u))
+                (f64_from_string $delta))
+              then accept
+              else reject))))))
+
+; Rewrite an accepted assignment.
+(mln-process $step $x $old $new
+  (exec (mln p40 $step)
+    (, (mln-decision $step $x accept)
+       (mln-proposal $step $x $old $new)
+       (mln-delta $step $x $delta)
+       (mln-val $x $old))
+    (O
+      (- (mln-val $x $old))
+      (+ (mln-val $x $new))
+      (+ (mln-accepted $step $x $old $new $delta)))))
+
+; Rewrite only the accepted variable's incident-clause caches.
+(mln-process $step $x $old $new
+  (exec (mln p41 $step)
+    (, (mln-decision $step $x accept)
+       (mln-clause-update $step $x $c $old_count $new_count)
+       (mln-sat-count $c $old_count))
+    (O
+      (- (mln-sat-count $c $old_count))
+      (+ (mln-sat-count $c $new_count))
+      (- (mln-clause-update $step $x $c $old_count $new_count)))))
+
+; A rejection preserves assignment and cache state.
+(mln-process $step $x $old $new
+  (exec (mln p42 $step)
+    (, (mln-decision $step $x reject)
+       (mln-proposal $step $x $old $new)
+       (mln-delta $step $x $delta))
+    (O
+      (+ (mln-rejected $step $x $old $new $delta)))))
+
+(mln-process $step $x $old $new
+  (exec (mln p45 $step)
+    (, (mln-decision $step $x $decision)
+       (mln-clause-update $step $x $c $old_count $new_count))
+    (O
+      (- (mln-clause-update $step $x $c $old_count $new_count)))))
+
+(mln-process $step $x $old $new
+  (exec (mln p46 $step)
+    (, (mln-delta-part $step $x $c $part))
+    (O
+      (- (mln-delta-part $step $x $c $part)))))
+
+; Retain one sample event per completed transition.
+(mln-process $step $x $old $new
+  (exec (mln p48 $step)
+    (, (mln-decision $step $x $decision)
+       (mln-proposal $step $x $old $new)
+       (mln-delta $step $x $delta)
+       (mln-random $step $x $u)
+       (mln-val $x $state))
+    (O
+      (+ (mln-sample $step $x $state $decision $delta $u)))))
+
+; Remove transaction-local state.
+(mln-process $step $x $old $new
+  (exec (mln p49 $step)
+    (, (mln-decision $step $x $decision)
+       (mln-proposal $step $x $old $new)
+       (mln-delta $step $x $delta)
+       (mln-random $step $x $u))
+    (O
+      (- (mln-decision $step $x $decision))
+      (- (mln-proposal $step $x $old $new))
+      (- (mln-delta $step $x $delta))
+      (- (mln-random $step $x $u)))))
+
+; One weighted site event followed by bounded metta-calculus execution is one
+; serial MCMC transition.
+(sweep social-mln
+  (e random_walk)
+  (src (, (mln-site $x)))
+  (weight first)
+  (sink
+    (O
+      (+ (was-sampled social-mln (mln-site $x)))
+
+      (+ (exec (mln p00 mutable $x)
+           (, (was-sampled social-mln (mln-site $x))
+              (mln-mutable $x)
+              (mln-val $x $old)
+              (mln-flip $old $new)
+              (mln-rng $seed $step))
+           (O
+             (- (was-sampled social-mln (mln-site $x)))
+             (- (mln-rng $seed $step))
+             (pure (mln-rng $seed $next_step) $next_step
+               (i64_to_string
+                 (sum_i64
+                   (i64_from_string $step)
+                   (i64_one))))
+             (pure (mln-random $step $x $u) $u
+               (f64_to_string
+                 (uniform_f64_from_seed
+                   (i64_from_string $seed)
+                   (i64_from_string $step))))
+             (+ (mln-proposal $step $x $old $new))
+             (+ (mln-delta-part $step $x baseline 0.0))
+             (+ (mln-activate $step $x $old $new))
+             (+ (exec (mln p01 $step)
+                  (, (mln-activate $step $x $old $new)
+                     (mln-process $step $x $old $new $process))
+                  (O
+                    (+ $process)
+                    (- (mln-activate $step $x $old $new))))))))
+
+      ; Evidence is never scheduled in a valid model, but malformed input is guarded.
+      (+ (exec (mln p00 evidence $x)
+           (, (was-sampled social-mln (mln-site $x))
+              (mln-evidence $x $value))
+           (O
+             (- (was-sampled social-mln (mln-site $x)))
+             (+ (mln-skipped-evidence $x))))))))
