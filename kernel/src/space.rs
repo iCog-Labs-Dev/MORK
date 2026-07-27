@@ -41,6 +41,7 @@ pub static ACT_PATH: &'static str = "/dev/shm/";
 pub struct Space {
     pub btm: PathMap<u64>,
     pub was: WeightedAtomSweep,
+    pub sweep_specs: HashMap<String, SweepSpec>,
     pub sm: SharedMappingHandle,
     pub mmaps: HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
     pub z3s: HashMap<OwnedSourceItem, Box<Popen>>,
@@ -461,9 +462,35 @@ pub enum QueryPolicy {
     All,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SweepOperationSpec {
+    pub op_type: String,
+    pub args: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SweepRuleSpec {
+    pub source: Vec<u8>,
+    pub sink: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SweepSpec {
+    pub name: String,
+    pub engine_type: String,
+    pub operations: Vec<SweepOperationSpec>,
+    pub rule: Option<SweepRuleSpec>,
+}
+
+impl SweepSpec {
+    fn has_legacy_was_process(&self) -> bool {
+        !self.operations.is_empty() || self.rule.is_none()
+    }
+}
+
 impl Space {
     pub fn new() -> Self {
-        Self { btm: PathMap::new(), was: WeightedAtomSweep::new(WeightedAtomSweepSettings::default()), sm: SharedMapping::new(), mmaps: HashMap::new(), z3s: HashMap::new(), last_merkleize: Instant::now(), timing: false }
+        Self { btm: PathMap::new(), was: WeightedAtomSweep::new(WeightedAtomSweepSettings::default()), sweep_specs: HashMap::new(), sm: SharedMapping::new(), mmaps: HashMap::new(), z3s: HashMap::new(), last_merkleize: Instant::now(), timing: false }
     }
 
     pub fn parse_sexpr(&mut self, r: &[u8], buf: *mut u8) -> Result<(Expr, usize), ParserError> {
@@ -1734,134 +1761,174 @@ impl Space {
         }, _err => return Err("exec shape (exec <loc> <patterns> <templates>)"))
     }
 
-    /// Parse a single `(sweep engineName (e type) (o op args...) ...)` from raw path bytes.
-    /// Returns (engine_name, engine_type, operations) on success, None on parse failure.
-    fn parse_sweep_atom(path: &[u8]) -> Option<(String, String, Vec<(String, Vec<Vec<u8>>)>)> {
-        if path.len() < 7 { return None; }
-        if !matches!(byte_item(path[0]), Tag::Arity(_)) { return None; }
-        if byte_item(path[1]) != Tag::SymbolSize(5) { return None; }
-        if &path[2..7] != b"sweep" { return None; }
+    fn expr_bytes(e: Expr) -> Vec<u8> {
+        unsafe { e.span().as_ref().unwrap().to_vec() }
+    }
 
-        let mut i = 7;
-        // engine name: SymbolSize(L) + L bytes
-        let engine_name = match byte_item(path[i]) {
-            Tag::SymbolSize(sz) => {
-                i += 1;
-                if i + sz as usize > path.len() { return None; }
-                let s = std::str::from_utf8(&path[i..i + sz as usize]).ok()?.to_string();
-                i += sz as usize;
-                s
+    fn symbol_name(&self, e: Expr) -> Option<String> {
+        unsafe {
+            let Tag::SymbolSize(size) = byte_item(*e.ptr) else { return None; };
+            let bytes = slice_from_raw_parts(e.ptr.add(1), size as usize).as_ref().unwrap();
+            self.symbol_bytes_to_name(bytes)
+        }
+    }
+
+    fn symbol_bytes_to_name(&self, bytes: &[u8]) -> Option<String> {
+        #[cfg(feature = "interning")]
+        {
+            if bytes.len() != mork_interning::SYM_LEN {
+                return None;
             }
-            _ => return None,
-        };
+            let symbol = i64::from_be_bytes(bytes.try_into().ok()?).to_be_bytes();
+            self.sm
+                .get_bytes(symbol)
+                .and_then(|s| std::str::from_utf8(s).ok())
+                .map(|s| s.to_owned())
+        }
+        #[cfg(not(feature = "interning"))]
+        {
+            std::str::from_utf8(bytes).ok().map(|s| s.to_owned())
+        }
+    }
 
-        let mut engine_type = String::new();
-        let mut ops: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
+    fn expr_args(e: Expr) -> Option<Vec<ExprEnv>> {
+        if !matches!(unsafe { byte_item(*e.ptr) }, Tag::Arity(_)) {
+            return None;
+        }
+        let mut args = Vec::with_capacity(e.arity().unwrap_or(0) as usize);
+        ExprEnv::new(0, e).args(&mut args);
+        Some(args)
+    }
 
-        while i < path.len() {
-            // each tuple: Arity(N) + first-child symbol tag + data ...
-            let arity = match byte_item(path[i]) {
-                Tag::Arity(a) => { i += 1; a }
-                _ => break,
+    fn expr_head_name(&self, e: Expr) -> Option<String> {
+        let args = Self::expr_args(e)?;
+        args.first().and_then(|ee| self.symbol_name(ee.subsexpr()))
+    }
+
+    fn validate_sweep_source_expr(&self, e: Expr) -> bool {
+        matches!(self.expr_head_name(e).as_deref(), Some(",") | Some("I"))
+    }
+
+    fn validate_sweep_sink_expr(&self, e: Expr) -> bool {
+        matches!(self.expr_head_name(e).as_deref(), Some(",") | Some("O"))
+    }
+
+    fn parse_sweep_operation_expr(&self, e: Expr) -> Option<SweepOperationSpec> {
+        if let Some(op_type) = self.symbol_name(e) {
+            return Some(SweepOperationSpec { op_type, args: Vec::new() });
+        }
+
+        let args = Self::expr_args(e)?;
+        let head = self.symbol_name(args.first()?.subsexpr())?;
+        if head == "o" {
+            let op_type = self.symbol_name(args.get(1)?.subsexpr())?;
+            let op_args = args[2..].iter().map(|ee| Self::expr_bytes(ee.subsexpr())).collect();
+            Some(SweepOperationSpec { op_type, args: op_args })
+        } else {
+            let op_args = args[1..].iter().map(|ee| Self::expr_bytes(ee.subsexpr())).collect();
+            Some(SweepOperationSpec { op_type: head, args: op_args })
+        }
+    }
+
+    fn parse_sweep_o_clause(&self, clause_args: &[ExprEnv]) -> Option<SweepOperationSpec> {
+        let op_type = self.symbol_name(clause_args.get(1)?.subsexpr())?;
+        let args = clause_args[2..].iter().map(|ee| Self::expr_bytes(ee.subsexpr())).collect();
+        Some(SweepOperationSpec { op_type, args })
+    }
+
+    /// Parse a single `(sweep name (e type) ...)` atom into a typed sweep spec.
+    ///
+    /// Supported clauses:
+    /// - `(e <engine>)`
+    /// - `(o <operation> <arg>...)`
+    /// - `(, (<operation> <arg>...) (o <operation> <arg>...) ...)`
+    /// - `(src <source-expr>)`
+    /// - `(sink <sink-expr>)`
+    fn parse_sweep_atom(&self, path: &[u8]) -> Option<SweepSpec> {
+        let sweep_expr = Expr { ptr: path.as_ptr().cast_mut() };
+        let args = Self::expr_args(sweep_expr)?;
+        if self.symbol_name(args.first()?.subsexpr())? != "sweep" {
+            return None;
+        }
+
+        let name = self.symbol_name(args.get(1)?.subsexpr())?;
+        let mut engine_type: Option<String> = None;
+        let mut operations = Vec::new();
+        let mut source: Option<Vec<u8>> = None;
+        let mut sink: Option<Vec<u8>> = None;
+
+        for clause in &args[2..] {
+            let Some(clause_args) = Self::expr_args(clause.subsexpr()) else {
+                warn!("sweep '{}' contains a non-expression clause, ignoring it", name);
+                continue;
             };
-            if i >= path.len() { break; }
-            let tag = match byte_item(path[i]) {
-                Tag::SymbolSize(sz) => {
-                    i += 1;
-                    if i + sz as usize > path.len() { break; }
-                    let t = &path[i..i + sz as usize];
-                    i += sz as usize;
-                    t.to_vec()
-                }
-                _ => break,
+            let Some(head) = clause_args.first().and_then(|ee| self.symbol_name(ee.subsexpr())) else {
+                warn!("sweep '{}' contains a clause without a symbol head, ignoring it", name);
+                continue;
             };
-            match &tag[..] {
-                b"e" => {
-                    // (e <engine-type>) — engine definition
-                    if i >= path.len() { break; }
-                    engine_type = match byte_item(path[i]) {
-                        Tag::SymbolSize(sz) => {
-                            i += 1;
-                            if i + sz as usize > path.len() { break; }
-                            let s = std::str::from_utf8(&path[i..i + sz as usize]).ok()?.to_string();
-                            i += sz as usize;
-                            s
-                        }
-                        _ => break,
-                    };
-                }
-                b"o" => {
-                    // (o <op-type> [args...]) — single operation
-                    if i >= path.len() { break; }
-                    let op_type = match byte_item(path[i]) {
-                        Tag::SymbolSize(sz) => {
-                            i += 1;
-                            if i + sz as usize > path.len() { break; }
-                            let s = std::str::from_utf8(&path[i..i + sz as usize]).ok()?.to_string();
-                            i += sz as usize;
-                            s
-                        }
-                        _ => break,
-                    };
-                    let mut args: Vec<Vec<u8>> = Vec::new();
-                    for _ in 2..arity {
-                        if i >= path.len() { break; }
-                        match byte_item(path[i]) {
-                            Tag::SymbolSize(sz) => {
-                                i += 1;
-                                if i + sz as usize > path.len() { break; }
-                                args.push(path[i..i + sz as usize].to_vec());
-                                i += sz as usize;
-                            }
-                            _ => break,
-                        }
+
+            match head.as_str() {
+                "e" => {
+                    if clause_args.len() != 2 {
+                        warn!("sweep '{}' has malformed engine clause", name);
+                        return None;
                     }
-                    ops.push((op_type, args));
+                    engine_type = Some(self.symbol_name(clause_args[1].subsexpr())?);
                 }
-                b"," => {
-                    // (, (op1 args...) (op2 args...) ...) — multiple operations grouped
-                    for _ in 1..arity {
-                        if i >= path.len() { break; }
-                        let op_arity = match byte_item(path[i]) {
-                            Tag::Arity(a) => { i += 1; a }
-                            _ => break,
-                        };
-                        if i >= path.len() { break; }
-                        let op_type = match byte_item(path[i]) {
-                            Tag::SymbolSize(sz) => {
-                                i += 1;
-                                if i + sz as usize > path.len() { break; }
-                                let s = std::str::from_utf8(&path[i..i + sz as usize]).ok()?.to_string();
-                                i += sz as usize;
-                                s
-                            }
-                            _ => break,
-                        };
-                        let mut args: Vec<Vec<u8>> = Vec::new();
-                        for _ in 1..op_arity {
-                            if i >= path.len() { break; }
-                            match byte_item(path[i]) {
-                                Tag::SymbolSize(sz) => {
-                                    i += 1;
-                                    if i + sz as usize > path.len() { break; }
-                                    args.push(path[i..i + sz as usize].to_vec());
-                                    i += sz as usize;
-                                }
-                                _ => break,
-                            }
-                        }
-                        ops.push((op_type, args));
+                "o" => {
+                    operations.push(self.parse_sweep_o_clause(&clause_args)?);
+                }
+                "," => {
+                    for op_expr in &clause_args[1..] {
+                        operations.push(self.parse_sweep_operation_expr(op_expr.subsexpr())?);
                     }
                 }
-                _ => break,
+                "src" => {
+                    if clause_args.len() != 2 {
+                        warn!("sweep '{}' has malformed src clause", name);
+                        return None;
+                    }
+                    let source_expr = clause_args[1].subsexpr();
+                    if !self.validate_sweep_source_expr(source_expr) {
+                        warn!("sweep '{}' source must have ',' or 'I' as its head", name);
+                        return None;
+                    }
+                    source = Some(Self::expr_bytes(source_expr));
+                }
+                "sink" => {
+                    if clause_args.len() != 2 {
+                        warn!("sweep '{}' has malformed sink clause", name);
+                        return None;
+                    }
+                    let sink_expr = clause_args[1].subsexpr();
+                    if !self.validate_sweep_sink_expr(sink_expr) {
+                        warn!("sweep '{}' sink must have ',' or 'O' as its head", name);
+                        return None;
+                    }
+                    sink = Some(Self::expr_bytes(sink_expr));
+                }
+                other => {
+                    warn!("sweep '{}' contains unknown clause '{}', ignoring it", name, other);
+                }
             }
         }
 
-        if engine_type.is_empty() { None } else { Some((engine_name, engine_type, ops)) }
+        let engine_type = engine_type?;
+        let rule = match (source, sink) {
+            (Some(source), Some(sink)) => Some(SweepRuleSpec { source, sink }),
+            (None, None) => None,
+            _ => {
+                warn!("sweep '{}' must provide both src and sink clauses", name);
+                return None;
+            }
+        };
+
+        Some(SweepSpec { name, engine_type, operations, rule })
     }
 
     pub fn sweep(&mut self) -> String {
-        let mut groups: HashMap<String, (String, Vec<(String, Vec<Vec<u8>>)>)> = HashMap::new();
+        let mut parsed: Vec<(Vec<u8>, SweepSpec)> = Vec::new();
+        let mut specs: HashMap<String, SweepSpec> = HashMap::new();
         // We must collect paths to remove first because the zipper `rz` borrows `self.btm`.
         // Mutating `self.btm` while the zipper is alive is not allowed by the borrow checker.
         let mut paths_to_remove: Vec<Vec<u8>> = Vec::new();
@@ -1870,41 +1937,53 @@ impl Space {
             let mut rz = self.btm.read_zipper();
             while rz.to_next_val() {
                 let path = rz.path();
-                if let Some((name, etype, ops)) = Self::parse_sweep_atom(path) {
-                    groups.insert(name.clone(), (etype, ops));
-                    paths_to_remove.push(path.to_vec());
+                if let Some(spec) = self.parse_sweep_atom(path) {
+                    parsed.push((path.to_vec(), spec));
                 }
             }
         }
 
-        if groups.is_empty() { return String::new(); }
+        if parsed.is_empty() { return String::new(); }
 
-        let valid_groups: Vec<(String, (String, Vec<(String, Vec<Vec<u8>>)>))> = groups.into_iter().filter(|(_, (et, _))| {
-            if build_strategy(et).is_none() {
-                warn!("unknown engine type '{}', skipping", et);
-                false
+        for (path, spec) in parsed {
+            if build_strategy(&spec.engine_type).is_none() {
+                warn!("unknown engine type '{}' for sweep '{}', skipping", spec.engine_type, spec.name);
             } else {
-                true
+                paths_to_remove.push(path);
+                specs.insert(spec.name.clone(), spec);
             }
-        }).collect();
+        }
 
-        if valid_groups.is_empty() { return String::new(); }
+        if specs.is_empty() { return String::new(); }
 
-        // Remove the sweep configuration atoms from self.btm so they won't be processed again
+        // Remove valid sweep configuration atoms from self.btm so they won't be processed again.
         for path in &paths_to_remove {
             self.btm.remove(path);
         }
 
+        for spec in specs.values() {
+            self.sweep_specs.insert(spec.name.clone(), spec.clone());
+        }
+
+        let legacy_specs: Vec<SweepSpec> = specs
+            .into_values()
+            .filter(|spec| spec.has_legacy_was_process())
+            .collect();
+
+        if legacy_specs.is_empty() {
+            return "sweep-config".to_string();
+        }
+
         self.was.take_trie(std::mem::take(&mut self.btm));
 
-        for (engine_name, (engine_type, ops)) in &valid_groups {
-            let process = self.was.add_engine(engine_name, engine_type);
-            for (op_type, op_args) in ops {
-                let args_refs: Vec<&[u8]> = op_args.iter().map(|a| &a[..]).collect();
-                if let Some(op) = build_operation(op_type, &args_refs) {
+        for spec in &legacy_specs {
+            let process = self.was.add_engine(&spec.name, &spec.engine_type);
+            for op in &spec.operations {
+                let args_refs: Vec<&[u8]> = op.args.iter().map(|a| &a[..]).collect();
+                if let Some(op) = build_operation(&op.op_type, &args_refs) {
                     process.subscribe(op);
                 } else {
-                    warn!("unknown op type '{}' for engine '{}', skipping", op_type, engine_name);
+                    warn!("unknown op type '{}' for engine '{}', skipping", op.op_type, spec.name);
                 }
             }
         }
