@@ -126,6 +126,52 @@ fn query_policy_weighted_one_prefers_higher_weight_random_walk_candidate() {
 }
 
 #[test]
+fn query_policy_weighted_one_random_walk_skips_zero_weight_candidates() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(b"(mln-site A (# 7))(mln-site B (# 0))(other Z (# 1000))")
+        .unwrap();
+
+    for _ in 0..20 {
+        let picked = run_weighted_pick(&mut space, "random_walk");
+        assert!(
+            picked.contains("(picked A)"),
+            "random walk should only sample the non-zero matching source atom:\n{picked}"
+        );
+        assert!(
+            !picked.contains("(picked B)"),
+            "zero-weight source atom should not be selected:\n{picked}"
+        );
+    }
+}
+
+#[test]
+fn query_policy_weighted_one_random_walk_preserves_non_tail_source_constraints() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(b"(rel A C (# 1))(rel B D (# 1000000))")
+        .unwrap();
+
+    let pattern = expr!(space, "[2] , [3] rel $ C");
+    for _ in 0..20 {
+        let picked = run_weighted_pick_with_policy(
+            &mut space,
+            "random_walk",
+            WeightPolicy::First,
+            pattern,
+        );
+        assert!(
+            picked.contains("(picked A)"),
+            "random walk should respect fixed terms after a variable:\n{picked}"
+        );
+        assert!(
+            !picked.contains("(picked B)"),
+            "non-matching high-weight prefix candidate should not be selected:\n{picked}"
+        );
+    }
+}
+
+#[test]
 fn query_policy_weighted_one_cpq_selects_highest_weight_candidate() {
     let mut space = Space::new();
     space

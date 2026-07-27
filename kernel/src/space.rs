@@ -488,7 +488,7 @@ impl Default for WeightPolicy {
 
 struct WeightedQueryCandidate {
     weight: u64,
-    outputs: Vec<(usize, Vec<u8>)>,
+    source_matches: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1742,6 +1742,47 @@ impl Space {
         Some(outputs)
     }
 
+    fn source_match_bindings(
+        source_envs: &[ExprEnv],
+        source_matches: &[Vec<u8>],
+    ) -> Option<BTreeMap<(u8, u8), ExprEnv>> {
+        if source_envs.len() != source_matches.len() {
+            return None;
+        }
+
+        let mut pairs = Vec::with_capacity(source_envs.len());
+        for (source_env, source_match) in source_envs.iter().zip(source_matches) {
+            let source_match_expr = Expr { ptr: source_match.as_ptr().cast_mut() };
+            pairs.push((*source_env, ExprEnv::new((pairs.len() + 1) as u8, source_match_expr)));
+        }
+
+        #[cfg(feature="no_search")]
+        {
+            unify(pairs).ok()
+        }
+        #[cfg(not(feature="no_search"))]
+        {
+            unify(&mut pairs).ok()
+        }
+    }
+
+    fn instantiate_source_match_outputs(
+        pat_expr: Expr,
+        source_envs: &[ExprEnv],
+        source_matches: &[Vec<u8>],
+        templates: &[Expr],
+    ) -> Option<Vec<(usize, Vec<u8>)>> {
+        let bindings = Self::source_match_bindings(source_envs, source_matches)?;
+        Self::instantiate_template_outputs(pat_expr, templates, &bindings)
+    }
+
+    fn owned_source_matches(source_matches: &[Expr]) -> Vec<Vec<u8>> {
+        source_matches
+            .iter()
+            .map(|source_match| Self::expr_bytes(*source_match))
+            .collect()
+    }
+
     fn strip_btm_source_wrapper(e: Expr) -> Option<Vec<u8>> {
         let args = Self::expr_args(e)?;
         args.get(1).map(|ee| Self::expr_bytes(ee.subsexpr()))
@@ -1760,6 +1801,93 @@ impl Space {
             }
             SourceWeightKind::NonBtm => None,
         }
+    }
+
+    fn source_pattern_prefix(e: Expr, kind: SourceWeightKind) -> Option<Vec<u8>> {
+        match kind {
+            SourceWeightKind::DirectBtm => unsafe {
+                let span = e.span().as_ref()?;
+                let prefix = e
+                    .prefix()
+                    .unwrap_or_else(|full| full)
+                    .as_ref()?;
+                if prefix.len() == span.len()
+                    || matches!(span.get(prefix.len()..), Some([b]) if matches!(byte_item(*b), Tag::NewVar))
+                {
+                    Some(prefix.to_vec())
+                } else {
+                    None
+                }
+            },
+            SourceWeightKind::WrappedBtm | SourceWeightKind::NonBtm => None,
+        }
+    }
+
+    fn weighted_random_btm_path_from_prefix(btm: &PathMap<u64>, prefix: &[u8]) -> Option<Vec<u8>> {
+        let mut z = btm.read_zipper_at_path(prefix);
+        let total_weight = z.agg_w();
+        if total_weight == 0 {
+            return None;
+        }
+
+        let mut ticket = rand::random_range(0..total_weight);
+        loop {
+            if let Some(value) = z.val() {
+                let node_weight = *value;
+                if ticket < node_weight {
+                    return Some(z.origin_path().to_vec());
+                }
+                ticket -= node_weight;
+            }
+
+            let mut found_child = false;
+            for byte in z.child_mask().iter() {
+                z.descend_to_byte(byte);
+                let child_weight = z.agg_w();
+                if ticket < child_weight {
+                    found_child = true;
+                    break;
+                }
+                ticket -= child_weight;
+                z.ascend_byte();
+            }
+
+            if !found_child {
+                return None;
+            }
+        }
+    }
+
+    fn try_weighted_btm_prefix_candidate(
+        btm: &PathMap<u64>,
+        source_envs: &[ExprEnv],
+        source_weight_kinds: &[SourceWeightKind],
+        engine: &str,
+        weight_policy: &WeightPolicy,
+    ) -> Option<Option<WeightedQueryCandidate>> {
+        if engine != "random_walk"
+            || !matches!(weight_policy, WeightPolicy::First)
+            || source_envs.len() != 1
+            || source_weight_kinds != [SourceWeightKind::DirectBtm]
+        {
+            return None;
+        }
+
+        let prefix = Self::source_pattern_prefix(source_envs[0].subsexpr(), source_weight_kinds[0])?;
+        let Some(path) = Self::weighted_random_btm_path_from_prefix(btm, &prefix) else {
+            return Some(None);
+        };
+        let weight = Self::query_match_weight(btm, &path);
+        if weight == 0 {
+            return Some(None);
+        }
+
+        let source_matches = vec![path];
+        if Self::source_match_bindings(source_envs, &source_matches).is_none() {
+            return None;
+        }
+
+        Some(Some(WeightedQueryCandidate { weight, source_matches }))
     }
 
     fn symbol_bytes_to_name_with(sm: &SharedMappingHandle, bytes: &[u8]) -> Option<String> {
@@ -1856,34 +1984,23 @@ impl Space {
         }
     }
 
-    fn select_weighted_candidate_index(engine: &str, candidates: &[WeightedQueryCandidate]) -> Option<usize> {
+    fn weighted_candidate_should_replace(
+        engine: &str,
+        selected_weight: Option<u64>,
+        total_weight: &mut u128,
+        weight: u64,
+    ) -> bool {
+        if weight == 0 {
+            return false;
+        }
+
         match engine {
             "random_walk" => {
-                let total: u128 = candidates.iter().map(|candidate| candidate.weight as u128).sum();
-                if total == 0 {
-                    return None;
-                }
-
-                let mut ticket = rand::random_range(0..total);
-                for (i, candidate) in candidates.iter().enumerate() {
-                    let weight = candidate.weight as u128;
-                    if ticket < weight {
-                        return Some(i);
-                    }
-                    ticket -= weight;
-                }
-                None
+                *total_weight = total_weight.saturating_add(weight as u128);
+                rand::random_range(0..*total_weight) < weight as u128
             }
-            "cpq" => candidates
-                .iter()
-                .enumerate()
-                .filter(|(_, candidate)| candidate.weight > 0)
-                .max_by_key(|(_, candidate)| candidate.weight)
-                .map(|(i, _)| i),
-            other => {
-                warn!("unknown weighted query engine '{}'", other);
-                None
-            }
+            "cpq" => selected_weight.map(|selected_weight| weight >= selected_weight).unwrap_or(true),
+            _ => false,
         }
     }
 
@@ -1955,39 +2072,70 @@ impl Space {
         };
 
         if let Some((engine, weight_policy)) = weighted {
-            let mut candidates = Vec::new();
-            Self::query_multi_i_with_sources(no_source, &mut self.mmaps, &mut self.z3s, &read_copy, pat_expr, |refs_bindings, _loc, source_matches| {
-                match refs_bindings {
-                    Ok(_) => {
-                        unreachable!()
-                    }
-                    Err(ref bindings) => {
-                        #[cfg(debug_assertions)]
-                        bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
-
-                        if let Some(outputs) = Self::instantiate_template_outputs(pat_expr, &templates, bindings) {
-                            let weight = Self::candidate_weight(
-                                &sm,
-                                &read_copy,
-                                pat_expr,
-                                source_matches,
-                                &source_weight_kinds,
-                                &weight_policy,
-                                bindings,
-                            );
-                            candidates.push(WeightedQueryCandidate { weight, outputs });
-                        }
-                        true
-                    }
+            if !matches!(engine.as_str(), "random_walk" | "cpq") {
+                warn!("unknown weighted query engine '{}'", engine);
+                for wz in outstanding_wzs.iter_mut() {
+                    zh.cleanup_write_zipper(wz);
                 }
-            });
+                return (0, false);
+            }
+
+            let source_envs = &pat_args[1..];
+            let selected_candidate = match Self::try_weighted_btm_prefix_candidate(
+                &read_copy,
+                source_envs,
+                &source_weight_kinds,
+                &engine,
+                &weight_policy,
+            ) {
+                Some(candidate) => candidate,
+                None => {
+                    let mut selected_candidate = None;
+                    let mut total_weight = 0u128;
+                    Self::query_multi_i_with_sources(no_source, &mut self.mmaps, &mut self.z3s, &read_copy, pat_expr, |refs_bindings, _loc, source_matches| {
+                        match refs_bindings {
+                            Ok(_) => {
+                                unreachable!()
+                            }
+                            Err(ref bindings) => {
+                                #[cfg(debug_assertions)]
+                                bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
+
+                                let weight = Self::candidate_weight(
+                                    &sm,
+                                    &read_copy,
+                                    pat_expr,
+                                    source_matches,
+                                    &source_weight_kinds,
+                                    &weight_policy,
+                                    bindings,
+                                );
+                                let selected_weight = selected_candidate.as_ref().map(|candidate: &WeightedQueryCandidate| candidate.weight);
+                                if Self::weighted_candidate_should_replace(&engine, selected_weight, &mut total_weight, weight) {
+                                    selected_candidate = Some(WeightedQueryCandidate {
+                                        weight,
+                                        source_matches: Self::owned_source_matches(source_matches),
+                                    });
+                                }
+                                true
+                            }
+                        }
+                    });
+                    selected_candidate
+                }
+            };
 
             let mut any_new = false;
-            let selected = Self::select_weighted_candidate_index(&engine, &candidates);
-            if let Some(selected) = selected {
-                let candidate = &candidates[selected];
-                writes.fetch_add(candidate.outputs.len(), std::sync::atomic::Ordering::Relaxed);
-                for (i, output) in &candidate.outputs {
+            let touched = if let Some(candidate) = selected_candidate {
+                let Some(outputs) = Self::instantiate_source_match_outputs(pat_expr, source_envs, &candidate.source_matches, &templates) else {
+                    for wz in outstanding_wzs.iter_mut() {
+                        zh.cleanup_write_zipper(wz);
+                    }
+                    return (0, false);
+                };
+
+                writes.fetch_add(outputs.len(), std::sync::atomic::Ordering::Relaxed);
+                for (i, output) in &outputs {
                     let wz = unsafe { std::ptr::read(&template_resources[subsumption[*i]]) };
                     sinks[*i].sink(std::iter::once(wz), output);
                 }
@@ -1996,13 +2144,16 @@ impl Space {
                     let wz = unsafe { std::ptr::read(&template_resources[subsumption[i]]) };
                     any_new |= s.finalize(std::iter::once(wz));
                 }
-            }
+                1
+            } else {
+                0
+            };
 
             for wz in outstanding_wzs.iter_mut() {
                 zh.cleanup_write_zipper(wz);
             }
 
-            return (usize::from(selected.is_some()), any_new);
+            return (touched, any_new);
         }
 
         let mut any_new = false;

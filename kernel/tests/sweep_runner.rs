@@ -80,6 +80,46 @@ fn run_sweep_once_supports_explicit_btm_source_rules() {
 }
 
 #[test]
+fn run_sweep_once_random_walk_uses_source_weight_prefix() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(
+            b"
+            (mln-site A (# 7))
+            (mln-site B (# 0))
+            (other Z (# 1000))
+            (sweep mln
+              (e random_walk)
+              (src (, (mln-site $x)))
+              (weight first)
+              (sink (O (+ (was-sampled mln (mln-site $x))))))
+            ",
+        )
+        .unwrap();
+
+    assert_eq!(space.sweep(), "sweep-config");
+
+    let (touched, changed) = space.run_sweep_once("mln").unwrap();
+
+    assert_eq!(touched, 1);
+    assert!(changed);
+
+    let sampled = dump(
+        &space,
+        expr!(space, "[3] was-sampled mln [2] mln-site $"),
+        expr!(space, "[3] was-sampled mln [2] mln-site _1"),
+    );
+    assert!(
+        sampled.contains("(was-sampled mln (mln-site A))"),
+        "random walk should emit the non-zero matching source atom:\n{sampled}"
+    );
+    assert!(
+        !sampled.contains("(was-sampled mln (mln-site B))"),
+        "zero-weight source atom should not be emitted:\n{sampled}"
+    );
+}
+
+#[test]
 fn run_sweep_once_uses_product_weight_policy() {
     let mut space = Space::new();
     space
