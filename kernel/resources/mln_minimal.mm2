@@ -1,0 +1,231 @@
+; Grounded Boolean MLN sampled by the generic weighted sweep/process-calculus path.
+;
+; Model invariants:
+; - each variable has exactly one mln-val atom;
+; - each normalized clause contains a variable at most once;
+; - mln-sat-count is initialized from the current assignment;
+; - only non-evidence variables have mln-site atoms;
+; - measured sampling uses fixed site weights.
+
+; Minimal model:
+;   C1, weight  1.5: !A or B
+;   C2, weight -0.5: A
+;   evidence: B = false
+;
+; Therefore P(A=true | B=false) = exp(-0.5) / (exp(1.5) + exp(-0.5)).
+(mln-var A)
+(mln-var B)
+(mln-mutable A)
+(mln-evidence B false)
+(mln-val A false)
+(mln-val B false)
+
+(mln-clause C1 1.5)
+(mln-lit C1 A negative)
+(mln-lit C1 B positive)
+(mln-in-clause A C1 negative)
+(mln-in-clause B C1 positive)
+(mln-sat-count C1 1)
+
+(mln-clause C2 -0.5)
+(mln-lit C2 A positive)
+(mln-in-clause A C2 positive)
+(mln-sat-count C2 0)
+
+; Scheduler weights are fixed during measured sampling.
+(mln-site A (# 10))
+
+; The seed and explicit stream position make acceptance draws reproducible.
+(mln-rng 1729 0)
+
+(mln-flip false true)
+(mln-flip true false)
+(mln-lit-sat positive false 0)
+(mln-lit-sat positive true 1)
+(mln-lit-sat negative false 1)
+(mln-lit-sat negative true 0)
+
+; Reflective process templates. The sampled-site bridge below specializes these
+; variables and emits the resulting ordinary exec atoms.
+
+; Build one local delta and proposed cache update per incident clause.
+(mln-process $step $x $old $new
+  (exec (mln p10 $step)
+    (, (mln-proposal $step $x $old $new)
+       (mln-in-clause $x $c $polarity)
+       (mln-clause $c $weight)
+       (mln-sat-count $c $old_count)
+       (mln-lit-sat $polarity $old $old_lit_sat)
+       (mln-lit-sat $polarity $new $new_lit_sat))
+    (O
+      (pure
+        (mln-clause-update $step $x $c $old_count $new_count)
+        $new_count
+        (i64_to_string
+          (sum_i64
+            (i64_from_string $old_count)
+            (neg_i64 (i64_from_string $old_lit_sat))
+            (i64_from_string $new_lit_sat))))
+      (pure
+        (mln-delta-part $step $x $c $part)
+        $part
+        (f64_to_string
+          (product_f64
+            (f64_from_string $weight)
+            (i8_as_f64
+              (sub_i8
+                (gt_i64
+                  (sum_i64
+                    (i64_from_string $old_count)
+                    (neg_i64 (i64_from_string $old_lit_sat))
+                    (i64_from_string $new_lit_sat))
+                  (i64_from_string 0))
+                (gt_i64
+                  (i64_from_string $old_count)
+                  (i64_from_string 0))))))))))
+
+; Aggregate local score changes, including the zero baseline.
+(mln-process $step $x $old $new
+  (exec (mln p20 $step)
+    (, (mln-delta-part $step $x $c $part))
+    (O
+      (fsum (mln-delta $step $x $delta) $delta $part))))
+
+; Metropolis accept in log space: ln(u) <= min(0, delta_score).
+(mln-process $step $x $old $new
+  (exec (mln p30 $step)
+    (, (mln-delta $step $x $delta)
+       (mln-random $step $x $u))
+    (O
+      (pure (mln-decision $step $x $decision) $decision
+        (ifnz
+          (gte_f64
+            (f64_from_string $delta)
+            (f64_from_string 0.0))
+          then accept
+          else
+            (ifnz
+              (lte_f64
+                (ln_f64 (f64_from_string $u))
+                (f64_from_string $delta))
+              then accept
+              else reject))))))
+
+; Accepted assignment rewrite.
+(mln-process $step $x $old $new
+  (exec (mln p40 $step)
+    (, (mln-decision $step $x accept)
+       (mln-proposal $step $x $old $new)
+       (mln-delta $step $x $delta)
+       (mln-val $x $old))
+    (O
+      (- (mln-val $x $old))
+      (+ (mln-val $x $new))
+      (+ (mln-accepted $step $x $old $new $delta)))))
+
+; Accepted incident-clause cache rewrites.
+(mln-process $step $x $old $new
+  (exec (mln p41 $step)
+    (, (mln-decision $step $x accept)
+       (mln-clause-update $step $x $c $old_count $new_count)
+       (mln-sat-count $c $old_count))
+    (O
+      (- (mln-sat-count $c $old_count))
+      (+ (mln-sat-count $c $new_count))
+      (- (mln-clause-update $step $x $c $old_count $new_count)))))
+
+; Rejections leave assignment and caches unchanged.
+(mln-process $step $x $old $new
+  (exec (mln p42 $step)
+    (, (mln-decision $step $x reject)
+       (mln-proposal $step $x $old $new)
+       (mln-delta $step $x $delta))
+    (O
+      (+ (mln-rejected $step $x $old $new $delta)))))
+
+; Remove proposed cache updates after either decision.
+(mln-process $step $x $old $new
+  (exec (mln p45 $step)
+    (, (mln-decision $step $x $decision)
+       (mln-clause-update $step $x $c $old_count $new_count))
+    (O
+      (- (mln-clause-update $step $x $c $old_count $new_count)))))
+
+; Remove per-clause delta messages after aggregation.
+(mln-process $step $x $old $new
+  (exec (mln p46 $step)
+    (, (mln-delta-part $step $x $c $part))
+    (O
+      (- (mln-delta-part $step $x $c $part)))))
+
+; Record every post-transition state for readout and exact tests.
+(mln-process $step $x $old $new
+  (exec (mln p48 $step)
+    (, (mln-decision $step $x $decision)
+       (mln-proposal $step $x $old $new)
+       (mln-delta $step $x $delta)
+       (mln-random $step $x $u)
+       (mln-val $x $state))
+    (O
+      (+ (mln-sample $step $x $state $decision $delta $u)))))
+
+; Transaction-local cleanup.
+(mln-process $step $x $old $new
+  (exec (mln p49 $step)
+    (, (mln-decision $step $x $decision)
+       (mln-proposal $step $x $old $new)
+       (mln-delta $step $x $delta)
+       (mln-random $step $x $u))
+    (O
+      (- (mln-decision $step $x $decision))
+      (- (mln-proposal $step $x $old $new))
+      (- (mln-delta $step $x $delta))
+      (- (mln-random $step $x $u)))))
+
+; One sweep step emits an event plus compact one-shot dispatch processes.
+; cycle_scheduler(1, ..., n) preserves serial MCMC semantics.
+(sweep mln
+  (e random_walk)
+  (src (, (mln-site $x)))
+  (weight first)
+  (sink
+    (O
+      (+ (was-sampled mln (mln-site $x)))
+
+      ; Mutable-site bridge and transaction setup.
+      (+ (exec (mln p00 mutable $x)
+           (, (was-sampled mln (mln-site $x))
+              (mln-mutable $x)
+              (mln-val $x $old)
+              (mln-flip $old $new)
+              (mln-rng $seed $step))
+           (O
+             (- (was-sampled mln (mln-site $x)))
+             (- (mln-rng $seed $step))
+             (pure (mln-rng $seed $next_step) $next_step
+               (i64_to_string
+                 (sum_i64
+                   (i64_from_string $step)
+                   (i64_one))))
+             (pure (mln-random $step $x $u) $u
+               (f64_to_string
+                 (uniform_f64_from_seed
+                   (i64_from_string $seed)
+                   (i64_from_string $step))))
+             (+ (mln-proposal $step $x $old $new))
+             (+ (mln-delta-part $step $x baseline 0.0))
+             (+ (mln-activate $step $x $old $new))
+             (+ (exec (mln p01 $step)
+                  (, (mln-activate $step $x $old $new)
+                     (mln-process $step $x $old $new $process))
+                  (O
+                    (+ $process)
+                    (- (mln-activate $step $x $old $new))))))))
+
+      ; Defensive evidence guard for a malformed model that schedules evidence.
+      (+ (exec (mln p00 evidence $x)
+           (, (was-sampled mln (mln-site $x))
+              (mln-evidence $x $value))
+           (O
+             (- (was-sampled mln (mln-site $x)))
+             (+ (mln-skipped-evidence $x))))))))
