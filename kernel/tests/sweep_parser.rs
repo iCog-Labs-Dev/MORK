@@ -1,4 +1,4 @@
-use mork::space::Space;
+use mork::space::{Space, WeightPolicy};
 
 fn dump_all(space: &Space) -> String {
     let mut out = Vec::new();
@@ -65,6 +65,7 @@ fn sweep_source_sink_spec_is_registered_and_config_removed_without_spawning_was(
         .expect("mln sweep should be registered");
     assert_eq!(spec.name, "mln");
     assert_eq!(spec.engine_type, "random_walk");
+    assert_eq!(spec.weight_policy, WeightPolicy::First);
     assert!(spec.operations.is_empty());
 
     let rule = spec
@@ -105,6 +106,7 @@ fn legacy_sweep_operations_still_spawn_was_and_are_registered() {
         .sweep_specs
         .get("imp")
         .expect("legacy sweep should be registered");
+    assert_eq!(spec.weight_policy, WeightPolicy::First);
     let op_names: Vec<&str> = spec
         .operations
         .iter()
@@ -114,6 +116,59 @@ fn legacy_sweep_operations_still_spawn_was_and_are_registered() {
     assert!(spec.rule.is_none());
 
     let _ = space.was.shutdown_all();
+}
+
+#[test]
+fn sweep_weight_expr_clause_is_registered() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(
+            b"
+            (sweep planner
+              (e cpq)
+              (src (, (task $t) (priority $t $w)))
+              (weight expr $w)
+              (sink (O (+ (was-sampled planner (task $t))))))
+            ",
+        )
+        .unwrap();
+
+    assert_eq!(space.sweep(), "sweep-config");
+
+    let spec = space
+        .sweep_specs
+        .get("planner")
+        .expect("planner sweep should be registered");
+    match &spec.weight_policy {
+        WeightPolicy::Expr(bytes) => {
+            assert!(!bytes.is_empty(), "weight expr bytes should be stored");
+        }
+        other => panic!("expected weight expr policy, got {other:?}"),
+    }
+}
+
+#[test]
+fn sweep_weight_product_clause_is_registered() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(
+            b"
+            (sweep planner
+              (e cpq)
+              (src (, (task $t) (ready $t)))
+              (weight product)
+              (sink (O (+ (was-sampled planner (task $t))))))
+            ",
+        )
+        .unwrap();
+
+    assert_eq!(space.sweep(), "sweep-config");
+
+    let spec = space
+        .sweep_specs
+        .get("planner")
+        .expect("planner sweep should be registered");
+    assert_eq!(spec.weight_policy, WeightPolicy::Product);
 }
 
 #[test]
@@ -218,6 +273,34 @@ fn invalid_engine_sweep_is_not_registered_or_removed() {
     let dumped = dump_all(&space);
     assert!(
         dumped.contains("(sweep bad"),
+        "invalid sweep should remain:\n{dumped}"
+    );
+}
+
+#[test]
+fn invalid_weight_clause_sweep_is_not_registered_or_removed() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(
+            b"
+            (sweep bad-weight
+              (e cpq)
+              (src (, (mln-site $x)))
+              (weight expr)
+              (sink (O (+ (was-sampled bad-weight (mln-site $x))))))
+            ",
+        )
+        .unwrap();
+
+    let handle = space.sweep();
+
+    assert!(handle.is_empty());
+    assert!(!space.sweep_specs.contains_key("bad-weight"));
+    assert!(space.was.map.is_none());
+
+    let dumped = dump_all(&space);
+    assert!(
+        dumped.contains("(sweep bad-weight"),
         "invalid sweep should remain:\n{dumped}"
     );
 }

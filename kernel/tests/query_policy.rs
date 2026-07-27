@@ -1,10 +1,14 @@
 use mork::expr;
-use mork::space::{QueryPolicy, Space};
+use mork::space::{QueryPolicy, Space, WeightPolicy};
 
 fn dump(space: &Space, pattern: mork_expr::Expr, template: mork_expr::Expr) -> String {
     let mut out = Vec::new();
     space.dump_sexpr(pattern, template, &mut out);
     String::from_utf8(out).expect("dump output should be valid UTF-8")
+}
+
+fn expr_bytes(e: mork_expr::Expr) -> Vec<u8> {
+    unsafe { e.span().as_ref().unwrap().to_vec() }
 }
 
 #[test]
@@ -37,10 +41,14 @@ fn query_policy_all_runs_existing_source_sink_path() {
     assert!(seen.contains("(seen A C)"), "seen:\n{seen}");
 }
 
-fn run_weighted_pick(space: &mut Space, engine: &str) -> String {
+fn run_weighted_pick_with_policy(
+    space: &mut Space,
+    engine: &str,
+    weight_policy: WeightPolicy,
+    pattern: mork_expr::Expr,
+) -> String {
     space.remove_all_sexpr(b"(picked A)(picked B)").unwrap();
 
-    let pattern = expr!(space, "[2] , [2] mln-site $");
     let template = expr!(space, "[2] O [2] + [2] picked _1");
     let marker = expr!(space, "[1] query-policy-weighted");
 
@@ -52,6 +60,7 @@ fn run_weighted_pick(space: &mut Space, engine: &str) -> String {
         false,
         QueryPolicy::WeightedOne {
             engine: engine.to_string(),
+            weight_policy,
         },
     );
 
@@ -61,6 +70,11 @@ fn run_weighted_pick(space: &mut Space, engine: &str) -> String {
         expr!(space, "[2] picked $"),
         expr!(space, "[2] picked _1"),
     )
+}
+
+fn run_weighted_pick(space: &mut Space, engine: &str) -> String {
+    let pattern = expr!(space, "[2] , [2] mln-site $");
+    run_weighted_pick_with_policy(space, engine, WeightPolicy::First, pattern)
 }
 
 #[test]
@@ -123,4 +137,61 @@ fn query_policy_weighted_one_cpq_selects_highest_weight_candidate() {
         assert!(picked.contains("(picked A)"), "cpq should pick highest weight:\n{picked}");
         assert!(!picked.contains("(picked B)"), "cpq should only pick one candidate:\n{picked}");
     }
+}
+
+#[test]
+fn query_policy_weight_product_uses_all_btm_source_weights() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(b"(site A (# 10))(ready A (# 2))(site B (# 3))(ready B (# 20))")
+        .unwrap();
+
+    let pattern = expr!(space, "[3] , [2] site $ [2] ready _1");
+    let picked = run_weighted_pick_with_policy(&mut space, "cpq", WeightPolicy::Product, pattern);
+
+    assert!(
+        picked.contains("(picked B)"),
+        "product should prefer B: A=10*2, B=3*20\n{picked}"
+    );
+    assert!(!picked.contains("(picked A)"), "cpq should only pick one candidate:\n{picked}");
+}
+
+#[test]
+fn query_policy_weight_sum_uses_all_btm_source_weights() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(b"(site A (# 10))(ready A (# 2))(site B (# 3))(ready B (# 20))")
+        .unwrap();
+
+    let pattern = expr!(space, "[3] , [2] site $ [2] ready _1");
+    let picked = run_weighted_pick_with_policy(&mut space, "cpq", WeightPolicy::Sum, pattern);
+
+    assert!(
+        picked.contains("(picked B)"),
+        "sum should prefer B: A=10+2, B=3+20\n{picked}"
+    );
+    assert!(!picked.contains("(picked A)"), "cpq should only pick one candidate:\n{picked}");
+}
+
+#[test]
+fn query_policy_weight_expr_uses_bound_numeric_expression() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(b"(task A)(priority A 2)(task B)(priority B 20)")
+        .unwrap();
+
+    let pattern = expr!(space, "[3] , [2] task $ [3] priority _1 $");
+    let weight_expr = expr!(space, "_2");
+    let picked = run_weighted_pick_with_policy(
+        &mut space,
+        "cpq",
+        WeightPolicy::Expr(expr_bytes(weight_expr)),
+        pattern,
+    );
+
+    assert!(
+        picked.contains("(picked B)"),
+        "expr weight should prefer the candidate whose bound weight expression is 20:\n{picked}"
+    );
+    assert!(!picked.contains("(picked A)"), "cpq should only pick one candidate:\n{picked}");
 }

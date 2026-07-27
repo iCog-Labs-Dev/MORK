@@ -469,12 +469,33 @@ pub struct CycleSchedulerStats {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryPolicy {
     All,
-    WeightedOne { engine: String },
+    WeightedOne { engine: String, weight_policy: WeightPolicy },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WeightPolicy {
+    First,
+    Product,
+    Sum,
+    Expr(Vec<u8>),
+}
+
+impl Default for WeightPolicy {
+    fn default() -> Self {
+        Self::First
+    }
 }
 
 struct WeightedQueryCandidate {
     weight: u64,
     outputs: Vec<(usize, Vec<u8>)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceWeightKind {
+    DirectBtm,
+    WrappedBtm,
+    NonBtm,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -495,6 +516,7 @@ pub struct SweepSpec {
     pub engine_type: String,
     pub operations: Vec<SweepOperationSpec>,
     pub rule: Option<SweepRuleSpec>,
+    pub weight_policy: WeightPolicy,
     pub atom: Vec<u8>,
 }
 
@@ -1194,6 +1216,15 @@ impl Space {
             mmaps: &mut HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
             z3s: &mut HashMap<OwnedSourceItem, Box<Popen>>,
             btm: &PathMap<u64>, pat_expr: Expr, mut effect: F) -> usize {
+        Self::query_multi_i_with_sources(no_source, mmaps, z3s, btm, pat_expr, |refs_bindings, loc, _sources| {
+            effect(refs_bindings, loc)
+        })
+    }
+
+    fn query_multi_i_with_sources<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr, &[Expr]) -> bool>(no_source: bool,
+            mmaps: &mut HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
+            z3s: &mut HashMap<OwnedSourceItem, Box<Popen>>,
+            btm: &PathMap<u64>, pat_expr: Expr, mut effect: F) -> usize {
         use crate::sources::{ASource, Resource, ResourceRequest, Source};
 
         let pat_newvars = pat_expr.newvars();
@@ -1201,7 +1232,7 @@ impl Space {
         let n_factors = pat_expr.arity().unwrap() as usize;
         debug_assert!(n_factors > 0);
         if n_factors == 1 {
-            effect(Err(BTreeMap::new()), pat_expr);
+            effect(Err(BTreeMap::new()), pat_expr, &[]);
             return 1;
         }
         let mut pat_args = Vec::with_capacity(n_factors);
@@ -1220,20 +1251,26 @@ impl Space {
             AFactor::CompatSource(primary) => {
                 let mut prz = ProductZipper::new(primary, &mut factors[..]);
                 prz.reserve_buffers(1 << 32, 32);
-                Self::query_multi_raw(&mut prz, &pat_args[1..], effect)
+                Self::query_multi_raw_with_sources(&mut prz, &pat_args[1..], effect)
             }
             primary => {
                 trace!(target: "query_multi_i", "PZG of {:?}", factors.len() + 1);
                 let mut prz = ProductZipperG::new(primary, &mut factors[..]);
                 prz.reserve_buffers(1 << 32, 32);
-                Self::query_multi_raw(&mut prz, &pat_args[1..], effect)
+                Self::query_multi_raw_with_sources(&mut prz, &pat_args[1..], effect)
             }
         }
     }
 
+    pub fn query_multi_raw<PZ : ZipperProduct, F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
+        Self::query_multi_raw_with_sources(prz, sources, |refs_bindings, loc, _sources| {
+            effect(refs_bindings, loc)
+        })
+    }
+
     #[cfg(feature="no_search")]
     #[inline(always)]
-    pub fn query_multi_raw<PZ : ZipperProduct, F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
+    fn query_multi_raw_with_sources<PZ : ZipperProduct, F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr, &[Expr]) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
         let mut candidate = 0;
 
         while prz.to_next_val() {
@@ -1241,9 +1278,12 @@ impl Space {
             let e = Expr { ptr: prz.origin_path().as_ptr().cast_mut() };
             trace!(target: "query_multi_ref", "pi {:?}", prz.path_indices());
             trace!(target: "query_multi_ref", "at {:?}", e);
+            let mut source_matches = Vec::with_capacity(sources.len());
+            source_matches.push(e);
             for &other_i in prz.path_indices() {
                 trace!(target: "query_multi_ref", "at {:?}",
                     Expr { ptr: unsafe { prz.origin_path().as_ptr().cast_mut().add(other_i) } });
+                source_matches.push(Expr { ptr: unsafe { prz.origin_path().as_ptr().cast_mut().add(other_i) } });
             }
             unifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // if e.variables() != 0 {
@@ -1264,7 +1304,7 @@ impl Space {
                 Ok(bs) => {
 
                     unsafe { std::ptr::write_volatile(&mut candidate, std::ptr::read_volatile(&candidate) + 1); }
-                    if !effect(Err(bs), e) {
+                    if !effect(Err(bs), e, &source_matches) {
                         break
                     }
                 }
@@ -1290,7 +1330,7 @@ impl Space {
 
     #[cfg(not(feature="no_search"))]
     #[inline(always)]
-    pub fn query_multi_raw<PZ : ZipperProduct, F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
+    fn query_multi_raw_with_sources<PZ : ZipperProduct, F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr, &[Expr]) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
         let mut stack = sources[0..].iter().rev().cloned().collect::<Vec<_>>();
 
         let mut references: Vec<u32> = vec![];
@@ -1305,9 +1345,12 @@ impl Space {
                     let e = Expr { ptr: loc.origin_path().as_ptr().cast_mut() };
                     trace!(target: "query_multi", "pi {:?}", loc.path_indices());
                     trace!(target: "query_multi", "at {:?}", e);
+                    let mut source_matches = Vec::with_capacity(sources.len());
+                    source_matches.push(e);
                     for &other_i in loc.path_indices() {
                         trace!(target: "query_multi", "at {:?}",
                             Expr { ptr: unsafe { loc.origin_path().as_ptr().cast_mut().add(other_i) } });
+                        source_matches.push(Expr { ptr: unsafe { loc.origin_path().as_ptr().cast_mut().add(other_i) } });
                     }
                     unifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // if e.variables() != 0 {
@@ -1327,7 +1370,7 @@ impl Space {
                         match bindings {
                             Ok(bs) => {
                                 unsafe { std::ptr::write_volatile(&mut candidate, std::ptr::read_volatile(&candidate) + 1); }
-                                if !effect(Err(bs), e) {
+                                if !effect(Err(bs), e, &source_matches) {
                                     unsafe { longjmp(a, 1) }
                                 }
                             }
@@ -1348,7 +1391,7 @@ impl Space {
                     } else {
                         trace!(target: "query_multi", "#variables==0 {:?}", e);
                         unsafe { std::ptr::write_volatile(&mut candidate, std::ptr::read_volatile(&candidate) + 1); }
-                        if !effect(Ok(unsafe { slice_from_raw_parts(references.as_ptr(), references.len()).as_ref().unwrap() }), e) {
+                        if !effect(Ok(unsafe { slice_from_raw_parts(references.as_ptr(), references.len()).as_ref().unwrap() }), e, &source_matches) {
                             unsafe { longjmp(a, 1) }
                         }
                     }
@@ -1673,18 +1716,144 @@ impl Space {
         Some(outputs)
     }
 
+    fn instantiate_exprs(
+        pat_expr: Expr,
+        exprs: &[Expr],
+        bindings: &BTreeMap<(u8, u8), ExprEnv>,
+    ) -> Option<Vec<Vec<u8>>> {
+        let mut assignments: Vec<(u8, u8)> = vec![];
+        let mut trace: Vec<(u8, u8)> = vec![];
+        let mut ass = Vec::with_capacity(64);
+        let mut astack = Vec::with_capacity(64);
+        let mut buffer = Vec::with_capacity(4096);
+
+        let (oi, ni, true) = ({
+            let mut void = std::io::sink();
+            mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0,pat_expr,bindings,void,trace,assignments)
+        }) else { return None; };
+
+        let mut outputs = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            buffer.clear();
+            let (_, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*expr,bindings,buffer,astack,ass) else { return None; };
+            outputs.push(buffer.clone());
+        }
+
+        Some(outputs)
+    }
+
     fn strip_btm_source_wrapper(e: Expr) -> Option<Vec<u8>> {
         let args = Self::expr_args(e)?;
         args.get(1).map(|ee| Self::expr_bytes(ee.subsexpr()))
     }
 
-    fn query_match_weight(btm: &PathMap<u64>, loc: Expr, strip_btm_wrapper: bool) -> u64 {
-        let path = if strip_btm_wrapper {
-            Self::strip_btm_source_wrapper(loc).unwrap_or_else(|| Self::expr_bytes(loc))
-        } else {
-            Self::expr_bytes(loc)
-        };
+    fn query_match_weight(btm: &PathMap<u64>, path: &[u8]) -> u64 {
         btm.read_zipper_at_path(&path).val().copied().unwrap_or(1)
+    }
+
+    fn source_weight_path(bytes: &[u8], kind: SourceWeightKind) -> Option<Vec<u8>> {
+        match kind {
+            SourceWeightKind::DirectBtm => Some(bytes.to_vec()),
+            SourceWeightKind::WrappedBtm => {
+                let expr = Expr { ptr: bytes.as_ptr().cast_mut() };
+                Self::strip_btm_source_wrapper(expr)
+            }
+            SourceWeightKind::NonBtm => None,
+        }
+    }
+
+    fn symbol_bytes_to_name_with(sm: &SharedMappingHandle, bytes: &[u8]) -> Option<String> {
+        #[cfg(feature = "interning")]
+        {
+            if bytes.len() != mork_interning::SYM_LEN {
+                return None;
+            }
+            let symbol = i64::from_be_bytes(bytes.try_into().ok()?).to_be_bytes();
+            sm.get_bytes(symbol)
+                .and_then(|s| std::str::from_utf8(s).ok())
+                .map(|s| s.to_owned())
+        }
+        #[cfg(not(feature = "interning"))]
+        {
+            let _ = sm;
+            std::str::from_utf8(bytes).ok().map(|s| s.to_owned())
+        }
+    }
+
+    fn symbol_name_with_sm(sm: &SharedMappingHandle, e: Expr) -> Option<String> {
+        unsafe {
+            let Tag::SymbolSize(size) = byte_item(*e.ptr) else { return None; };
+            let bytes = slice_from_raw_parts(e.ptr.add(1), size as usize).as_ref().unwrap();
+            Self::symbol_bytes_to_name_with(sm, bytes)
+        }
+    }
+
+    fn explicit_expr_weight(sm: &SharedMappingHandle, btm: &PathMap<u64>, bytes: &[u8]) -> Option<u64> {
+        let expr = Expr { ptr: bytes.as_ptr().cast_mut() };
+        if let Some(text) = Self::symbol_name_with_sm(sm, expr) {
+            return text.parse::<u64>().ok();
+        }
+
+        btm.read_zipper_at_path(bytes).val().copied()
+    }
+
+    fn source_match_weights(
+        btm: &PathMap<u64>,
+        source_matches: &[Expr],
+        source_weight_kinds: &[SourceWeightKind],
+    ) -> Vec<u64> {
+        source_matches
+            .iter()
+            .zip(source_weight_kinds)
+            .filter_map(|(source_match, kind)| {
+                let bytes = Self::expr_bytes(*source_match);
+                let path = Self::source_weight_path(&bytes, *kind)?;
+                Some(Self::query_match_weight(btm, &path))
+            })
+            .collect()
+    }
+
+    fn candidate_weight(
+        sm: &SharedMappingHandle,
+        btm: &PathMap<u64>,
+        pat_expr: Expr,
+        source_matches: &[Expr],
+        source_weight_kinds: &[SourceWeightKind],
+        weight_policy: &WeightPolicy,
+        bindings: &BTreeMap<(u8, u8), ExprEnv>,
+    ) -> u64 {
+        match weight_policy {
+            WeightPolicy::First => {
+                let weights = Self::source_match_weights(btm, source_matches, source_weight_kinds);
+                weights.first().copied().unwrap_or(1)
+            }
+            WeightPolicy::Product => {
+                let weights = Self::source_match_weights(btm, source_matches, source_weight_kinds);
+                if weights.is_empty() {
+                    1
+                } else {
+                    weights.into_iter().fold(1u64, u64::saturating_mul)
+                }
+            }
+            WeightPolicy::Sum => {
+                let weights = Self::source_match_weights(btm, source_matches, source_weight_kinds);
+                if weights.is_empty() {
+                    1
+                } else {
+                    weights.into_iter().fold(0u64, u64::saturating_add)
+                }
+            }
+            WeightPolicy::Expr(weight_expr) => {
+                let weight_expr = Expr { ptr: weight_expr.as_ptr().cast_mut() };
+                let Some(mut instantiated) = Self::instantiate_exprs(pat_expr, &[weight_expr], bindings) else {
+                    return 0;
+                };
+                let Some(weight_expr) = instantiated.pop() else {
+                    return 0;
+                };
+                Self::explicit_expr_weight(sm, btm, &weight_expr).unwrap_or(0)
+            }
+        }
     }
 
     fn select_weighted_candidate_index(engine: &str, candidates: &[WeightedQueryCandidate]) -> Option<usize> {
@@ -1727,13 +1896,25 @@ impl Space {
         let mut templates: Vec<_> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
         let mut pat_args = Vec::with_capacity(64);
         ExprEnv::new(0, pat_expr).args(&mut pat_args);
-        let first_source_is_btm = !no_source && matches!(
-            pat_args
-                .get(1)
-                .and_then(|ee| self.expr_head_name(ee.subsexpr()))
-                .as_deref(),
-            Some("BTM")
-        );
+        let source_patterns: Vec<_> = pat_args[1..].iter().map(|ee| ee.subsexpr()).collect();
+        let source_weight_kinds: Vec<_> = if no_source {
+            source_patterns
+                .iter()
+                .map(|_| SourceWeightKind::DirectBtm)
+                .collect()
+        } else {
+            source_patterns
+                .iter()
+                .map(|source| {
+                    if matches!(self.expr_head_name(*source).as_deref(), Some("BTM")) {
+                        SourceWeightKind::WrappedBtm
+                    } else {
+                        SourceWeightKind::NonBtm
+                    }
+                })
+                .collect()
+        };
+        let sm = self.sm.clone();
         let mut sinks: Vec<_> = templates.iter().map(|e| { if no_sink { ASink::compat(*e) } else { ASink::new(*e) } }).collect();
         let mut template_prefixes: Vec<_> = sinks.iter().map(|sink|
             sink.request().next().unwrap()
@@ -1768,14 +1949,14 @@ impl Space {
         let mut ass = Vec::with_capacity(64);
         let mut astack = Vec::with_capacity(64);
 
-        let weighted_engine = match policy {
+        let weighted = match policy {
             QueryPolicy::All => None,
-            QueryPolicy::WeightedOne { engine } => Some(engine),
+            QueryPolicy::WeightedOne { engine, weight_policy } => Some((engine, weight_policy)),
         };
 
-        if let Some(engine) = weighted_engine {
+        if let Some((engine, weight_policy)) = weighted {
             let mut candidates = Vec::new();
-            Self::query_multi_i(no_source, &mut self.mmaps, &mut self.z3s, &read_copy, pat_expr, |refs_bindings, loc| {
+            Self::query_multi_i_with_sources(no_source, &mut self.mmaps, &mut self.z3s, &read_copy, pat_expr, |refs_bindings, _loc, source_matches| {
                 match refs_bindings {
                     Ok(_) => {
                         unreachable!()
@@ -1785,7 +1966,15 @@ impl Space {
                         bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
 
                         if let Some(outputs) = Self::instantiate_template_outputs(pat_expr, &templates, bindings) {
-                            let weight = Self::query_match_weight(&read_copy, loc, first_source_is_btm);
+                            let weight = Self::candidate_weight(
+                                &sm,
+                                &read_copy,
+                                pat_expr,
+                                source_matches,
+                                &source_weight_kinds,
+                                &weight_policy,
+                                bindings,
+                            );
                             candidates.push(WeightedQueryCandidate { weight, outputs });
                         }
                         true
@@ -1898,25 +2087,7 @@ impl Space {
         unsafe {
             let Tag::SymbolSize(size) = byte_item(*e.ptr) else { return None; };
             let bytes = slice_from_raw_parts(e.ptr.add(1), size as usize).as_ref().unwrap();
-            self.symbol_bytes_to_name(bytes)
-        }
-    }
-
-    fn symbol_bytes_to_name(&self, bytes: &[u8]) -> Option<String> {
-        #[cfg(feature = "interning")]
-        {
-            if bytes.len() != mork_interning::SYM_LEN {
-                return None;
-            }
-            let symbol = i64::from_be_bytes(bytes.try_into().ok()?).to_be_bytes();
-            self.sm
-                .get_bytes(symbol)
-                .and_then(|s| std::str::from_utf8(s).ok())
-                .map(|s| s.to_owned())
-        }
-        #[cfg(not(feature = "interning"))]
-        {
-            std::str::from_utf8(bytes).ok().map(|s| s.to_owned())
+            Self::symbol_bytes_to_name_with(&self.sm, bytes)
         }
     }
 
@@ -1990,6 +2161,44 @@ impl Space {
         Some(SweepOperationSpec { op_type, args })
     }
 
+    fn parse_sweep_weight_clause(&self, name: &str, clause_args: &[ExprEnv]) -> Option<WeightPolicy> {
+        let mode = self.symbol_name(clause_args.get(1)?.subsexpr())?;
+        match mode.as_str() {
+            "first" => {
+                if clause_args.len() != 2 {
+                    warn!("sweep '{}' has malformed weight first clause", name);
+                    return None;
+                }
+                Some(WeightPolicy::First)
+            }
+            "product" => {
+                if clause_args.len() != 2 {
+                    warn!("sweep '{}' has malformed weight product clause", name);
+                    return None;
+                }
+                Some(WeightPolicy::Product)
+            }
+            "sum" => {
+                if clause_args.len() != 2 {
+                    warn!("sweep '{}' has malformed weight sum clause", name);
+                    return None;
+                }
+                Some(WeightPolicy::Sum)
+            }
+            "expr" => {
+                if clause_args.len() != 3 {
+                    warn!("sweep '{}' has malformed weight expr clause", name);
+                    return None;
+                }
+                Some(WeightPolicy::Expr(Self::expr_bytes(clause_args[2].subsexpr())))
+            }
+            other => {
+                warn!("sweep '{}' has unknown weight mode '{}'", name, other);
+                None
+            }
+        }
+    }
+
     /// Parse a single `(sweep name (e type) ...)` atom into a typed sweep spec.
     ///
     /// Supported clauses:
@@ -1998,6 +2207,7 @@ impl Space {
     /// - `(, (<operation> <arg>...) (o <operation> <arg>...) ...)`
     /// - `(src <source-expr>)`
     /// - `(sink <sink-expr>)`
+    /// - `(weight first|product|sum|expr <expr>)`
     fn parse_sweep_atom(&self, path: &[u8]) -> Option<SweepSpec> {
         let sweep_expr = Expr { ptr: path.as_ptr().cast_mut() };
         let args = Self::expr_args(sweep_expr)?;
@@ -2010,6 +2220,7 @@ impl Space {
         let mut operations = Vec::new();
         let mut source: Option<Vec<u8>> = None;
         let mut sink: Option<Vec<u8>> = None;
+        let mut weight_policy = WeightPolicy::First;
 
         for clause in &args[2..] {
             let Some(clause_args) = Self::expr_args(clause.subsexpr()) else {
@@ -2061,6 +2272,9 @@ impl Space {
                     }
                     sink = Some(Self::expr_bytes(sink_expr));
                 }
+                "weight" => {
+                    weight_policy = self.parse_sweep_weight_clause(&name, &clause_args)?;
+                }
                 other => {
                     warn!("sweep '{}' contains unknown clause '{}', ignoring it", name, other);
                 }
@@ -2077,7 +2291,7 @@ impl Space {
             }
         };
 
-        Some(SweepSpec { name, engine_type, operations, rule, atom: path.to_vec() })
+        Some(SweepSpec { name, engine_type, operations, rule, weight_policy, atom: path.to_vec() })
     }
 
     pub fn sweep(&mut self) -> String {
@@ -2145,7 +2359,7 @@ impl Space {
     }
 
     fn run_sweep_spec_once(&mut self, spec: SweepSpec) -> Result<(usize, bool), &'static str> {
-        let SweepSpec { engine_type, rule, atom, .. } = spec;
+        let SweepSpec { engine_type, rule, weight_policy, atom, .. } = spec;
         let rule = rule.ok_or("sweep has no source/sink rule")?;
         let mut source = rule.source;
         let mut sink = rule.sink;
@@ -2164,6 +2378,7 @@ impl Space {
             no_sink,
             QueryPolicy::WeightedOne {
                 engine: engine_type,
+                weight_policy,
             },
         ))
     }
