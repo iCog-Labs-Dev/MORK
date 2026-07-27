@@ -460,6 +460,12 @@ pub struct StepInfo<'e> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryPolicy {
     All,
+    WeightedOne { engine: String },
+}
+
+struct WeightedQueryCandidate {
+    weight: u64,
+    outputs: Vec<(usize, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1631,17 +1637,93 @@ impl Space {
         self.transform_multi_multi_io_with_policy(pat_expr, tpl_expr, add, no_source, no_sink, QueryPolicy::All)
     }
 
-    pub fn transform_multi_multi_io_with_policy(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr, no_source: bool, no_sink: bool, policy: QueryPolicy) -> (usize, bool) {
-        match policy {
-            QueryPolicy::All => {}
+    fn instantiate_template_outputs(
+        pat_expr: Expr,
+        templates: &[Expr],
+        bindings: &BTreeMap<(u8, u8), ExprEnv>,
+    ) -> Option<Vec<(usize, Vec<u8>)>> {
+        let mut assignments: Vec<(u8, u8)> = vec![];
+        let mut trace: Vec<(u8, u8)> = vec![];
+        let mut ass = Vec::with_capacity(64);
+        let mut astack = Vec::with_capacity(64);
+        let mut buffer = Vec::with_capacity(4096);
+
+        let (oi, ni, true) = ({
+            let mut void = std::io::sink();
+            mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0,pat_expr,bindings,void,trace,assignments)
+        }) else { return None; };
+
+        let mut outputs = Vec::with_capacity(templates.len());
+        for (i, template) in templates.iter().enumerate() {
+            buffer.clear();
+            let (_, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue; };
+            outputs.push((i, buffer.clone()));
         }
 
+        Some(outputs)
+    }
+
+    fn strip_btm_source_wrapper(e: Expr) -> Option<Vec<u8>> {
+        let args = Self::expr_args(e)?;
+        args.get(1).map(|ee| Self::expr_bytes(ee.subsexpr()))
+    }
+
+    fn query_match_weight(btm: &PathMap<u64>, loc: Expr, strip_btm_wrapper: bool) -> u64 {
+        let path = if strip_btm_wrapper {
+            Self::strip_btm_source_wrapper(loc).unwrap_or_else(|| Self::expr_bytes(loc))
+        } else {
+            Self::expr_bytes(loc)
+        };
+        btm.read_zipper_at_path(&path).val().copied().unwrap_or(1)
+    }
+
+    fn select_weighted_candidate_index(engine: &str, candidates: &[WeightedQueryCandidate]) -> Option<usize> {
+        match engine {
+            "random_walk" => {
+                let total: u128 = candidates.iter().map(|candidate| candidate.weight as u128).sum();
+                if total == 0 {
+                    return None;
+                }
+
+                let mut ticket = rand::random_range(0..total);
+                for (i, candidate) in candidates.iter().enumerate() {
+                    let weight = candidate.weight as u128;
+                    if ticket < weight {
+                        return Some(i);
+                    }
+                    ticket -= weight;
+                }
+                None
+            }
+            "cpq" => candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| candidate.weight > 0)
+                .max_by_key(|(_, candidate)| candidate.weight)
+                .map(|(i, _)| i),
+            other => {
+                warn!("unknown weighted query engine '{}'", other);
+                None
+            }
+        }
+    }
+
+    pub fn transform_multi_multi_io_with_policy(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr, no_source: bool, no_sink: bool, policy: QueryPolicy) -> (usize, bool) {
         use crate::sinks::*;
         let mut buffer = Vec::with_capacity(1 << 32);
         unsafe { buffer.set_len(1 << 32); }
         let mut tpl_args = Vec::with_capacity(64);
         ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
         let mut templates: Vec<_> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
+        let mut pat_args = Vec::with_capacity(64);
+        ExprEnv::new(0, pat_expr).args(&mut pat_args);
+        let first_source_is_btm = !no_source && matches!(
+            pat_args
+                .get(1)
+                .and_then(|ee| self.expr_head_name(ee.subsexpr()))
+                .as_deref(),
+            Some("BTM")
+        );
         let mut sinks: Vec<_> = templates.iter().map(|e| { if no_sink { ASink::compat(*e) } else { ASink::new(*e) } }).collect();
         let mut template_prefixes: Vec<_> = sinks.iter().map(|sink|
             sink.request().next().unwrap()
@@ -1675,6 +1757,54 @@ impl Space {
 
         let mut ass = Vec::with_capacity(64);
         let mut astack = Vec::with_capacity(64);
+
+        let weighted_engine = match policy {
+            QueryPolicy::All => None,
+            QueryPolicy::WeightedOne { engine } => Some(engine),
+        };
+
+        if let Some(engine) = weighted_engine {
+            let mut candidates = Vec::new();
+            Self::query_multi_i(no_source, &mut self.mmaps, &mut self.z3s, &read_copy, pat_expr, |refs_bindings, loc| {
+                match refs_bindings {
+                    Ok(_) => {
+                        unreachable!()
+                    }
+                    Err(ref bindings) => {
+                        #[cfg(debug_assertions)]
+                        bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
+
+                        if let Some(outputs) = Self::instantiate_template_outputs(pat_expr, &templates, bindings) {
+                            let weight = Self::query_match_weight(&read_copy, loc, first_source_is_btm);
+                            candidates.push(WeightedQueryCandidate { weight, outputs });
+                        }
+                        true
+                    }
+                }
+            });
+
+            let mut any_new = false;
+            let selected = Self::select_weighted_candidate_index(&engine, &candidates);
+            if let Some(selected) = selected {
+                let candidate = &candidates[selected];
+                writes.fetch_add(candidate.outputs.len(), std::sync::atomic::Ordering::Relaxed);
+                for (i, output) in &candidate.outputs {
+                    let wz = unsafe { std::ptr::read(&template_resources[subsumption[*i]]) };
+                    sinks[*i].sink(std::iter::once(wz), output);
+                }
+
+                for (i, s) in sinks.iter_mut().enumerate() {
+                    let wz = unsafe { std::ptr::read(&template_resources[subsumption[i]]) };
+                    any_new |= s.finalize(std::iter::once(wz));
+                }
+            }
+
+            for wz in outstanding_wzs.iter_mut() {
+                zh.cleanup_write_zipper(wz);
+            }
+
+            return (usize::from(selected.is_some()), any_new);
+        }
 
         let mut any_new = false;
         let touched = Self::query_multi_i(no_source, &mut self.mmaps, &mut self.z3s, &read_copy, pat_expr, |refs_bindings, loc| 'query : {
