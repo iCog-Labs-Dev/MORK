@@ -456,6 +456,11 @@ pub struct StepInfo<'e> {
     pub error: Option<&'static str>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryPolicy {
+    All,
+}
+
 impl Space {
     pub fn new() -> Self {
         Self { btm: PathMap::new(), was: WeightedAtomSweep::new(WeightedAtomSweepSettings::default()), sm: SharedMapping::new(), mmaps: HashMap::new(), z3s: HashMap::new(), last_merkleize: Instant::now(), timing: false }
@@ -1596,6 +1601,14 @@ impl Space {
     }
 
     pub fn transform_multi_multi_io(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr, no_source: bool, no_sink: bool) -> (usize, bool) {
+        self.transform_multi_multi_io_with_policy(pat_expr, tpl_expr, add, no_source, no_sink, QueryPolicy::All)
+    }
+
+    pub fn transform_multi_multi_io_with_policy(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr, no_source: bool, no_sink: bool, policy: QueryPolicy) -> (usize, bool) {
+        match policy {
+            QueryPolicy::All => {}
+        }
+
         use crate::sinks::*;
         let mut buffer = Vec::with_capacity(1 << 32);
         unsafe { buffer.set_len(1 << 32); }
