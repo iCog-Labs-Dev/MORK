@@ -486,6 +486,7 @@ pub struct SweepSpec {
     pub engine_type: String,
     pub operations: Vec<SweepOperationSpec>,
     pub rule: Option<SweepRuleSpec>,
+    pub atom: Vec<u8>,
 }
 
 impl SweepSpec {
@@ -1863,28 +1864,17 @@ impl Space {
         { let mut rz = self.btm.read_zipper(); while rz.to_next_val() { trace!(target: "interpret", "on space {:?}", serialize(unsafe { rz.path() })); }; drop(rz); }
         destruct!(rt, ("exec" loc pat_expr tpl_expr), unsafe {
             debug_assert!(loc.variables() == 0);
-            if let Tag::Arity(i) = byte_item(*pat_expr.ptr) { if i == 0 { return Err("pattern expression can not be empty"); } } else { return Err("pattern must be an expression, not a symbol or variables") }
-            if *pat_expr.ptr.add(1) != item_byte(Tag::SymbolSize(1)) { return Err("pattern functor can only be , or I") }
-
-            if let Tag::Arity(i) = byte_item(*tpl_expr.ptr) { if i == 0 { return Err("template expression can not be empty"); } } else { return Err("template must be an expression, not a symbol or variables") }
-            if *tpl_expr.ptr.add(1) != item_byte(Tag::SymbolSize(1)) { return Err("template functor can only be , or O") }
+            let (no_source, no_sink) = self.transform_io_flags(pat_expr, tpl_expr)?;
 
             #[cfg(feature="specialize_io")]
-            let res = match (*pat_expr.ptr.add(2), *tpl_expr.ptr.add(2)) {
-                (b',', b',') => { self.transform_multi_multi_(pat_expr, tpl_expr, rt) }
-                (b'I', b',') => { self.transform_multi_multi_i(pat_expr, tpl_expr, rt) }
-                (b',', b'O') => { self.transform_multi_multi_o(pat_expr, tpl_expr, rt) }
-                (b'I', b'O') => { self.transform_multi_multi_io(pat_expr, tpl_expr, rt, false, false) }
-                (_, _) => { return Err("pattern functor can only be , or I and template functor can only be , or O") }
+            let res = match (no_source, no_sink) {
+                (true, true) => { self.transform_multi_multi_(pat_expr, tpl_expr, rt) }
+                (false, true) => { self.transform_multi_multi_i(pat_expr, tpl_expr, rt) }
+                (true, false) => { self.transform_multi_multi_o(pat_expr, tpl_expr, rt) }
+                (false, false) => { self.transform_multi_multi_io(pat_expr, tpl_expr, rt, false, false) }
             };
             #[cfg(not(feature="specialize_io"))]
-            let res = match (*pat_expr.ptr.add(2), *tpl_expr.ptr.add(2)) {
-                (b',', b',') => { self.transform_multi_multi_io(pat_expr, tpl_expr, rt, true, true) }
-                (b'I', b',') => { self.transform_multi_multi_io(pat_expr, tpl_expr, rt, false, true) }
-                (b',', b'O') => { self.transform_multi_multi_io(pat_expr, tpl_expr, rt, true, false) }
-                (b'I', b'O') => { self.transform_multi_multi_io(pat_expr, tpl_expr, rt, false, false) }
-                (_, _) => { return Err("pattern functor can only be , or I and template functor can only be , or O") }
-            };
+            let res = self.transform_multi_multi_io(pat_expr, tpl_expr, rt, no_source, no_sink);
 
             trace!(target: "interpret", "(run, changed) = {:?}", res);
             return Ok(res)
@@ -1941,6 +1931,31 @@ impl Space {
 
     fn validate_sweep_sink_expr(&self, e: Expr) -> bool {
         matches!(self.expr_head_name(e).as_deref(), Some(",") | Some("O"))
+    }
+
+    fn transform_io_flags(&self, pat_expr: Expr, tpl_expr: Expr) -> Result<(bool, bool), &'static str> {
+        if let Tag::Arity(i) = unsafe { byte_item(*pat_expr.ptr) } {
+            if i == 0 { return Err("pattern expression can not be empty"); }
+        } else {
+            return Err("pattern must be an expression, not a symbol or variables");
+        }
+
+        if let Tag::Arity(i) = unsafe { byte_item(*tpl_expr.ptr) } {
+            if i == 0 { return Err("template expression can not be empty"); }
+        } else {
+            return Err("template must be an expression, not a symbol or variables");
+        }
+
+        match (
+            self.expr_head_name(pat_expr).as_deref(),
+            self.expr_head_name(tpl_expr).as_deref(),
+        ) {
+            (Some(","), Some(",")) => Ok((true, true)),
+            (Some("I"), Some(",")) => Ok((false, true)),
+            (Some(","), Some("O")) => Ok((true, false)),
+            (Some("I"), Some("O")) => Ok((false, false)),
+            _ => Err("pattern functor can only be , or I and template functor can only be , or O"),
+        }
     }
 
     fn parse_sweep_operation_expr(&self, e: Expr) -> Option<SweepOperationSpec> {
@@ -2053,7 +2068,7 @@ impl Space {
             }
         };
 
-        Some(SweepSpec { name, engine_type, operations, rule })
+        Some(SweepSpec { name, engine_type, operations, rule, atom: path.to_vec() })
     }
 
     pub fn sweep(&mut self) -> String {
@@ -2118,6 +2133,92 @@ impl Space {
             }
         }
         self.was.spawn()
+    }
+
+    fn run_sweep_spec_once(&mut self, spec: SweepSpec) -> Result<(usize, bool), &'static str> {
+        let SweepSpec { engine_type, rule, atom, .. } = spec;
+        let rule = rule.ok_or("sweep has no source/sink rule")?;
+        let mut source = rule.source;
+        let mut sink = rule.sink;
+        let pat_expr = Expr { ptr: source.as_mut_ptr() };
+        let tpl_expr = Expr { ptr: sink.as_mut_ptr() };
+        let (no_source, no_sink) = self.transform_io_flags(pat_expr, tpl_expr)?;
+
+        let mut sweep_atom = atom;
+        let add = Expr { ptr: sweep_atom.as_mut_ptr() };
+
+        Ok(self.transform_multi_multi_io_with_policy(
+            pat_expr,
+            tpl_expr,
+            add,
+            no_source,
+            no_sink,
+            QueryPolicy::WeightedOne {
+                engine: engine_type,
+            },
+        ))
+    }
+
+    pub fn run_sweep_once(&mut self, name: &str) -> Result<(usize, bool), &'static str> {
+        let spec = self
+            .sweep_specs
+            .get(name)
+            .cloned()
+            .ok_or("sweep not found")?;
+
+        let was_paused = self.was.map.is_some();
+        if was_paused {
+            self.btm = self.was.pause_all();
+        }
+
+        let result = self.run_sweep_spec_once(spec);
+
+        if was_paused {
+            let btm = std::mem::take(&mut self.btm);
+            self.was.resume_all(btm);
+        }
+
+        result
+    }
+
+    pub fn run_sweep_cycles(&mut self, cycles: usize) -> Result<(usize, bool), &'static str> {
+        let mut names: Vec<String> = self
+            .sweep_specs
+            .iter()
+            .filter(|(_, spec)| spec.rule.is_some())
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+
+        let was_paused = self.was.map.is_some();
+        if was_paused {
+            self.btm = self.was.pause_all();
+        }
+
+        let result = (|| {
+            let mut touched = 0;
+            let mut any_new = false;
+            for _ in 0..cycles {
+                for name in &names {
+                    let spec = self
+                        .sweep_specs
+                        .get(name)
+                        .cloned()
+                        .ok_or("sweep not found")?;
+                    let (next_touched, next_new) = self.run_sweep_spec_once(spec)?;
+                    touched += next_touched;
+                    any_new |= next_new;
+                }
+            }
+            Ok((touched, any_new))
+        })();
+
+        if was_paused {
+            let btm = std::mem::take(&mut self.btm);
+            self.was.resume_all(btm);
+        }
+
+        result
     }
 
     pub fn metta_calculus(&mut self, steps: usize) -> usize {
