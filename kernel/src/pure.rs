@@ -682,6 +682,36 @@ op!(num binary ne_f64(x: f64, y: f64) => (x != y) as i8);
 op!(num from_string f64_from_string<f64>);
 op!(num to_string f64_to_string<f64>);
 
+/// Deterministically maps a seed and stream position to a value in the open interval (0, 1).
+///
+/// Keeping the stream position explicit makes probabilistic `.mm2` programs reproducible
+/// without mutable evaluator state.
+pub extern "C" fn uniform_f64_from_seed(
+    expr: *mut ExprSource,
+    sink: *mut ExprSink,
+) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+    if expr.consume_head_check(b"uniform_f64_from_seed")? != 2 {
+        return Err(EvalError::from(
+            "uniform_f64_from_seed takes a seed and stream position",
+        ));
+    }
+
+    let seed = expr.consume::<i64>()? as u64;
+    let position = expr.consume::<i64>()? as u64;
+    let mut bits = seed.wrapping_add(position.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    bits = bits.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    bits = (bits ^ (bits >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    bits = (bits ^ (bits >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    bits ^= bits >> 31;
+
+    let mantissa = bits >> 11;
+    let uniform = (mantissa as f64 + 0.5) * (1.0 / ((1u64 << 53) as f64));
+    sink.write(SourceItem::Symbol(uniform.to_be_bytes().as_slice()))?;
+    Ok(())
+}
+
 op!(num unary f32_as_i8(x: f32) => x as i8);
 op!(num unary f32_as_i16(x: f32) => x as i16);
 op!(num unary f32_as_i32(x: f32) => x as i32);
@@ -1234,6 +1264,11 @@ pub fn register(scope: &mut EvalScope) {
     scope.add_func("ne_f64", ne_f64, FuncType::Pure);
     scope.add_func("f64_from_string", f64_from_string, FuncType::Pure);
     scope.add_func("f64_to_string", f64_to_string, FuncType::Pure);
+    scope.add_func(
+        "uniform_f64_from_seed",
+        uniform_f64_from_seed,
+        FuncType::Pure,
+    );
 
     scope.add_func("f32_as_i8", f32_as_i8, FuncType::Pure);
     scope.add_func("f32_as_i16", f32_as_i16, FuncType::Pure);
