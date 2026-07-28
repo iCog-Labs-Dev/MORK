@@ -323,6 +323,40 @@ fn run_sweep_once_uses_pure_expr_weight_policy() {
 }
 
 #[test]
+fn run_sweep_once_can_emit_exec_with_local_variables() {
+    let mut space = Space::new();
+    space
+        .add_all_sexpr(
+            b"
+            (site A (# 1))
+            (state A old)
+            (sweep dynamic
+              (e cpq)
+              (src (, (site $x)))
+              (sink
+                (O
+                  (+ (exec (dynamic $x)
+                       (, (state $x $old))
+                       (O (- (state $x $old))
+                          (+ (state $x new))))))))
+            ",
+        )
+        .unwrap();
+    assert_eq!(space.sweep(), "sweep-config");
+
+    let (_, emitted) = space.run_sweep_once("dynamic").unwrap();
+    assert!(emitted);
+    assert_eq!(space.metta_calculus(8), 1);
+
+    let all = dump(&space, expr!(space, "$"), expr!(space, "_1"));
+    assert!(all.contains("(state A new)"), "dynamic exec did not run:\n{all}");
+    assert!(
+        !all.contains("(state A old)"),
+        "dynamic exec did not remove its matched state:\n{all}"
+    );
+}
+
+#[test]
 fn run_sweep_cycles_runs_each_source_sink_sweep_per_cycle() {
     let mut space = Space::new();
     space
