@@ -2817,9 +2817,7 @@ impl Space {
 
     /// Steps only execs under `(exec <loc_prefix> …)`. `on_step` is called with each
     /// consumed exec's info; returning `false` stops early (cooperative cancellation).
-    /// Empty `loc_prefix` is byte-for-byte the previous whole-space semantics, including the
-    /// off-by-one where `steps == 0` still runs exactly one exec (the check below only gates
-    /// *continuing* to a next round; an available exec is always consumed first).
+    /// `steps == 0` is a no-op: nothing is consumed.
     pub fn metta_calculus_scoped(&mut self, loc_prefix: &[u8], steps: usize,
                                  mut on_step: impl FnMut(StepInfo) -> bool) -> usize {
         let was_paused = self.was.map.is_some();
@@ -2832,7 +2830,10 @@ impl Space {
         full_prefix.extend_from_slice(&PREFIX[..]);
         full_prefix.extend_from_slice(loc_prefix);
 
-        while {
+        loop {
+            if done >= steps {
+                break;
+            }
             let mut rz = self.btm.read_zipper_at_borrowed_path(&full_prefix[..]);
             if rz.to_next_val() {
                 // cannot be here `rz` conflicts potentially with zippers(rz.path())
@@ -2855,11 +2856,14 @@ impl Space {
                 }
                 let micros = start.elapsed().as_micros() as u64;
                 let cont = on_step(StepInfo { exec: &x[..], touched, new, micros, error });
-                done < steps && cont
+                done += 1;
+                if !cont {
+                    break;
+                }
             } else {
-                false
+                break;
             }
-        } { done += 1 }
+        }
 
         if was_paused {
             let btm = std::mem::take(&mut self.btm);
