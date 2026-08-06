@@ -77,6 +77,10 @@ struct Args {
     /// Max concurrent SSE subscribers on GET /events. Rejects with 503 when at capacity.
     #[arg(long, default_value_t = 4096)]
     max_sse_subs: usize,
+    /// Max concurrent TCP connections. Rejects at accept time with TCP RST when at
+    /// capacity — no HTTP response is sent, the client sees a connection reset.
+    #[arg(long, default_value_t = 4096)]
+    max_connections: usize,
 }
 
 fn main() {
@@ -133,6 +137,7 @@ fn main() {
             admission.clone(),
         ));
 
+        let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(args.max_connections));
         let listener = TcpListener::bind(&args.addr)
             .await
             .unwrap_or_else(|e| panic!("failed to bind {}: {e}", args.addr));
@@ -146,8 +151,17 @@ fn main() {
                 }
                 accepted = listener.accept() => {
                     let Ok((stream, _peer)) = accepted else { continue };
+                    let permit = match conn_semaphore.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            log::debug!("connection rejected: at capacity ({})", args.max_connections);
+                            drop(stream);
+                            continue;
+                        }
+                    };
                     let st = state.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         let io = TokioIo::new(stream);
                         let svc = service_fn(move |req| http::handle(req, st.clone()));
                         if let Err(e) = hyper::server::conn::http1::Builder::new()
