@@ -2,12 +2,14 @@
 //! published read snapshot, and the state handle the HTTP layer works with.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use mork_interning::{SharedMapping, SharedMappingHandle};
 use pathmap::PathMap;
 use serde_json::{json, Value};
+
+use crate::admission::AdmissionController;
 
 /// `tx<count>_<unique 8-char alphanumeric>`, e.g. `tx17_si49f8v6`.
 pub type TxId = String;
@@ -132,6 +134,6 @@ pub struct ServerState {
     pub tx_counter: Arc<AtomicU64>,
     /// Transactions with pending execs (kept by the engine; read by `hello`).
     pub active: Arc<Mutex<HashSet<TxId>>>,
-    /// Number of connected `?deltas=true` subscribers; the delta task skips work at 0.
-    pub delta_subs: Arc<AtomicUsize>,
+    /// Admission control: body size limits, in-flight request budget, SSE subscriber budget.
+    pub admission: AdmissionController,
 }

@@ -5,6 +5,7 @@
 //! execution event. One submission verb: `POST /run` — submitting a transaction (data +
 //! execs) IS running it.
 
+mod admission;
 mod engine;
 mod events;
 mod http;
@@ -14,7 +15,7 @@ mod wal;
 mod wrap;
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
@@ -66,6 +67,16 @@ struct Args {
     /// transactions; 0 disables (the log grows unbounded).
     #[arg(long, default_value_t = 1024)]
     checkpoint_every: u64,
+    /// Max request body size in bytes for POST /run. Rejects larger bodies with 413 before
+    /// buffering.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    max_body_bytes: usize,
+    /// Max concurrent in-flight POST /run requests. Rejects with 503 when at capacity.
+    #[arg(long, default_value_t = 64)]
+    max_inflight: usize,
+    /// Max concurrent SSE subscribers on GET /events. Rejects with 503 when at capacity.
+    #[arg(long, default_value_t = 4096)]
+    max_sse_subs: usize,
 }
 
 fn main() {
@@ -92,13 +103,19 @@ fn main() {
     // engine has replayed the log and restored the shared counter.
     ready.recv().expect("engine died during startup/recovery");
 
+    let admission = admission::AdmissionController::new(
+        args.max_body_bytes,
+        args.max_inflight,
+        args.max_sse_subs,
+    );
+
     let state = Arc::new(ServerState {
         tx_send,
         snapshot: snap_rx.clone(),
         events: events.clone(),
         tx_counter,
         active,
-        delta_subs: Arc::new(AtomicUsize::new(0)),
+        admission: admission.clone(),
     });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -113,7 +130,7 @@ fn main() {
         tokio::spawn(events::delta_task(
             snap_rx,
             events,
-            state.delta_subs.clone(),
+            admission.clone(),
         ));
 
         let listener = TcpListener::bind(&args.addr)

@@ -1,7 +1,6 @@
 //! SSE encoding of the event stream, and the opt-in snapshot-diff ("delta") task.
 
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -16,6 +15,7 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
+use crate::admission::{AdmissionController, SsePermit};
 use crate::transaction::{Event, ReadSnapshot, ServerState};
 use crate::wrap;
 
@@ -23,33 +23,23 @@ fn frame(event: &str, data: serde_json::Value) -> Bytes {
     Bytes::from(format!("event: {event}\ndata: {data}\n\n"))
 }
 
-/// Decrements the delta-subscriber count when an SSE connection ends.
-struct DeltaGuard(Option<Arc<AtomicUsize>>);
-impl Drop for DeltaGuard {
-    fn drop(&mut self) {
-        if let Some(c) = &self.0 { c.fetch_sub(1, Relaxed); }
-    }
-}
-
 /// `GET /events[?tx=<txid>][&deltas=true]` — the single stream carrying everything: a
 /// `hello` on connect, then `tx`/`step`/`quiescent`/`idle`/`delta`/`error` as they happen,
 /// plus `lagged` if this client falls behind the broadcast buffer.
+///
+/// The `permit` must be acquired by the caller via `AdmissionController::acquire_sse`
+/// before calling this function. It is moved into the response stream and released when
+/// the SSE connection closes.
 pub fn sse_response(
     state: &Arc<ServerState>,
     tx_filter: Option<String>,
     want_deltas: bool,
+    permit: SsePermit,
 ) -> Response<BoxBody<Bytes, Infallible>> {
     // Subscribe BEFORE reading the snapshot so no event between them is missed.
     let rx = state.events.subscribe();
     let snap = state.snapshot.borrow().clone();
     let active: Vec<String> = state.active.lock().unwrap().iter().cloned().collect();
-
-    let guard = DeltaGuard(if want_deltas {
-        state.delta_subs.fetch_add(1, Relaxed);
-        Some(state.delta_subs.clone())
-    } else {
-        None
-    });
 
     let hello = frame("hello", json!({
         "version": snap.version,
@@ -58,7 +48,10 @@ pub fn sse_response(
     }));
 
     let events = BroadcastStream::new(rx).filter_map(move |item| {
-        let _keepalive = &guard;
+        // `permit` is kept alive for the duration of this closure. When the SSE
+        // connection drops, the stream ends, the closure is dropped, and the permit
+        // is released — decrementing the subscriber count if this was a delta subscriber.
+        let _permit = &permit;
         match item {
             Ok(ev) => {
                 if !want_deltas && matches!(ev, Event::Delta { .. }) { return None }
@@ -92,12 +85,12 @@ pub fn sse_response(
 pub async fn delta_task(
     mut snap_rx: watch::Receiver<Arc<ReadSnapshot>>,
     events: broadcast::Sender<Event>,
-    delta_subs: Arc<AtomicUsize>,
+    admission: AdmissionController,
 ) {
     let mut prev = snap_rx.borrow().clone();
     while snap_rx.changed().await.is_ok() {
         let cur = snap_rx.borrow_and_update().clone();
-        if delta_subs.load(Relaxed) == 0 || cur.version == prev.version {
+        if admission.delta_sub_count() == 0 || cur.version == prev.version {
             prev = cur;
             continue;
         }
