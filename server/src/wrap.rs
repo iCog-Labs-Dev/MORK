@@ -13,6 +13,8 @@
 //! atoms beginning with `"` are strings running to the closing quote with `\` escapes,
 //! `$name` variables are ordinary atoms to us. Anything the CLI runs must round-trip here.
 
+use crate::transaction::TxId;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum SExpr {
     Atom(String),
@@ -21,13 +23,14 @@ pub enum SExpr {
 
 /// `tx<count>_<unique 8-char alphanumeric>`, e.g. `tx17_si49f8v6`. The count gives
 /// human-readable ordering; the random suffix prevents collision and guessing.
-pub fn gen_txid(count: u64) -> String {
+/// Returns a validated `TxId` — format and length are checked at construction.
+pub fn gen_txid(count: u64) -> TxId {
     use std::hash::{BuildHasher, Hasher};
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     // Randomly-seeded stdlib hasher; 36^8 < 2^64, so one u64 covers all 8 chars.
     let mut n = std::collections::hash_map::RandomState::new().build_hasher().finish();
     let suffix: String = (0..8).map(|_| { let c = ALPHABET[(n % 36) as usize] as char; n /= 36; c }).collect();
-    format!("tx{count}_{suffix}")
+    TxId::new(format!("tx{count}_{suffix}")).expect("gen_txid: produced invalid txid")
 }
 
 pub fn is_txid(s: &str) -> bool {

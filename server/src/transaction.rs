@@ -2,6 +2,7 @@
 //! published read snapshot, and the state handle the HTTP layer works with.
 
 use std::collections::HashSet;
+use std::ops::Deref;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
@@ -11,8 +12,58 @@ use serde_json::{json, Value};
 
 use crate::admission::AdmissionController;
 
-/// `tx<count>_<unique 8-char alphanumeric>`, e.g. `tx17_si49f8v6`.
-pub type TxId = String;
+/// Validated transaction identifier: `tx<count>_<8-char alphanumeric>`.
+///
+/// Enforces two invariants at construction:
+/// - Format matches `tx[0-9]+_[a-z0-9]{8}` (the canonical namespace prefix).
+/// - Total length ≤ 63 bytes (the SymbolSize encoding limit from `mork_expr::Tag`).
+///
+/// If it compiles, the id is safe for WAL encoding, VM namespace wrapping, and trie paths.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TxId(String);
+
+impl serde::Serialize for TxId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl TxId {
+    /// Create a validated TxId. Returns `Err` if the format or length is wrong.
+    pub fn new(id: String) -> Result<Self, String> {
+        if id.len() > 63 {
+            return Err(format!("txid too long: {} bytes (max 63)", id.len()));
+        }
+        let rest = id.strip_prefix("tx").ok_or("txid must start with 'tx'")?;
+        let (digits, suffix) = rest.split_once('_').ok_or("txid missing '_' separator")?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("txid count part must be non-empty digits".into());
+        }
+        if suffix.len() != 8 || !suffix.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
+            return Err("txid suffix must be exactly8 lowercase alphanumeric characters".into());
+        }
+        Ok(Self(id))
+    }
+}
+
+impl Deref for TxId {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TxId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for TxId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
 
 /// A transaction: an atomically-applied, auto-running unit of data + execs, already
 /// loc-wrapped into its namespace by `wrap::rewrite`.
@@ -103,7 +154,7 @@ impl Event {
     pub fn tx_id(&self) -> Option<&str> {
         match self {
             Event::Tx { tx, .. } | Event::Step { tx, .. } | Event::Quiescent { tx, .. }
-            | Event::Abort { tx, .. } | Event::Budget { tx, .. } => Some(tx),
+            | Event::Abort { tx, .. } | Event::Budget { tx, .. } => Some(tx.as_ref()),
             Event::Idle { .. } | Event::Delta { .. } => None,
         }
     }

@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use crate::transaction::TxOk;
+use crate::transaction::{TxOk, TxId};
 
 /// First 8 bytes of every segment file; identifies the format (and its version).
 const MAGIC: &[u8; 8] = b"MORKWAL1";
@@ -69,20 +69,21 @@ pub enum FsyncPolicy {
 /// `Commit.steps` semantically encodes "sequential, deterministic replay" — a future
 /// parallel scheduler adds a new tag rather than reinterpreting this one.
 ///
-/// Borrowed fields, because the hot path just encodes into a frame and moves
-/// on; [`OwnedRec`] is the decoded twin the recovery scan hands back.
+/// The `id` field borrows `&TxId` — a validated newtype that enforces the format
+/// `tx<count>_<8-char>` and length ≤ 63 bytes at construction. If it compiles,
+/// the id is safe for WAL encoding and VM namespace paths.
 pub enum Rec<'a> {
     Tx {
-        id: &'a str,
+        id: &'a TxId,
         source: &'a str,
     },
     Commit {
-        id: &'a str,
+        id: &'a TxId,
         steps: u64,
         version: u64,
     },
     Abort {
-        id: &'a str,
+        id: &'a TxId,
         reason: &'a str,
     },
 }
@@ -123,27 +124,31 @@ pub struct Ack {
 // ---------------------------------------------------------------------------
 // Record encoding
 
-/// Payload bytes for one record: `tag:u8 | txid_len:u8 | txid | tag-specific rest`.
+/// Payload bytes for one record: `tag:u8 | id_len:u16le | id | body_len:u32le | body`.
 fn encode_payload(rec: &Rec) -> Vec<u8> {
     let mut p = Vec::new();
     match rec {
         Rec::Tx { id, source } => {
             p.push(1);
-            p.push(id.len() as u8);
+            p.extend_from_slice(&(id.len() as u16).to_le_bytes());
             p.extend_from_slice(id.as_bytes());
+            p.extend_from_slice(&(source.len() as u32).to_le_bytes());
             p.extend_from_slice(source.as_bytes());
         }
         Rec::Commit { id, steps, version } => {
             p.push(2);
-            p.push(id.len() as u8);
+            p.extend_from_slice(&(id.len() as u16).to_le_bytes());
             p.extend_from_slice(id.as_bytes());
+            // body = steps:u64le | version:u64le (16 bytes)
+            p.extend_from_slice(&16u32.to_le_bytes());
             p.extend_from_slice(&steps.to_le_bytes());
             p.extend_from_slice(&version.to_le_bytes());
         }
         Rec::Abort { id, reason } => {
             p.push(3);
-            p.push(id.len() as u8);
+            p.extend_from_slice(&(id.len() as u16).to_le_bytes());
             p.extend_from_slice(id.as_bytes());
+            p.extend_from_slice(&(reason.len() as u32).to_le_bytes());
             p.extend_from_slice(reason.as_bytes());
         }
     }
@@ -164,36 +169,44 @@ fn frame(rec: &Rec) -> Vec<u8> {
 /// the scan treats as corruption.
 fn decode_payload(p: &[u8]) -> Result<OwnedRec, String> {
     let err = || "malformed record payload".to_string();
-    if p.len() < 2 {
+    if p.len() < 3 {
         return Err(err());
     }
-    let id_len = p[1] as usize;
-    let rest_at = 2 + id_len;
+    let id_len = u16::from_le_bytes([p[1], p[2]]) as usize;
+    let rest_at = 3 + id_len;
     if p.len() < rest_at {
         return Err(err());
     }
-    let id = str::from_utf8(&p[2..rest_at])
+    let id = str::from_utf8(&p[3..rest_at])
         .map_err(|_| err())?
         .to_string();
     let rest = &p[rest_at..];
+    if rest.len() < 4 {
+        return Err(err());
+    }
+    let body_len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+    let body = &rest[4..];
+    if body.len() != body_len {
+        return Err(err());
+    }
     match p[0] {
         1 => Ok(OwnedRec::Tx {
             id,
-            source: str::from_utf8(rest).map_err(|_| err())?.to_string(),
+            source: str::from_utf8(body).map_err(|_| err())?.to_string(),
         }),
         2 => {
-            if rest.len() != 16 {
+            if body.len() != 16 {
                 return Err(err());
             }
             Ok(OwnedRec::Commit {
                 id,
-                steps: u64::from_le_bytes(rest[..8].try_into().unwrap()),
-                version: u64::from_le_bytes(rest[8..].try_into().unwrap()),
+                steps: u64::from_le_bytes(body[..8].try_into().unwrap()),
+                version: u64::from_le_bytes(body[8..].try_into().unwrap()),
             })
         }
         3 => Ok(OwnedRec::Abort {
             id,
-            reason: str::from_utf8(rest).map_err(|_| err())?.to_string(),
+            reason: str::from_utf8(body).map_err(|_| err())?.to_string(),
         }),
         t => Err(format!(
             "unknown record tag {t} (written by a newer server?)"
@@ -797,6 +810,11 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    /// Shorthand: build a TxId from a string literal in tests.
+    fn tx(s: &str) -> TxId {
+        TxId::new(s.to_string()).unwrap()
+    }
+
     fn tmpdir() -> PathBuf {
         static N: AtomicUsize = AtomicUsize::new(0);
         let d = std::env::temp_dir().join(format!(
@@ -820,20 +838,20 @@ mod tests {
     fn roundtrip_all_tags() {
         let recs = [
             Rec::Tx {
-                id: "tx1_abcd1234",
+                id: &tx("tx1_abcd1234"),
                 source: "(a b)\n(exec (tx1_abcd1234 0) $x $y)\n",
             },
             Rec::Tx {
-                id: "tx2_efgh5678",
+                id: &tx("tx2_efgh5678"),
                 source: "(unicode ⍼ \"quoted \\\" str\")",
             },
             Rec::Commit {
-                id: "tx1_abcd1234",
+                id: &tx("tx1_abcd1234"),
                 steps: 42,
                 version: 1234567890123,
             },
             Rec::Abort {
-                id: "tx2_efgh5678",
+                id: &tx("tx2_efgh5678"),
                 reason: "exec (bad): pattern functor",
             },
         ];
@@ -844,7 +862,8 @@ mod tests {
             let dec = decode_payload(&f[8..]).unwrap();
             match (r, &dec) {
                 (Rec::Tx { id, source }, OwnedRec::Tx { id: i2, source: s2 }) => {
-                    assert_eq!((*id, *source), (i2.as_str(), s2.as_str()));
+                    assert_eq!(&**id, i2.as_str());
+                    assert_eq!(*source, s2.as_str());
                 }
                 (
                     Rec::Commit { id, steps, version },
@@ -854,10 +873,13 @@ mod tests {
                         version: v2,
                     },
                 ) => {
-                    assert_eq!((*id, *steps, *version), (i2.as_str(), *st2, *v2));
+                    assert_eq!(&**id, i2.as_str());
+                    assert_eq!(*steps, *st2);
+                    assert_eq!(*version, *v2);
                 }
                 (Rec::Abort { id, reason }, OwnedRec::Abort { id: i2, reason: r2 }) => {
-                    assert_eq!((*id, *reason), (i2.as_str(), r2.as_str()));
+                    assert_eq!(&**id, i2.as_str());
+                    assert_eq!(*reason, r2.as_str());
                 }
                 _ => panic!("tag mismatch"),
             }
@@ -873,16 +895,16 @@ mod tests {
             &p,
             &[
                 Rec::Tx {
-                    id: "tx1_aaaaaaaa",
+                    id: &tx("tx1_aaaaaaaa"),
                     source: "(a)",
                 },
                 Rec::Commit {
-                    id: "tx1_aaaaaaaa",
+                    id: &tx("tx1_aaaaaaaa"),
                     steps: 1,
                     version: 2,
                 },
                 Rec::Tx {
-                    id: "tx2_bbbbbbbb",
+                    id: &tx("tx2_bbbbbbbb"),
                     source: "(b)",
                 },
             ],
@@ -922,11 +944,11 @@ mod tests {
             &p,
             &[
                 Rec::Tx {
-                    id: "tx1_aaaaaaaa",
+                    id: &tx("tx1_aaaaaaaa"),
                     source: "(a)",
                 },
                 Rec::Tx {
-                    id: "tx2_bbbbbbbb",
+                    id: &tx("tx2_bbbbbbbb"),
                     source: "(b)",
                 },
             ],
@@ -954,7 +976,7 @@ mod tests {
         write_frames(
             &seg_path(&dir, 0),
             &[Rec::Tx {
-                id: "tx1_aaaaaaaa",
+                id: &tx("tx1_aaaaaaaa"),
                 source: "(a)",
             }],
         );
@@ -962,7 +984,7 @@ mod tests {
         write_frames(
             &seg_path(&dir, 1),
             &[Rec::Tx {
-                id: "tx2_bbbbbbbb",
+                id: &tx("tx2_bbbbbbbb"),
                 source: "(b)",
             }],
         );
@@ -986,7 +1008,7 @@ mod tests {
         write_frames(
             &seg_path(&dir, 0),
             &[Rec::Tx {
-                id: "tx1_aaaaaaaa",
+                id: &tx("tx1_aaaaaaaa"),
                 source: "(a)",
             }],
         );
@@ -994,7 +1016,7 @@ mod tests {
         write_frames(
             &seg_path(&dir, 1),
             &[Rec::Commit {
-                id: "tx1_aaaaaaaa",
+                id: &tx("tx1_aaaaaaaa"),
                 steps: 3,
                 version: 4,
             }],
@@ -1031,13 +1053,13 @@ mod tests {
         let wal = Wal::open(&dir, FsyncPolicy::Always).unwrap();
         let (reply, rx) = tokio::sync::oneshot::channel();
         let ok = TxOk {
-            tx: "tx1_aaaaaaaa".into(),
+            tx: tx("tx1_aaaaaaaa"),
             count: 2,
             version: 1,
         };
         wal.append(
             Rec::Tx {
-                id: "tx1_aaaaaaaa",
+                id: &tx("tx1_aaaaaaaa"),
                 source: "(a b)",
             },
             Some(Ack { reply, ok }),
@@ -1046,7 +1068,7 @@ mod tests {
         assert_eq!(acked.version, 1);
         wal.append(
             Rec::Commit {
-                id: "tx1_aaaaaaaa",
+                id: &tx("tx1_aaaaaaaa"),
                 steps: 1,
                 version: 2,
             },
@@ -1070,11 +1092,11 @@ mod tests {
     fn checkpoint_rotates_installs_and_gcs() {
         let dir = tmpdir();
         let wal = Wal::open(&dir, FsyncPolicy::No).unwrap();
-        wal.append(Rec::Tx { id: "tx1_aaaaaaaa", source: "(a)" }, None);
-        wal.append(Rec::Commit { id: "tx1_aaaaaaaa", steps: 0, version: 1 }, None);
+        wal.append(Rec::Tx { id: &tx("tx1_aaaaaaaa"), source: "(a)" }, None);
+        wal.append(Rec::Commit { id: &tx("tx1_aaaaaaaa"), steps: 0, version: 1 }, None);
         assert!(wal.checkpoint(1, 1, "paths", Box::new(|w| w.write_all(b"SNAP"))));
         // FIFO: this lands in the freshly rotated segment
-        wal.append(Rec::Tx { id: "tx2_bbbbbbbb", source: "(b)" }, None);
+        wal.append(Rec::Tx { id: &tx("tx2_bbbbbbbb"), source: "(b)" }, None);
         wal.shutdown(); // joins writer AND checkpointer: the install is complete
 
         let meta = CkptMeta::load(&dir).unwrap().unwrap();
@@ -1101,7 +1123,7 @@ mod tests {
             let wal = Wal::open(&dir, FsyncPolicy::No).unwrap();
             wal.append(
                 Rec::Tx {
-                    id: "tx1_aaaaaaaa",
+                    id: &tx("tx1_aaaaaaaa"),
                     source: "(a)",
                 },
                 None,
@@ -1112,7 +1134,7 @@ mod tests {
             let wal = Wal::open(&dir, FsyncPolicy::No).unwrap();
             wal.append(
                 Rec::Tx {
-                    id: "tx2_bbbbbbbb",
+                    id: &tx("tx2_bbbbbbbb"),
                     source: "(b)",
                 },
                 None,

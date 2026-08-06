@@ -39,7 +39,7 @@ pub fn sse_response(
     // Subscribe BEFORE reading the snapshot so no event between them is missed.
     let rx = state.events.subscribe();
     let snap = state.snapshot.borrow().clone();
-    let active: Vec<String> = state.active.lock().unwrap().iter().cloned().collect();
+    let active: Vec<String> = state.active.lock().unwrap().iter().map(|t| t.to_string()).collect();
 
     let hello = frame("hello", json!({
         "version": snap.version,

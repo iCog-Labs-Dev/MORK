@@ -371,7 +371,7 @@ fn run_sweep_scheduler_tick_foreground(
     }
 
     let undo = space.btm.clone();
-    let tx = "sweep".to_string();
+    let tx = TxId::new("sweep".to_string()).expect("sweep txid");
     let mut stepped = false;
     for _ in 0..cfg.sweep_metta_steps {
         match step_at(space, &[], Some(&tx), version, snap_tx, events) {
@@ -770,7 +770,8 @@ fn recover(
                         "TX {id} while {prev} is unfinished — malformed log"
                     )));
                 }
-                pending = Some((id, source));
+                let txid = TxId::new(id).map_err(|e| io::Error::other(format!("replay: invalid txid: {e}")))?;
+                pending = Some((txid, source));
             }
             OwnedRec::Commit {
                 id,
@@ -782,28 +783,29 @@ fn recover(
                         "COMMIT for {id} with no pending TX"
                     )));
                 };
-                if pid != id {
+                let cid = TxId::new(id).map_err(|e| io::Error::other(format!("replay: invalid commit txid: {e}")))?;
+                if pid != cid {
                     return Err(io::Error::other(format!(
-                        "COMMIT for {id} but pending TX is {pid}"
+                        "COMMIT for {cid} but pending TX is {pid}"
                     )));
                 }
                 space.add_all_sexpr(source.as_bytes()).map_err(|e| {
                     io::Error::other(format!(
-                        "replay of {id}: load failed (determinism broken?): {e}"
+                        "replay of {cid}: load failed (determinism broken?): {e}"
                     ))
                 })?;
                 *version += 1;
                 for i in 0..steps {
-                    match step_once(space, &id, version, snap_tx, events) {
+                    match step_once(space, &cid, version, snap_tx, events) {
                         StepOutcome::Stepped => {}
                         StepOutcome::Done => {
                             return Err(io::Error::other(format!(
-                                "replay of {id}: log says {steps} steps but the space drained after {i}"
+                                "replay of {cid}: log says {steps} steps but the space drained after {i}"
                             )));
                         }
                         StepOutcome::Failed(r) => {
                             return Err(io::Error::other(format!(
-                                "replay of {id}: step {i} failed: {r}"
+                                "replay of {cid}: step {i} failed: {r}"
                             )));
                         }
                     }
@@ -813,7 +815,7 @@ fn recover(
                 }
                 if *version != logged {
                     log::error!(
-                        "replay of {id}: version {} != logged {logged} (determinism canary)",
+                        "replay of {cid}: version {} != logged {logged} (determinism canary)",
                         *version
                     );
                 }
@@ -925,8 +927,8 @@ fn step_at(
                 // the exec's own wrapper, when it still carries one.
                 let tx = attributed
                     .cloned()
-                    .or(parsed_txid)
-                    .unwrap_or_else(|| "?".into());
+                    .or_else(|| parsed_txid.and_then(|s| TxId::new(s).ok()))
+                    .unwrap_or_else(|| TxId::new("tx0_00000000".into()).unwrap());
                 ev = Some(Event::Step {
                     tx,
                     exec,
