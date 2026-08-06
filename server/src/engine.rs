@@ -24,7 +24,7 @@ use pathmap::PathMap;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::transaction::{EngineCmd, EngineError, Event, ReadSnapshot, Transaction, TxId, TxOk};
-use crate::wal::{Ack, CkptMeta, FsyncPolicy, OwnedRec, Rec, Wal};
+use crate::wal::{CkptMeta, FsyncPolicy, OwnedRec, Rec, Wal};
 use crate::{wal, wrap};
 
 /// What happens when a transaction exhausts its step budget.
@@ -448,6 +448,10 @@ fn publish(snap_tx: &watch::Sender<Arc<ReadSnapshot>>, space: &Space, version: u
 /// `TxOk` then), which is sound because redo logging requires durable-before-ACK, not
 /// durable-before-apply — a crash in between loses only an unacknowledged transaction.
 /// A failed load appends nothing at all: no TX record, no outcome needed.
+///
+/// **Submission/decoupling**: the ack fires immediately after the in-memory load
+/// succeeds. The HTTP handler returns 200 as soon as the ack arrives. WAL append and
+/// stepping continue asynchronously — progress streams on `/events`.
 fn run_tx(
     space: &mut Space,
     t: Transaction,
@@ -487,33 +491,21 @@ fn run_tx(
                 count,
                 version: *version,
             };
-            match wal {
-                // Under `always` the 200 is gated on durability: the writer thread fires
-                // the ack after the batch fsync while the engine moves straight on to
-                // stepping. Under `everysec`/`no` durability is deferred by policy, so
-                // the engine acks right after the (queued) append.
-                Some(w) if cfg.fsync == FsyncPolicy::Always => {
-                    w.append(
-                        Rec::Tx {
-                            id: &id,
-                            source: &source,
-                        },
-                        Some(Ack { reply, ok }),
-                    );
-                }
-                Some(w) => {
-                    w.append(
-                        Rec::Tx {
-                            id: &id,
-                            source: &source,
-                        },
-                        None,
-                    );
-                    let _ = reply.send(Ok(ok));
-                }
-                None => {
-                    let _ = reply.send(Ok(ok));
-                }
+
+            // Ack immediately: the HTTP handler returns 200 as soon as this arrives.
+            let _ = reply.send(Ok(ok));
+
+            // WAL append continues asynchronously — the client already has their
+            // response. Under `always` this means the 200 no longer gates on fsync;
+            // durability is still ensured by the WAL for crash recovery.
+            if let Some(w) = wal {
+                w.append(
+                    Rec::Tx {
+                        id: &id,
+                        source: &source,
+                    },
+                    None,
+                );
             }
         }
         Err(e) => {
@@ -535,6 +527,7 @@ fn run_tx(
         }
     }
 
+    // Step to quiescence asynchronously — the client is already gone (received 200).
     finish_tx(space, &id, undo, version, snap_tx, events, active, cfg, wal);
 
     if was_running {
