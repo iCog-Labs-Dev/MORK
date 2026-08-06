@@ -1142,4 +1142,104 @@ mod tests {
         assert_eq!(recs.len(), 2, "reopen must append, not overwrite");
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn encode_payload_uses_u16_id_length() {
+        let id = tx("tx1_abcd1234");
+        let r = Rec::Tx { id: &id, source: "test" };
+        let p = encode_payload(&r);
+        // tag:1 + id_len:2 + id:12 + body_len:4 + body:4 = 23
+        assert_eq!(p.len(), 23);
+        // id_len is u16 at bytes [1..3]
+        let id_len = u16::from_le_bytes([p[1], p[2]]);
+        assert_eq!(id_len as usize, "tx1_abcd1234".len());
+    }
+
+    #[test]
+    fn encode_payload_uses_u32_body_length() {
+        let id = tx("tx1_abcd1234");
+        let r = Rec::Tx { id: &id, source: "hello" };
+        let p = encode_payload(&r);
+        // tag:1 + id_len:2 + id:12 = 15, so body_len at [15..19]
+        let body_len = u32::from_le_bytes([p[15], p[16], p[17], p[18]]);
+        assert_eq!(body_len as usize, "hello".len());
+    }
+
+    #[test]
+    fn decode_rejects_short_payload() {
+        assert!(decode_payload(&[1]).is_err());
+        assert!(decode_payload(&[1, 0]).is_err());
+        assert!(decode_payload(&[]).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_id_length_exceeds_payload() {
+        // tag:1, id_len: 200 (way more than payload), garbage
+        let mut p = vec![1u8];
+        p.extend_from_slice(&200u16.to_le_bytes());
+        p.extend_from_slice(&vec![0u8; 10]);
+        assert!(decode_payload(&p).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_body_length_mismatch() {
+        // Construct a valid Tx record, then corrupt the body_len field
+        let id = tx("tx1_abcd1234");
+        let r = Rec::Tx { id: &id, source: "test" };
+        let mut p = encode_payload(&r);
+        // body_len is at [15..19], change it to a wrong value
+        let bad_len = (p.len() as u32 + 100).to_le_bytes();
+        p[15..19].copy_from_slice(&bad_len);
+        assert!(decode_payload(&p).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_unknown_tag() {
+        let mut p = vec![99u8]; // unknown tag
+        p.extend_from_slice(&0u16.to_le_bytes()); // id_len = 0
+        p.extend_from_slice(&0u32.to_le_bytes()); // body_len = 0
+        assert!(decode_payload(&p).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_non_utf8_id() {
+        let mut p = vec![1u8]; // Tx tag
+        p.extend_from_slice(&3u16.to_le_bytes()); // id_len = 3
+        p.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // invalid UTF-8
+        p.extend_from_slice(&0u32.to_le_bytes()); // body_len = 0
+        assert!(decode_payload(&p).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_non_utf8_source() {
+        let mut p = vec![1u8]; // Tx tag
+        p.extend_from_slice(&2u16.to_le_bytes()); // id_len = 2
+        p.extend_from_slice(b"ab"); // valid id
+        p.extend_from_slice(&3u32.to_le_bytes()); // body_len = 3
+        p.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // invalid UTF-8 body
+        assert!(decode_payload(&p).is_err());
+    }
+
+    #[test]
+    fn commit_body_length_is_always_16() {
+        let id = tx("tx1_abcd1234");
+        let r = Rec::Commit { id: &id, steps: 42, version: 99 };
+        let p = encode_payload(&r);
+        // tag:1 + id_len:2 + id:12 = 15, so body_len at [15..19]
+        let body_len = u32::from_le_bytes([p[15], p[16], p[17], p[18]]);
+        assert_eq!(body_len, 16);
+    }
+
+    #[test]
+    fn large_source_roundtrips() {
+        let source = "x".repeat(10_000);
+        let id = tx("tx1_abcd1234");
+        let r = Rec::Tx { id: &id, source: &source };
+        let f = frame(&r);
+        let dec = decode_payload(&f[8..]).unwrap();
+        match dec {
+            OwnedRec::Tx { source: s, .. } => assert_eq!(s.len(), 10_000),
+            _ => panic!("wrong variant"),
+        }
+    }
 }

@@ -100,3 +100,110 @@ impl Drop for SsePermit {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn acquire_run_succeeds_under_limit() {
+        let ac = AdmissionController::new(1024, 2, 10);
+        let p1 = ac.acquire_run().await;
+        assert!(p1.is_some());
+        let p2 = ac.acquire_run().await;
+        assert!(p2.is_some());
+    }
+
+    #[tokio::test]
+    async fn acquire_run_returns_none_at_capacity() {
+        let ac = AdmissionController::new(1024, 1, 10);
+        let _p1 = ac.acquire_run().await.unwrap();
+        // Second acquire should fail immediately (semaphore exhausted)
+        let p2 = ac.acquire_run().await;
+        assert!(p2.is_none());
+    }
+
+    #[tokio::test]
+    async fn acquire_run_releases_on_drop() {
+        let ac = AdmissionController::new(1024, 1, 10);
+        let p1 = ac.acquire_run().await.unwrap();
+        drop(p1);
+        // Should succeed now that the permit was released
+        let p2 = ac.acquire_run().await;
+        assert!(p2.is_some());
+    }
+
+    #[tokio::test]
+    async fn run_permit_carries_body_limit() {
+        let ac = AdmissionController::new(4096, 1, 10);
+        let p = ac.acquire_run().await.unwrap();
+        assert_eq!(p.max_body_bytes(), 4096);
+    }
+
+    #[tokio::test]
+    async fn acquire_sse_succeeds_under_limit() {
+        let ac = AdmissionController::new(1024, 10, 2);
+        let p1 = ac.acquire_sse().await;
+        assert!(p1.is_some());
+        let p2 = ac.acquire_sse().await;
+        assert!(p2.is_some());
+    }
+
+    #[tokio::test]
+    async fn acquire_sse_returns_none_at_capacity() {
+        let ac = AdmissionController::new(1024, 10, 1);
+        let _p1 = ac.acquire_sse().await.unwrap();
+        let p2 = ac.acquire_sse().await;
+        assert!(p2.is_none());
+    }
+
+    #[tokio::test]
+    async fn acquire_sse_releases_on_drop() {
+        let ac = AdmissionController::new(1024, 10, 1);
+        let p1 = ac.acquire_sse().await.unwrap();
+        drop(p1);
+        let p2 = ac.acquire_sse().await;
+        assert!(p2.is_some());
+    }
+
+    #[tokio::test]
+    async fn sse_permit_with_deltas_tracks_count() {
+        let ac = AdmissionController::new(1024, 10, 10);
+        assert_eq!(ac.delta_sub_count(), 0);
+
+        let p1 = ac.acquire_sse().await.unwrap().with_deltas();
+        assert_eq!(ac.delta_sub_count(), 1);
+
+        let p2 = ac.acquire_sse().await.unwrap().with_deltas();
+        assert_eq!(ac.delta_sub_count(), 2);
+
+        drop(p1);
+        assert_eq!(ac.delta_sub_count(), 1);
+
+        drop(p2);
+        assert_eq!(ac.delta_sub_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn sse_permit_without_deltas_does_not_track() {
+        let ac = AdmissionController::new(1024, 10, 10);
+        let _p = ac.acquire_sse().await.unwrap();
+        // No .with_deltas() called — delta count stays at 0
+        assert_eq!(ac.delta_sub_count(), 0);
+    }
+
+    #[test]
+    fn controller_clone_shares_state() {
+        let ac1 = AdmissionController::new(1024, 4, 8);
+        let ac2 = ac1.clone();
+        // Both see the same delta count
+        assert_eq!(ac1.delta_sub_count(), ac2.delta_sub_count());
+    }
+
+    #[tokio::test]
+    async fn zero_capacity_rejects_immediately() {
+        let ac = AdmissionController::new(1024, 0, 0);
+        assert!(ac.acquire_run().await.is_none());
+        assert!(ac.acquire_sse().await.is_none());
+    }
+}

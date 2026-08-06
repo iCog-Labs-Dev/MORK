@@ -237,3 +237,175 @@ pub struct ServerState {
     /// Admission control: body size limits, in-flight request budget, SSE subscriber budget.
     pub admission: AdmissionController,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn txid_valid_format() {
+        let id = TxId::new("tx17_si49f8v6".into()).unwrap();
+        assert_eq!(&*id, "tx17_si49f8v6");
+        assert_eq!(id.to_string(), "tx17_si49f8v6");
+    }
+
+    #[test]
+    fn txid_minimal_valid() {
+        assert!(TxId::new("tx0_00000000".into()).is_ok());
+    }
+
+    #[test]
+    fn txid_max_length_63() {
+        // 63 bytes: "tx" + 52 digits + "_" + 8 suffix = 63
+        let count = "0".repeat(52);
+        let id = format!("tx{count}_abcdefgh");
+        assert_eq!(id.len(), 63);
+        assert!(TxId::new(id).is_ok());
+    }
+
+    #[test]
+    fn txid_rejects_too_long() {
+        let count = "0".repeat(53);
+        let id = format!("tx{count}_abcdefgh");
+        assert_eq!(id.len(), 64);
+        assert!(TxId::new(id).is_err());
+    }
+
+    #[test]
+    fn txid_rejects_missing_prefix() {
+        assert!(TxId::new("17_si49f8v6".into()).is_err());
+    }
+
+    #[test]
+    fn txid_rejects_missing_separator() {
+        assert!(TxId::new("tx17si49f8v6".into()).is_err());
+    }
+
+    #[test]
+    fn txid_rejects_empty_count() {
+        assert!(TxId::new("tx_abcdefgh".into()).is_err());
+    }
+
+    #[test]
+    fn txid_rejects_non_digit_count() {
+        assert!(TxId::new("txabc_abcdefgh".into()).is_err());
+    }
+
+    #[test]
+    fn txid_rejects_short_suffix() {
+        assert!(TxId::new("tx1_abcdefg".into()).is_err());
+    }
+
+    #[test]
+    fn txid_rejects_long_suffix() {
+        assert!(TxId::new("tx1_abcdefghi".into()).is_err());
+    }
+
+    #[test]
+    fn txid_rejects_uppercase_suffix() {
+        assert!(TxId::new("tx1_ABCDEFGH".into()).is_err());
+    }
+
+    #[test]
+    fn txid_deref_to_str() {
+        let id = TxId::new("tx1_abcdefgh".into()).unwrap();
+        let s: &str = &id;
+        assert_eq!(s, "tx1_abcdefgh");
+    }
+
+    #[test]
+    fn txid_partial_eq_str() {
+        let id = TxId::new("tx1_abcdefgh".into()).unwrap();
+        assert_eq!(&*id, "tx1_abcdefgh");
+        assert_ne!(&*id, "tx2_abcdefgh");
+    }
+
+    #[test]
+    fn txid_clone() {
+        let id = TxId::new("tx1_abcdefgh".into()).unwrap();
+        let id2 = id.clone();
+        assert_eq!(id, id2);
+    }
+
+    #[test]
+    fn txid_hash_consistent() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let id1 = TxId::new("tx1_abcdefgh".into()).unwrap();
+        let id2 = TxId::new("tx1_abcdefgh".into()).unwrap();
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        id1.hash(&mut h1);
+        id2.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    fn txid_display() {
+        let id = TxId::new("tx1_abcdefgh".into()).unwrap();
+        assert_eq!(format!("{id}"), "tx1_abcdefgh");
+    }
+
+    #[test]
+    fn txid_serialize_json() {
+        let id = TxId::new("tx1_abcdefgh".into()).unwrap();
+        let v = serde_json::to_value(&id).unwrap();
+        assert_eq!(v, serde_json::json!("tx1_abcdefgh"));
+    }
+
+    #[test]
+    fn engine_error_wal_poisoned_status() {
+        let e = EngineError::WalPoisoned;
+        assert_eq!(e.status_code(), hyper::StatusCode::SERVICE_UNAVAILABLE);
+        // Safe message must not contain the internal error detail
+        assert!(!e.safe_message().contains("EIO"));
+    }
+
+    #[test]
+    fn engine_error_load_failed_status() {
+        let e = EngineError::LoadFailed { detail: "parse error at byte 42".into() };
+        assert_eq!(e.status_code(), hyper::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(e.safe_message(), "transaction rejected by the kernel loader");
+        // Internal detail must not leak to safe message
+        assert!(!e.safe_message().contains("byte 42"));
+    }
+
+    #[test]
+    fn engine_error_log_internal_does_not_panic() {
+        let e1 = EngineError::WalPoisoned;
+        e1.log_internal("tx1_abcdefgh");
+        let e2 = EngineError::LoadFailed { detail: "test".into() };
+        e2.log_internal("tx2_abcdefgh");
+    }
+
+    #[test]
+    fn event_tx_id_returns_some_for_transaction_events() {
+        let id = TxId::new("tx1_abcdefgh".into()).unwrap();
+        let ev = Event::Tx { tx: id.clone(), count: 1, version: 1 };
+        assert_eq!(ev.tx_id(), Some("tx1_abcdefgh"));
+    }
+
+    #[test]
+    fn event_tx_id_returns_none_for_idle() {
+        let ev = Event::Idle { version: 1 };
+        assert_eq!(ev.tx_id(), None);
+    }
+
+    #[test]
+    fn event_tx_id_returns_none_for_delta() {
+        let ev = Event::Delta { version: 1, added: vec![], removed: vec![] };
+        assert_eq!(ev.tx_id(), None);
+    }
+
+    #[test]
+    fn event_name_matches_variant() {
+        let id = TxId::new("tx1_abcdefgh".into()).unwrap();
+        assert_eq!(Event::Tx { tx: id.clone(), count: 0, version: 0 }.name(), "tx");
+        assert_eq!(Event::Step { tx: id.clone(), exec: "()".into(), touched: 0, new: false, us: 0, version: 0 }.name(), "step");
+        assert_eq!(Event::Quiescent { tx: id.clone(), version: 0 }.name(), "quiescent");
+        assert_eq!(Event::Idle { version: 0 }.name(), "idle");
+        assert_eq!(Event::Delta { version: 0, added: vec![], removed: vec![] }.name(), "delta");
+        assert_eq!(Event::Abort { tx: id.clone(), reason: "".into(), version: 0 }.name(), "abort");
+        assert_eq!(Event::Budget { tx: id, steps: 0, version: 0 }.name(), "budget");
+    }
+}
