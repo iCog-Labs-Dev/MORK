@@ -65,13 +65,62 @@ impl PartialEq<str> for TxId {
     }
 }
 
+/// Structured engine error with presentation separation.
+///
+/// Each variant carries:
+/// - An internal message (full detail, for `log::error!` server-side)
+/// - An HTTP status code
+/// - A user-safe message (no internals leaked to clients)
+///
+/// The HTTP layer calls `status_code()` and `safe_message()` for the response,
+/// and `log_internal()` to record the full detail.
+#[derive(Debug)]
+pub enum EngineError {
+    /// WAL disk write error — server is temporarily unable to persist.
+    WalPoisoned,
+    /// Transaction body rejected by the kernel loader.
+    LoadFailed { detail: String },
+}
+
+impl EngineError {
+    pub fn status_code(&self) -> hyper::StatusCode {
+        use hyper::StatusCode;
+        match self {
+            EngineError::WalPoisoned => StatusCode::SERVICE_UNAVAILABLE,
+            EngineError::LoadFailed { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        }
+    }
+
+    pub fn safe_message(&self) -> String {
+        match self {
+            EngineError::WalPoisoned => {
+                "write error on disk; writes refused (reads still serve)".into()
+            }
+            EngineError::LoadFailed { .. } => "transaction rejected by the kernel loader".into(),
+        }
+    }
+
+    /// Log the full internal detail server-side. Call before returning the safe message
+    /// to the client.
+    pub fn log_internal(&self, txid: &str) {
+        match self {
+            EngineError::WalPoisoned => {
+                log::error!("tx {txid}: WAL poisoned, writes refused");
+            }
+            EngineError::LoadFailed { detail } => {
+                log::error!("tx {txid}: load failed: {detail}");
+            }
+        }
+    }
+}
+
 /// A transaction: an atomically-applied, auto-running unit of data + execs, already
 /// loc-wrapped into its namespace by `wrap::rewrite`.
 pub struct Transaction {
     pub id: TxId,
     /// Rewritten MeTTa source, ready for `Space::add_all_sexpr` verbatim.
     pub source: String,
-    pub reply: tokio::sync::oneshot::Sender<Result<TxOk, String>>,
+    pub reply: tokio::sync::oneshot::Sender<Result<TxOk, EngineError>>,
 }
 
 /// Commands the HTTP layer sends to the engine thread. Everything that mutates `Space`

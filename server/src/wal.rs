@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use crate::transaction::{TxOk, TxId};
+use crate::transaction::{TxOk, TxId, EngineError};
 
 /// First 8 bytes of every segment file; identifies the format (and its version).
 const MAGIC: &[u8; 8] = b"MORKWAL1";
@@ -117,7 +117,7 @@ pub enum OwnedRec {
 /// write (`everysec`/`no` — though there the engine usually replies itself and passes
 /// no ack at all).
 pub struct Ack {
-    pub reply: tokio::sync::oneshot::Sender<Result<TxOk, String>>,
+    pub reply: tokio::sync::oneshot::Sender<Result<TxOk, EngineError>>,
     pub ok: TxOk,
 }
 
@@ -511,9 +511,7 @@ impl Wal {
     pub fn append(&self, rec: Rec<'_>, ack: Option<Ack>) {
         if self.poisoned() {
             if let Some(a) = ack {
-                let _ = a
-                    .reply
-                    .send(Err("wal is poisoned (earlier write error)".into()));
+                let _ = a.reply.send(Err(EngineError::WalPoisoned));
             }
             return;
         }
@@ -527,7 +525,7 @@ impl Wal {
             .expect("wal used after shutdown")
             .send(cmd)
         {
-            let _ = a.reply.send(Err("wal writer thread is gone".into()));
+            let _ = a.reply.send(Err(EngineError::WalPoisoned));
         }
     }
 
@@ -610,7 +608,7 @@ fn writer_loop(
         log::error!("wal: write error, poisoning the log: {e}");
         poisoned.store(true, Ordering::Relaxed);
         for a in acks.drain(..) {
-            let _ = a.reply.send(Err(format!("wal write failed: {e}")));
+            let _ = a.reply.send(Err(EngineError::WalPoisoned));
         }
     };
 
@@ -638,7 +636,7 @@ fn writer_loop(
             if poisoned.load(Ordering::Relaxed) {
                 match cmd {
                     Cmd::Append { ack: Some(a), .. } => {
-                        let _ = a.reply.send(Err("wal is poisoned".into()));
+                        let _ = a.reply.send(Err(EngineError::WalPoisoned));
                     }
                     Cmd::Append { .. } => {}
                     Cmd::Checkpoint { .. } => ckpt_busy.store(false, Ordering::Release),

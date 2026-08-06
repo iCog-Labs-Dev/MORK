@@ -23,7 +23,7 @@ use mork_interning::SharedMappingHandle;
 use pathmap::PathMap;
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::transaction::{EngineCmd, Event, ReadSnapshot, Transaction, TxId, TxOk};
+use crate::transaction::{EngineCmd, EngineError, Event, ReadSnapshot, Transaction, TxId, TxOk};
 use crate::wal::{Ack, CkptMeta, FsyncPolicy, OwnedRec, Rec, Wal};
 use crate::{wal, wrap};
 
@@ -461,10 +461,7 @@ fn run_tx(
     let Transaction { id, source, reply } = t;
     if let Some(w) = wal {
         if w.poisoned() {
-            // The "unavailable:" prefix maps to 503 in http.rs: not applied, retryable.
-            let _ = reply.send(Err(
-                "unavailable: wal write error; writes refused (reads still serve)".into(),
-            ));
+            let _ = reply.send(Err(EngineError::WalPoisoned));
             return;
         }
     }
@@ -529,7 +526,7 @@ fn run_tx(
                 reason: reason.clone(),
                 version: *version,
             });
-            let _ = reply.send(Err(reason));
+            let _ = reply.send(Err(EngineError::LoadFailed { detail: reason }));
             if was_running {
                 let btm = std::mem::take(&mut space.btm);
                 space.was.resume_all(btm);

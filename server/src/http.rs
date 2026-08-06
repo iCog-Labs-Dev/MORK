@@ -92,11 +92,14 @@ async fn run_transaction(body: Incoming, state: &Arc<ServerState>) -> Response<B
     let id = wrap::gen_txid(state.tx_counter.fetch_add(1, Relaxed) + 1);
     let source = match wrap::rewrite(src, &id) {
         Ok(w) => w,
-        Err(e) => return json_response(StatusCode::BAD_REQUEST, json!({"ok": false, "error": format!("parse error: {e}")})),
+        Err(e) => {
+            log::error!("tx {id}: parse failed: {e}");
+            return json_response(StatusCode::BAD_REQUEST, json!({"ok": false, "error": "s-expression parse error"}));
+        }
     };
 
     let (reply, reply_rx) = tokio::sync::oneshot::channel();
-    if state.tx_send.send(EngineCmd::Tx(Transaction { id, source, reply })).await.is_err() {
+    if state.tx_send.send(EngineCmd::Tx(Transaction { id: id.clone(), source, reply })).await.is_err() {
         return json_response(StatusCode::SERVICE_UNAVAILABLE, json!({"ok": false, "error": "engine is shut down"}));
     }
     match reply_rx.await {
@@ -104,13 +107,10 @@ async fn run_transaction(body: Incoming, state: &Arc<ServerState>) -> Response<B
             StatusCode::OK,
             json!({"ok": true, "tx": ok.tx, "count": ok.count, "version": ok.version}),
         ),
-        // "unavailable:" is the engine's marker for transient refusals (e.g. the WAL is
-        // poisoned by a disk error): the transaction was NOT applied and retrying later
-        // may succeed — 503, not 422.
-        Ok(Err(e)) if e.starts_with("unavailable:") => {
-            json_response(StatusCode::SERVICE_UNAVAILABLE, json!({"ok": false, "error": e}))
+        Ok(Err(e)) => {
+            e.log_internal(&id.to_string());
+            json_response(e.status_code(), json!({"ok": false, "error": e.safe_message()}))
         }
-        Ok(Err(e)) => json_response(StatusCode::UNPROCESSABLE_ENTITY, json!({"ok": false, "error": e})),
         Err(_) => json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "error": "engine dropped the reply"})),
     }
     // `permit` is dropped here, releasing the in-flight slot.
