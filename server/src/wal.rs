@@ -604,6 +604,9 @@ fn writer_loop(
 ) {
     let mut dirty = false;
     let mut last_sync = Instant::now();
+    // Double-buffered acks for Everysec: acks from synced batches go here, acks from
+    // the current (dirty) batch wait here until the next fsync.
+    let mut synced_acks: Vec<Ack> = Vec::new();
     let poison = |e: &io::Error, acks: &mut Vec<Ack>, poisoned: &AtomicBool| {
         log::error!("wal: write error, poisoning the log: {e}");
         poisoned.store(true, Ordering::Relaxed);
@@ -723,12 +726,15 @@ fn writer_loop(
                 }
             }
             FsyncPolicy::Everysec => {
-                for Ack { reply, ok } in acks.drain(..) {
+                // Ack data from prior cycles that was already fsynced.
+                for Ack { reply, ok } in synced_acks.drain(..) {
                     let _ = reply.send(Ok(ok));
                 }
+                // Current batch's acks wait until this cycle's fsync completes.
+                synced_acks.append(&mut acks);
                 if dirty && last_sync.elapsed() >= SYNC_INTERVAL {
                     if let Err(e) = file.sync_data() {
-                        poison(&e, &mut acks, &poisoned);
+                        poison(&e, &mut synced_acks, &poisoned);
                         continue;
                     }
                     dirty = false;
@@ -747,6 +753,10 @@ fn writer_loop(
     // before reporting disconnect); leave the file durable.
     if dirty {
         let _ = file.sync_data();
+    }
+    // Ack any remaining synced data on shutdown.
+    for Ack { reply, ok } in synced_acks.drain(..) {
+        let _ = reply.send(Ok(ok));
     }
 }
 
