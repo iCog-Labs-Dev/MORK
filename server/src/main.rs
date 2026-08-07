@@ -180,5 +180,16 @@ fn main() {
     // closes the transaction channel, which is the engine's shutdown signal.
     drop(rt);
     drop(state);
-    let _ = engine_join.join();
+    match engine_join.join() {
+        Ok(()) => log::info!("engine: exited cleanly"),
+        Err(e) => {
+            if let Some(s) = e.downcast_ref::<&str>() {
+                log::error!("engine: panicked: {s}");
+            } else if let Some(s) = e.downcast_ref::<String>() {
+                log::error!("engine: panicked: {s}");
+            } else {
+                log::error!("engine: panicked with unknown payload");
+            }
+        }
+    }
 }
