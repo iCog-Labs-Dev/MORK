@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use crate::transaction::TxOk;
+use crate::transaction::{TxOk, TxId, EngineError};
 
 /// First 8 bytes of every segment file; identifies the format (and its version).
 const MAGIC: &[u8; 8] = b"MORKWAL1";
@@ -69,20 +69,21 @@ pub enum FsyncPolicy {
 /// `Commit.steps` semantically encodes "sequential, deterministic replay" — a future
 /// parallel scheduler adds a new tag rather than reinterpreting this one.
 ///
-/// Borrowed fields, because the hot path just encodes into a frame and moves
-/// on; [`OwnedRec`] is the decoded twin the recovery scan hands back.
+/// The `id` field borrows `&TxId` — a validated newtype that enforces the format
+/// `tx<count>_<8-char>` and length ≤ 63 bytes at construction. If it compiles,
+/// the id is safe for WAL encoding and VM namespace paths.
 pub enum Rec<'a> {
     Tx {
-        id: &'a str,
+        id: &'a TxId,
         source: &'a str,
     },
     Commit {
-        id: &'a str,
+        id: &'a TxId,
         steps: u64,
         version: u64,
     },
     Abort {
-        id: &'a str,
+        id: &'a TxId,
         reason: &'a str,
     },
 }
@@ -116,34 +117,38 @@ pub enum OwnedRec {
 /// write (`everysec`/`no` — though there the engine usually replies itself and passes
 /// no ack at all).
 pub struct Ack {
-    pub reply: tokio::sync::oneshot::Sender<Result<TxOk, String>>,
+    pub reply: tokio::sync::oneshot::Sender<Result<TxOk, EngineError>>,
     pub ok: TxOk,
 }
 
 // ---------------------------------------------------------------------------
 // Record encoding
 
-/// Payload bytes for one record: `tag:u8 | txid_len:u8 | txid | tag-specific rest`.
+/// Payload bytes for one record: `tag:u8 | id_len:u16le | id | body_len:u32le | body`.
 fn encode_payload(rec: &Rec) -> Vec<u8> {
     let mut p = Vec::new();
     match rec {
         Rec::Tx { id, source } => {
             p.push(1);
-            p.push(id.len() as u8);
+            p.extend_from_slice(&(id.len() as u16).to_le_bytes());
             p.extend_from_slice(id.as_bytes());
+            p.extend_from_slice(&(source.len() as u32).to_le_bytes());
             p.extend_from_slice(source.as_bytes());
         }
         Rec::Commit { id, steps, version } => {
             p.push(2);
-            p.push(id.len() as u8);
+            p.extend_from_slice(&(id.len() as u16).to_le_bytes());
             p.extend_from_slice(id.as_bytes());
+            // body = steps:u64le | version:u64le (16 bytes)
+            p.extend_from_slice(&16u32.to_le_bytes());
             p.extend_from_slice(&steps.to_le_bytes());
             p.extend_from_slice(&version.to_le_bytes());
         }
         Rec::Abort { id, reason } => {
             p.push(3);
-            p.push(id.len() as u8);
+            p.extend_from_slice(&(id.len() as u16).to_le_bytes());
             p.extend_from_slice(id.as_bytes());
+            p.extend_from_slice(&(reason.len() as u32).to_le_bytes());
             p.extend_from_slice(reason.as_bytes());
         }
     }
@@ -164,36 +169,44 @@ fn frame(rec: &Rec) -> Vec<u8> {
 /// the scan treats as corruption.
 fn decode_payload(p: &[u8]) -> Result<OwnedRec, String> {
     let err = || "malformed record payload".to_string();
-    if p.len() < 2 {
+    if p.len() < 3 {
         return Err(err());
     }
-    let id_len = p[1] as usize;
-    let rest_at = 2 + id_len;
+    let id_len = u16::from_le_bytes([p[1], p[2]]) as usize;
+    let rest_at = 3 + id_len;
     if p.len() < rest_at {
         return Err(err());
     }
-    let id = str::from_utf8(&p[2..rest_at])
+    let id = str::from_utf8(&p[3..rest_at])
         .map_err(|_| err())?
         .to_string();
     let rest = &p[rest_at..];
+    if rest.len() < 4 {
+        return Err(err());
+    }
+    let body_len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+    let body = &rest[4..];
+    if body.len() != body_len {
+        return Err(err());
+    }
     match p[0] {
         1 => Ok(OwnedRec::Tx {
             id,
-            source: str::from_utf8(rest).map_err(|_| err())?.to_string(),
+            source: str::from_utf8(body).map_err(|_| err())?.to_string(),
         }),
         2 => {
-            if rest.len() != 16 {
+            if body.len() != 16 {
                 return Err(err());
             }
             Ok(OwnedRec::Commit {
                 id,
-                steps: u64::from_le_bytes(rest[..8].try_into().unwrap()),
-                version: u64::from_le_bytes(rest[8..].try_into().unwrap()),
+                steps: u64::from_le_bytes(body[..8].try_into().unwrap()),
+                version: u64::from_le_bytes(body[8..].try_into().unwrap()),
             })
         }
         3 => Ok(OwnedRec::Abort {
             id,
-            reason: str::from_utf8(rest).map_err(|_| err())?.to_string(),
+            reason: str::from_utf8(body).map_err(|_| err())?.to_string(),
         }),
         t => Err(format!(
             "unknown record tag {t} (written by a newer server?)"
@@ -498,9 +511,7 @@ impl Wal {
     pub fn append(&self, rec: Rec<'_>, ack: Option<Ack>) {
         if self.poisoned() {
             if let Some(a) = ack {
-                let _ = a
-                    .reply
-                    .send(Err("wal is poisoned (earlier write error)".into()));
+                let _ = a.reply.send(Err(EngineError::WalPoisoned));
             }
             return;
         }
@@ -514,7 +525,7 @@ impl Wal {
             .expect("wal used after shutdown")
             .send(cmd)
         {
-            let _ = a.reply.send(Err("wal writer thread is gone".into()));
+            let _ = a.reply.send(Err(EngineError::WalPoisoned));
         }
     }
 
@@ -593,11 +604,14 @@ fn writer_loop(
 ) {
     let mut dirty = false;
     let mut last_sync = Instant::now();
+    // Double-buffered acks for Everysec: acks from synced batches go here, acks from
+    // the current (dirty) batch wait here until the next fsync.
+    let mut synced_acks: Vec<Ack> = Vec::new();
     let poison = |e: &io::Error, acks: &mut Vec<Ack>, poisoned: &AtomicBool| {
         log::error!("wal: write error, poisoning the log: {e}");
         poisoned.store(true, Ordering::Relaxed);
         for a in acks.drain(..) {
-            let _ = a.reply.send(Err(format!("wal write failed: {e}")));
+            let _ = a.reply.send(Err(EngineError::WalPoisoned));
         }
     };
 
@@ -625,7 +639,7 @@ fn writer_loop(
             if poisoned.load(Ordering::Relaxed) {
                 match cmd {
                     Cmd::Append { ack: Some(a), .. } => {
-                        let _ = a.reply.send(Err("wal is poisoned".into()));
+                        let _ = a.reply.send(Err(EngineError::WalPoisoned));
                     }
                     Cmd::Append { .. } => {}
                     Cmd::Checkpoint { .. } => ckpt_busy.store(false, Ordering::Release),
@@ -712,12 +726,15 @@ fn writer_loop(
                 }
             }
             FsyncPolicy::Everysec => {
-                for Ack { reply, ok } in acks.drain(..) {
+                // Ack data from prior cycles that was already fsynced.
+                for Ack { reply, ok } in synced_acks.drain(..) {
                     let _ = reply.send(Ok(ok));
                 }
+                // Current batch's acks wait until this cycle's fsync completes.
+                synced_acks.append(&mut acks);
                 if dirty && last_sync.elapsed() >= SYNC_INTERVAL {
                     if let Err(e) = file.sync_data() {
-                        poison(&e, &mut acks, &poisoned);
+                        poison(&e, &mut synced_acks, &poisoned);
                         continue;
                     }
                     dirty = false;
@@ -736,6 +753,10 @@ fn writer_loop(
     // before reporting disconnect); leave the file durable.
     if dirty {
         let _ = file.sync_data();
+    }
+    // Ack any remaining synced data on shutdown.
+    for Ack { reply, ok } in synced_acks.drain(..) {
+        let _ = reply.send(Ok(ok));
     }
 }
 
@@ -797,6 +818,11 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    /// Shorthand: build a TxId from a string literal in tests.
+    fn tx(s: &str) -> TxId {
+        TxId::new(s.to_string()).unwrap()
+    }
+
     fn tmpdir() -> PathBuf {
         static N: AtomicUsize = AtomicUsize::new(0);
         let d = std::env::temp_dir().join(format!(
@@ -820,20 +846,20 @@ mod tests {
     fn roundtrip_all_tags() {
         let recs = [
             Rec::Tx {
-                id: "tx1_abcd1234",
+                id: &tx("tx1_abcd1234"),
                 source: "(a b)\n(exec (tx1_abcd1234 0) $x $y)\n",
             },
             Rec::Tx {
-                id: "tx2_efgh5678",
+                id: &tx("tx2_efgh5678"),
                 source: "(unicode ⍼ \"quoted \\\" str\")",
             },
             Rec::Commit {
-                id: "tx1_abcd1234",
+                id: &tx("tx1_abcd1234"),
                 steps: 42,
                 version: 1234567890123,
             },
             Rec::Abort {
-                id: "tx2_efgh5678",
+                id: &tx("tx2_efgh5678"),
                 reason: "exec (bad): pattern functor",
             },
         ];
@@ -844,7 +870,8 @@ mod tests {
             let dec = decode_payload(&f[8..]).unwrap();
             match (r, &dec) {
                 (Rec::Tx { id, source }, OwnedRec::Tx { id: i2, source: s2 }) => {
-                    assert_eq!((*id, *source), (i2.as_str(), s2.as_str()));
+                    assert_eq!(&**id, i2.as_str());
+                    assert_eq!(*source, s2.as_str());
                 }
                 (
                     Rec::Commit { id, steps, version },
@@ -854,10 +881,13 @@ mod tests {
                         version: v2,
                     },
                 ) => {
-                    assert_eq!((*id, *steps, *version), (i2.as_str(), *st2, *v2));
+                    assert_eq!(&**id, i2.as_str());
+                    assert_eq!(*steps, *st2);
+                    assert_eq!(*version, *v2);
                 }
                 (Rec::Abort { id, reason }, OwnedRec::Abort { id: i2, reason: r2 }) => {
-                    assert_eq!((*id, *reason), (i2.as_str(), r2.as_str()));
+                    assert_eq!(&**id, i2.as_str());
+                    assert_eq!(*reason, r2.as_str());
                 }
                 _ => panic!("tag mismatch"),
             }
@@ -873,16 +903,16 @@ mod tests {
             &p,
             &[
                 Rec::Tx {
-                    id: "tx1_aaaaaaaa",
+                    id: &tx("tx1_aaaaaaaa"),
                     source: "(a)",
                 },
                 Rec::Commit {
-                    id: "tx1_aaaaaaaa",
+                    id: &tx("tx1_aaaaaaaa"),
                     steps: 1,
                     version: 2,
                 },
                 Rec::Tx {
-                    id: "tx2_bbbbbbbb",
+                    id: &tx("tx2_bbbbbbbb"),
                     source: "(b)",
                 },
             ],
@@ -922,11 +952,11 @@ mod tests {
             &p,
             &[
                 Rec::Tx {
-                    id: "tx1_aaaaaaaa",
+                    id: &tx("tx1_aaaaaaaa"),
                     source: "(a)",
                 },
                 Rec::Tx {
-                    id: "tx2_bbbbbbbb",
+                    id: &tx("tx2_bbbbbbbb"),
                     source: "(b)",
                 },
             ],
@@ -954,7 +984,7 @@ mod tests {
         write_frames(
             &seg_path(&dir, 0),
             &[Rec::Tx {
-                id: "tx1_aaaaaaaa",
+                id: &tx("tx1_aaaaaaaa"),
                 source: "(a)",
             }],
         );
@@ -962,7 +992,7 @@ mod tests {
         write_frames(
             &seg_path(&dir, 1),
             &[Rec::Tx {
-                id: "tx2_bbbbbbbb",
+                id: &tx("tx2_bbbbbbbb"),
                 source: "(b)",
             }],
         );
@@ -986,7 +1016,7 @@ mod tests {
         write_frames(
             &seg_path(&dir, 0),
             &[Rec::Tx {
-                id: "tx1_aaaaaaaa",
+                id: &tx("tx1_aaaaaaaa"),
                 source: "(a)",
             }],
         );
@@ -994,7 +1024,7 @@ mod tests {
         write_frames(
             &seg_path(&dir, 1),
             &[Rec::Commit {
-                id: "tx1_aaaaaaaa",
+                id: &tx("tx1_aaaaaaaa"),
                 steps: 3,
                 version: 4,
             }],
@@ -1031,13 +1061,13 @@ mod tests {
         let wal = Wal::open(&dir, FsyncPolicy::Always).unwrap();
         let (reply, rx) = tokio::sync::oneshot::channel();
         let ok = TxOk {
-            tx: "tx1_aaaaaaaa".into(),
+            tx: tx("tx1_aaaaaaaa"),
             count: 2,
             version: 1,
         };
         wal.append(
             Rec::Tx {
-                id: "tx1_aaaaaaaa",
+                id: &tx("tx1_aaaaaaaa"),
                 source: "(a b)",
             },
             Some(Ack { reply, ok }),
@@ -1046,7 +1076,7 @@ mod tests {
         assert_eq!(acked.version, 1);
         wal.append(
             Rec::Commit {
-                id: "tx1_aaaaaaaa",
+                id: &tx("tx1_aaaaaaaa"),
                 steps: 1,
                 version: 2,
             },
@@ -1070,11 +1100,11 @@ mod tests {
     fn checkpoint_rotates_installs_and_gcs() {
         let dir = tmpdir();
         let wal = Wal::open(&dir, FsyncPolicy::No).unwrap();
-        wal.append(Rec::Tx { id: "tx1_aaaaaaaa", source: "(a)" }, None);
-        wal.append(Rec::Commit { id: "tx1_aaaaaaaa", steps: 0, version: 1 }, None);
+        wal.append(Rec::Tx { id: &tx("tx1_aaaaaaaa"), source: "(a)" }, None);
+        wal.append(Rec::Commit { id: &tx("tx1_aaaaaaaa"), steps: 0, version: 1 }, None);
         assert!(wal.checkpoint(1, 1, "paths", Box::new(|w| w.write_all(b"SNAP"))));
         // FIFO: this lands in the freshly rotated segment
-        wal.append(Rec::Tx { id: "tx2_bbbbbbbb", source: "(b)" }, None);
+        wal.append(Rec::Tx { id: &tx("tx2_bbbbbbbb"), source: "(b)" }, None);
         wal.shutdown(); // joins writer AND checkpointer: the install is complete
 
         let meta = CkptMeta::load(&dir).unwrap().unwrap();
@@ -1101,7 +1131,7 @@ mod tests {
             let wal = Wal::open(&dir, FsyncPolicy::No).unwrap();
             wal.append(
                 Rec::Tx {
-                    id: "tx1_aaaaaaaa",
+                    id: &tx("tx1_aaaaaaaa"),
                     source: "(a)",
                 },
                 None,
@@ -1112,7 +1142,7 @@ mod tests {
             let wal = Wal::open(&dir, FsyncPolicy::No).unwrap();
             wal.append(
                 Rec::Tx {
-                    id: "tx2_bbbbbbbb",
+                    id: &tx("tx2_bbbbbbbb"),
                     source: "(b)",
                 },
                 None,
@@ -1121,5 +1151,105 @@ mod tests {
         let recs = read_segments(&dir, 0).unwrap();
         assert_eq!(recs.len(), 2, "reopen must append, not overwrite");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn encode_payload_uses_u16_id_length() {
+        let id = tx("tx1_abcd1234");
+        let r = Rec::Tx { id: &id, source: "test" };
+        let p = encode_payload(&r);
+        // tag:1 + id_len:2 + id:12 + body_len:4 + body:4 = 23
+        assert_eq!(p.len(), 23);
+        // id_len is u16 at bytes [1..3]
+        let id_len = u16::from_le_bytes([p[1], p[2]]);
+        assert_eq!(id_len as usize, "tx1_abcd1234".len());
+    }
+
+    #[test]
+    fn encode_payload_uses_u32_body_length() {
+        let id = tx("tx1_abcd1234");
+        let r = Rec::Tx { id: &id, source: "hello" };
+        let p = encode_payload(&r);
+        // tag:1 + id_len:2 + id:12 = 15, so body_len at [15..19]
+        let body_len = u32::from_le_bytes([p[15], p[16], p[17], p[18]]);
+        assert_eq!(body_len as usize, "hello".len());
+    }
+
+    #[test]
+    fn decode_rejects_short_payload() {
+        assert!(decode_payload(&[1]).is_err());
+        assert!(decode_payload(&[1, 0]).is_err());
+        assert!(decode_payload(&[]).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_id_length_exceeds_payload() {
+        // tag:1, id_len: 200 (way more than payload), garbage
+        let mut p = vec![1u8];
+        p.extend_from_slice(&200u16.to_le_bytes());
+        p.extend_from_slice(&vec![0u8; 10]);
+        assert!(decode_payload(&p).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_body_length_mismatch() {
+        // Construct a valid Tx record, then corrupt the body_len field
+        let id = tx("tx1_abcd1234");
+        let r = Rec::Tx { id: &id, source: "test" };
+        let mut p = encode_payload(&r);
+        // body_len is at [15..19], change it to a wrong value
+        let bad_len = (p.len() as u32 + 100).to_le_bytes();
+        p[15..19].copy_from_slice(&bad_len);
+        assert!(decode_payload(&p).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_unknown_tag() {
+        let mut p = vec![99u8]; // unknown tag
+        p.extend_from_slice(&0u16.to_le_bytes()); // id_len = 0
+        p.extend_from_slice(&0u32.to_le_bytes()); // body_len = 0
+        assert!(decode_payload(&p).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_non_utf8_id() {
+        let mut p = vec![1u8]; // Tx tag
+        p.extend_from_slice(&3u16.to_le_bytes()); // id_len = 3
+        p.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // invalid UTF-8
+        p.extend_from_slice(&0u32.to_le_bytes()); // body_len = 0
+        assert!(decode_payload(&p).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_non_utf8_source() {
+        let mut p = vec![1u8]; // Tx tag
+        p.extend_from_slice(&2u16.to_le_bytes()); // id_len = 2
+        p.extend_from_slice(b"ab"); // valid id
+        p.extend_from_slice(&3u32.to_le_bytes()); // body_len = 3
+        p.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // invalid UTF-8 body
+        assert!(decode_payload(&p).is_err());
+    }
+
+    #[test]
+    fn commit_body_length_is_always_16() {
+        let id = tx("tx1_abcd1234");
+        let r = Rec::Commit { id: &id, steps: 42, version: 99 };
+        let p = encode_payload(&r);
+        // tag:1 + id_len:2 + id:12 = 15, so body_len at [15..19]
+        let body_len = u32::from_le_bytes([p[15], p[16], p[17], p[18]]);
+        assert_eq!(body_len, 16);
+    }
+
+    #[test]
+    fn large_source_roundtrips() {
+        let source = "x".repeat(10_000);
+        let id = tx("tx1_abcd1234");
+        let r = Rec::Tx { id: &id, source: &source };
+        let f = frame(&r);
+        let dec = decode_payload(&f[8..]).unwrap();
+        match dec {
+            OwnedRec::Tx { source: s, .. } => assert_eq!(s.len(), 10_000),
+            _ => panic!("wrong variant"),
+        }
     }
 }

@@ -23,8 +23,8 @@ use mork_interning::SharedMappingHandle;
 use pathmap::PathMap;
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::transaction::{EngineCmd, Event, ReadSnapshot, Transaction, TxId, TxOk};
-use crate::wal::{Ack, CkptMeta, FsyncPolicy, OwnedRec, Rec, Wal};
+use crate::transaction::{EngineCmd, EngineError, Event, ReadSnapshot, Transaction, TxId, TxOk};
+use crate::wal::{CkptMeta, FsyncPolicy, OwnedRec, Rec, Wal};
 use crate::{wal, wrap};
 
 /// What happens when a transaction exhausts its step budget.
@@ -371,7 +371,7 @@ fn run_sweep_scheduler_tick_foreground(
     }
 
     let undo = space.btm.clone();
-    let tx = "sweep".to_string();
+    let tx = TxId::new("sweep".to_string()).expect("sweep txid");
     let mut stepped = false;
     for _ in 0..cfg.sweep_metta_steps {
         match step_at(space, &[], Some(&tx), version, snap_tx, events) {
@@ -448,6 +448,10 @@ fn publish(snap_tx: &watch::Sender<Arc<ReadSnapshot>>, space: &Space, version: u
 /// `TxOk` then), which is sound because redo logging requires durable-before-ACK, not
 /// durable-before-apply — a crash in between loses only an unacknowledged transaction.
 /// A failed load appends nothing at all: no TX record, no outcome needed.
+///
+/// **Submission/decoupling**: the ack fires immediately after the in-memory load
+/// succeeds. The HTTP handler returns 200 as soon as the ack arrives. WAL append and
+/// stepping continue asynchronously — progress streams on `/events`.
 fn run_tx(
     space: &mut Space,
     t: Transaction,
@@ -461,10 +465,7 @@ fn run_tx(
     let Transaction { id, source, reply } = t;
     if let Some(w) = wal {
         if w.poisoned() {
-            // The "unavailable:" prefix maps to 503 in http.rs: not applied, retryable.
-            let _ = reply.send(Err(
-                "unavailable: wal write error; writes refused (reads still serve)".into(),
-            ));
+            let _ = reply.send(Err(EngineError::WalPoisoned));
             return;
         }
     }
@@ -490,33 +491,21 @@ fn run_tx(
                 count,
                 version: *version,
             };
-            match wal {
-                // Under `always` the 200 is gated on durability: the writer thread fires
-                // the ack after the batch fsync while the engine moves straight on to
-                // stepping. Under `everysec`/`no` durability is deferred by policy, so
-                // the engine acks right after the (queued) append.
-                Some(w) if cfg.fsync == FsyncPolicy::Always => {
-                    w.append(
-                        Rec::Tx {
-                            id: &id,
-                            source: &source,
-                        },
-                        Some(Ack { reply, ok }),
-                    );
-                }
-                Some(w) => {
-                    w.append(
-                        Rec::Tx {
-                            id: &id,
-                            source: &source,
-                        },
-                        None,
-                    );
-                    let _ = reply.send(Ok(ok));
-                }
-                None => {
-                    let _ = reply.send(Ok(ok));
-                }
+
+            // Ack immediately: the HTTP handler returns 200 as soon as this arrives.
+            let _ = reply.send(Ok(ok));
+
+            // WAL append continues asynchronously — the client already has their
+            // response. Under `always` this means the 200 no longer gates on fsync;
+            // durability is still ensured by the WAL for crash recovery.
+            if let Some(w) = wal {
+                w.append(
+                    Rec::Tx {
+                        id: &id,
+                        source: &source,
+                    },
+                    None,
+                );
             }
         }
         Err(e) => {
@@ -529,7 +518,7 @@ fn run_tx(
                 reason: reason.clone(),
                 version: *version,
             });
-            let _ = reply.send(Err(reason));
+            let _ = reply.send(Err(EngineError::LoadFailed { detail: reason }));
             if was_running {
                 let btm = std::mem::take(&mut space.btm);
                 space.was.resume_all(btm);
@@ -538,6 +527,7 @@ fn run_tx(
         }
     }
 
+    // Step to quiescence asynchronously — the client is already gone (received 200).
     finish_tx(space, &id, undo, version, snap_tx, events, active, cfg, wal);
 
     if was_running {
@@ -770,7 +760,8 @@ fn recover(
                         "TX {id} while {prev} is unfinished — malformed log"
                     )));
                 }
-                pending = Some((id, source));
+                let txid = TxId::new(id).map_err(|e| io::Error::other(format!("replay: invalid txid: {e}")))?;
+                pending = Some((txid, source));
             }
             OwnedRec::Commit {
                 id,
@@ -782,28 +773,29 @@ fn recover(
                         "COMMIT for {id} with no pending TX"
                     )));
                 };
-                if pid != id {
+                let cid = TxId::new(id).map_err(|e| io::Error::other(format!("replay: invalid commit txid: {e}")))?;
+                if pid != cid {
                     return Err(io::Error::other(format!(
-                        "COMMIT for {id} but pending TX is {pid}"
+                        "COMMIT for {cid} but pending TX is {pid}"
                     )));
                 }
                 space.add_all_sexpr(source.as_bytes()).map_err(|e| {
                     io::Error::other(format!(
-                        "replay of {id}: load failed (determinism broken?): {e}"
+                        "replay of {cid}: load failed (determinism broken?): {e}"
                     ))
                 })?;
                 *version += 1;
                 for i in 0..steps {
-                    match step_once(space, &id, version, snap_tx, events) {
+                    match step_once(space, &cid, version, snap_tx, events) {
                         StepOutcome::Stepped => {}
                         StepOutcome::Done => {
                             return Err(io::Error::other(format!(
-                                "replay of {id}: log says {steps} steps but the space drained after {i}"
+                                "replay of {cid}: log says {steps} steps but the space drained after {i}"
                             )));
                         }
                         StepOutcome::Failed(r) => {
                             return Err(io::Error::other(format!(
-                                "replay of {id}: step {i} failed: {r}"
+                                "replay of {cid}: step {i} failed: {r}"
                             )));
                         }
                     }
@@ -813,7 +805,7 @@ fn recover(
                 }
                 if *version != logged {
                     log::error!(
-                        "replay of {id}: version {} != logged {logged} (determinism canary)",
+                        "replay of {cid}: version {} != logged {logged} (determinism canary)",
                         *version
                     );
                 }
@@ -925,8 +917,8 @@ fn step_at(
                 // the exec's own wrapper, when it still carries one.
                 let tx = attributed
                     .cloned()
-                    .or(parsed_txid)
-                    .unwrap_or_else(|| "?".into());
+                    .or_else(|| parsed_txid.and_then(|s| TxId::new(s).ok()))
+                    .unwrap_or_else(|| TxId::new("tx0_00000000".into()).unwrap());
                 ev = Some(Event::Step {
                     tx,
                     exec,

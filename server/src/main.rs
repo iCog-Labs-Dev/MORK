@@ -5,6 +5,7 @@
 //! execution event. One submission verb: `POST /run` — submitting a transaction (data +
 //! execs) IS running it.
 
+mod admission;
 mod engine;
 mod events;
 mod http;
@@ -14,7 +15,7 @@ mod wal;
 mod wrap;
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
@@ -66,6 +67,20 @@ struct Args {
     /// transactions; 0 disables (the log grows unbounded).
     #[arg(long, default_value_t = 1024)]
     checkpoint_every: u64,
+    /// Max request body size in bytes for POST /run. Rejects larger bodies with 413 before
+    /// buffering.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    max_body_bytes: usize,
+    /// Max concurrent in-flight POST /run requests. Rejects with 503 when at capacity.
+    #[arg(long, default_value_t = 64)]
+    max_inflight: usize,
+    /// Max concurrent SSE subscribers on GET /events. Rejects with 503 when at capacity.
+    #[arg(long, default_value_t = 4096)]
+    max_sse_subs: usize,
+    /// Max concurrent TCP connections. Rejects at accept time with TCP RST when at
+    /// capacity — no HTTP response is sent, the client sees a connection reset.
+    #[arg(long, default_value_t = 4096)]
+    max_connections: usize,
 }
 
 fn main() {
@@ -92,13 +107,19 @@ fn main() {
     // engine has replayed the log and restored the shared counter.
     ready.recv().expect("engine died during startup/recovery");
 
+    let admission = admission::AdmissionController::new(
+        args.max_body_bytes,
+        args.max_inflight,
+        args.max_sse_subs,
+    );
+
     let state = Arc::new(ServerState {
         tx_send,
         snapshot: snap_rx.clone(),
         events: events.clone(),
         tx_counter,
         active,
-        delta_subs: Arc::new(AtomicUsize::new(0)),
+        admission: admission.clone(),
     });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -113,9 +134,10 @@ fn main() {
         tokio::spawn(events::delta_task(
             snap_rx,
             events,
-            state.delta_subs.clone(),
+            admission.clone(),
         ));
 
+        let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(args.max_connections));
         let listener = TcpListener::bind(&args.addr)
             .await
             .unwrap_or_else(|e| panic!("failed to bind {}: {e}", args.addr));
@@ -129,8 +151,17 @@ fn main() {
                 }
                 accepted = listener.accept() => {
                     let Ok((stream, _peer)) = accepted else { continue };
+                    let permit = match conn_semaphore.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            log::debug!("connection rejected: at capacity ({})", args.max_connections);
+                            drop(stream);
+                            continue;
+                        }
+                    };
                     let st = state.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         let io = TokioIo::new(stream);
                         let svc = service_fn(move |req| http::handle(req, st.clone()));
                         if let Err(e) = hyper::server::conn::http1::Builder::new()
@@ -149,5 +180,16 @@ fn main() {
     // closes the transaction channel, which is the engine's shutdown signal.
     drop(rt);
     drop(state);
-    let _ = engine_join.join();
+    match engine_join.join() {
+        Ok(()) => log::info!("engine: exited cleanly"),
+        Err(e) => {
+            if let Some(s) = e.downcast_ref::<&str>() {
+                log::error!("engine: panicked: {s}");
+            } else if let Some(s) = e.downcast_ref::<String>() {
+                log::error!("engine: panicked: {s}");
+            } else {
+                log::error!("engine: panicked with unknown payload");
+            }
+        }
+    }
 }

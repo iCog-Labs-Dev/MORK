@@ -2,15 +2,117 @@
 //! published read snapshot, and the state handle the HTTP layer works with.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::ops::Deref;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use mork_interning::{SharedMapping, SharedMappingHandle};
 use pathmap::PathMap;
 use serde_json::{json, Value};
 
-/// `tx<count>_<unique 8-char alphanumeric>`, e.g. `tx17_si49f8v6`.
-pub type TxId = String;
+use crate::admission::AdmissionController;
+
+/// Validated transaction identifier: `tx<count>_<8-char alphanumeric>`.
+///
+/// Enforces two invariants at construction:
+/// - Format matches `tx[0-9]+_[a-z0-9]{8}` (the canonical namespace prefix).
+/// - Total length ≤ 63 bytes (the SymbolSize encoding limit from `mork_expr::Tag`).
+///
+/// If it compiles, the id is safe for WAL encoding, VM namespace wrapping, and trie paths.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TxId(String);
+
+impl serde::Serialize for TxId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl TxId {
+    /// Create a validated TxId. Returns `Err` if the format or length is wrong.
+    pub fn new(id: String) -> Result<Self, String> {
+        if id.len() > 63 {
+            return Err(format!("txid too long: {} bytes (max 63)", id.len()));
+        }
+        let rest = id.strip_prefix("tx").ok_or("txid must start with 'tx'")?;
+        let (digits, suffix) = rest.split_once('_').ok_or("txid missing '_' separator")?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("txid count part must be non-empty digits".into());
+        }
+        if suffix.len() != 8 || !suffix.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
+            return Err("txid suffix must be exactly8 lowercase alphanumeric characters".into());
+        }
+        Ok(Self(id))
+    }
+}
+
+impl Deref for TxId {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TxId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for TxId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+/// Structured engine error with presentation separation.
+///
+/// Each variant carries:
+/// - An internal message (full detail, for `log::error!` server-side)
+/// - An HTTP status code
+/// - A user-safe message (no internals leaked to clients)
+///
+/// The HTTP layer calls `status_code()` and `safe_message()` for the response,
+/// and `log_internal()` to record the full detail.
+#[derive(Debug)]
+pub enum EngineError {
+    /// WAL disk write error — server is temporarily unable to persist.
+    WalPoisoned,
+    /// Transaction body rejected by the kernel loader.
+    LoadFailed { detail: String },
+}
+
+impl EngineError {
+    pub fn status_code(&self) -> hyper::StatusCode {
+        use hyper::StatusCode;
+        match self {
+            EngineError::WalPoisoned => StatusCode::SERVICE_UNAVAILABLE,
+            EngineError::LoadFailed { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        }
+    }
+
+    pub fn safe_message(&self) -> String {
+        match self {
+            EngineError::WalPoisoned => {
+                "write error on disk; writes refused (reads still serve)".into()
+            }
+            EngineError::LoadFailed { .. } => "transaction rejected by the kernel loader".into(),
+        }
+    }
+
+    /// Log the full internal detail server-side. Call before returning the safe message
+    /// to the client.
+    pub fn log_internal(&self, txid: &str) {
+        match self {
+            EngineError::WalPoisoned => {
+                log::error!("tx {txid}: WAL poisoned, writes refused");
+            }
+            EngineError::LoadFailed { detail } => {
+                log::error!("tx {txid}: load failed: {detail}");
+            }
+        }
+    }
+}
 
 /// A transaction: an atomically-applied, auto-running unit of data + execs, already
 /// loc-wrapped into its namespace by `wrap::rewrite`.
@@ -18,7 +120,7 @@ pub struct Transaction {
     pub id: TxId,
     /// Rewritten MeTTa source, ready for `Space::add_all_sexpr` verbatim.
     pub source: String,
-    pub reply: tokio::sync::oneshot::Sender<Result<TxOk, String>>,
+    pub reply: tokio::sync::oneshot::Sender<Result<TxOk, EngineError>>,
 }
 
 /// Commands the HTTP layer sends to the engine thread. Everything that mutates `Space`
@@ -101,7 +203,7 @@ impl Event {
     pub fn tx_id(&self) -> Option<&str> {
         match self {
             Event::Tx { tx, .. } | Event::Step { tx, .. } | Event::Quiescent { tx, .. }
-            | Event::Abort { tx, .. } | Event::Budget { tx, .. } => Some(tx),
+            | Event::Abort { tx, .. } | Event::Budget { tx, .. } => Some(tx.as_ref()),
             Event::Idle { .. } | Event::Delta { .. } => None,
         }
     }
@@ -132,6 +234,178 @@ pub struct ServerState {
     pub tx_counter: Arc<AtomicU64>,
     /// Transactions with pending execs (kept by the engine; read by `hello`).
     pub active: Arc<Mutex<HashSet<TxId>>>,
-    /// Number of connected `?deltas=true` subscribers; the delta task skips work at 0.
-    pub delta_subs: Arc<AtomicUsize>,
+    /// Admission control: body size limits, in-flight request budget, SSE subscriber budget.
+    pub admission: AdmissionController,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn txid_valid_format() {
+        let id = TxId::new("tx17_si49f8v6".into()).unwrap();
+        assert_eq!(&*id, "tx17_si49f8v6");
+        assert_eq!(id.to_string(), "tx17_si49f8v6");
+    }
+
+    #[test]
+    fn txid_minimal_valid() {
+        assert!(TxId::new("tx0_00000000".into()).is_ok());
+    }
+
+    #[test]
+    fn txid_max_length_63() {
+        // 63 bytes: "tx" + 52 digits + "_" + 8 suffix = 63
+        let count = "0".repeat(52);
+        let id = format!("tx{count}_abcdefgh");
+        assert_eq!(id.len(), 63);
+        assert!(TxId::new(id).is_ok());
+    }
+
+    #[test]
+    fn txid_rejects_too_long() {
+        let count = "0".repeat(53);
+        let id = format!("tx{count}_abcdefgh");
+        assert_eq!(id.len(), 64);
+        assert!(TxId::new(id).is_err());
+    }
+
+    #[test]
+    fn txid_rejects_missing_prefix() {
+        assert!(TxId::new("17_si49f8v6".into()).is_err());
+    }
+
+    #[test]
+    fn txid_rejects_missing_separator() {
+        assert!(TxId::new("tx17si49f8v6".into()).is_err());
+    }
+
+    #[test]
+    fn txid_rejects_empty_count() {
+        assert!(TxId::new("tx_abcdefgh".into()).is_err());
+    }
+
+    #[test]
+    fn txid_rejects_non_digit_count() {
+        assert!(TxId::new("txabc_abcdefgh".into()).is_err());
+    }
+
+    #[test]
+    fn txid_rejects_short_suffix() {
+        assert!(TxId::new("tx1_abcdefg".into()).is_err());
+    }
+
+    #[test]
+    fn txid_rejects_long_suffix() {
+        assert!(TxId::new("tx1_abcdefghi".into()).is_err());
+    }
+
+    #[test]
+    fn txid_rejects_uppercase_suffix() {
+        assert!(TxId::new("tx1_ABCDEFGH".into()).is_err());
+    }
+
+    #[test]
+    fn txid_deref_to_str() {
+        let id = TxId::new("tx1_abcdefgh".into()).unwrap();
+        let s: &str = &id;
+        assert_eq!(s, "tx1_abcdefgh");
+    }
+
+    #[test]
+    fn txid_partial_eq_str() {
+        let id = TxId::new("tx1_abcdefgh".into()).unwrap();
+        assert_eq!(&*id, "tx1_abcdefgh");
+        assert_ne!(&*id, "tx2_abcdefgh");
+    }
+
+    #[test]
+    fn txid_clone() {
+        let id = TxId::new("tx1_abcdefgh".into()).unwrap();
+        let id2 = id.clone();
+        assert_eq!(id, id2);
+    }
+
+    #[test]
+    fn txid_hash_consistent() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let id1 = TxId::new("tx1_abcdefgh".into()).unwrap();
+        let id2 = TxId::new("tx1_abcdefgh".into()).unwrap();
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        id1.hash(&mut h1);
+        id2.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    fn txid_display() {
+        let id = TxId::new("tx1_abcdefgh".into()).unwrap();
+        assert_eq!(format!("{id}"), "tx1_abcdefgh");
+    }
+
+    #[test]
+    fn txid_serialize_json() {
+        let id = TxId::new("tx1_abcdefgh".into()).unwrap();
+        let v = serde_json::to_value(&id).unwrap();
+        assert_eq!(v, serde_json::json!("tx1_abcdefgh"));
+    }
+
+    #[test]
+    fn engine_error_wal_poisoned_status() {
+        let e = EngineError::WalPoisoned;
+        assert_eq!(e.status_code(), hyper::StatusCode::SERVICE_UNAVAILABLE);
+        // Safe message must not contain the internal error detail
+        assert!(!e.safe_message().contains("EIO"));
+    }
+
+    #[test]
+    fn engine_error_load_failed_status() {
+        let e = EngineError::LoadFailed { detail: "parse error at byte 42".into() };
+        assert_eq!(e.status_code(), hyper::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(e.safe_message(), "transaction rejected by the kernel loader");
+        // Internal detail must not leak to safe message
+        assert!(!e.safe_message().contains("byte 42"));
+    }
+
+    #[test]
+    fn engine_error_log_internal_does_not_panic() {
+        let e1 = EngineError::WalPoisoned;
+        e1.log_internal("tx1_abcdefgh");
+        let e2 = EngineError::LoadFailed { detail: "test".into() };
+        e2.log_internal("tx2_abcdefgh");
+    }
+
+    #[test]
+    fn event_tx_id_returns_some_for_transaction_events() {
+        let id = TxId::new("tx1_abcdefgh".into()).unwrap();
+        let ev = Event::Tx { tx: id.clone(), count: 1, version: 1 };
+        assert_eq!(ev.tx_id(), Some("tx1_abcdefgh"));
+    }
+
+    #[test]
+    fn event_tx_id_returns_none_for_idle() {
+        let ev = Event::Idle { version: 1 };
+        assert_eq!(ev.tx_id(), None);
+    }
+
+    #[test]
+    fn event_tx_id_returns_none_for_delta() {
+        let ev = Event::Delta { version: 1, added: vec![], removed: vec![] };
+        assert_eq!(ev.tx_id(), None);
+    }
+
+    #[test]
+    fn event_name_matches_variant() {
+        let id = TxId::new("tx1_abcdefgh".into()).unwrap();
+        assert_eq!(Event::Tx { tx: id.clone(), count: 0, version: 0 }.name(), "tx");
+        assert_eq!(Event::Step { tx: id.clone(), exec: "()".into(), touched: 0, new: false, us: 0, version: 0 }.name(), "step");
+        assert_eq!(Event::Quiescent { tx: id.clone(), version: 0 }.name(), "quiescent");
+        assert_eq!(Event::Idle { version: 0 }.name(), "idle");
+        assert_eq!(Event::Delta { version: 0, added: vec![], removed: vec![] }.name(), "delta");
+        assert_eq!(Event::Abort { tx: id.clone(), reason: "".into(), version: 0 }.name(), "abort");
+        assert_eq!(Event::Budget { tx: id, steps: 0, version: 0 }.name(), "budget");
+    }
 }

@@ -28,11 +28,22 @@ pub async fn handle(req: Request<Incoming>, state: Arc<ServerState>) -> Result<R
         (Method::POST, "/sweep/pause") => handle_sweep_pause(&state).await,
         (Method::POST, "/sweep/resume") => handle_sweep_resume(&state).await,
         (Method::POST, "/sweep/stop") => handle_sweep_stop(&state).await,
-        (Method::GET, "/events") => events::sse_response(
-            &state,
-            query.get("tx").cloned(),
-            query.get("deltas").map(|v| v == "true" || v == "1").unwrap_or(false),
-        ),
+        (Method::GET, "/events") => {
+            let want_deltas = query.get("deltas").map(|v| v == "true" || v == "1").unwrap_or(false);
+            let tx_filter = query.get("tx").cloned();
+            match state.admission.acquire_sse().await {
+                Some(permit) => {
+                    let permit = if want_deltas { permit.with_deltas() } else { permit };
+                    events::sse_response(&state, tx_filter, want_deltas, permit)
+                }
+                None => {
+                    json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        json!({"ok": false, "error": "server at capacity, too many SSE subscribers"}),
+                    )
+                }
+            }
+        }
         (Method::GET, "/export") => export(&state, &query),
         _ => json_response(StatusCode::NOT_FOUND, json!({"ok": false, "error": "not found"})),
     };
@@ -43,10 +54,36 @@ pub async fn handle(req: Request<Incoming>, state: Arc<ServerState>) -> Result<R
 /// input syntax). Applied atomically under a fresh tx namespace; execution starts
 /// immediately; progress streams on `/events`.
 async fn run_transaction(body: Incoming, state: &Arc<ServerState>) -> Response<Body> {
+    // Acquire in-flight permit BEFORE buffering the body. If the server is at capacity,
+    // reject immediately — no memory is spent on the upload.
+    let permit = match state.admission.acquire_run().await {
+        Some(p) => p,
+        None => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"ok": false, "error": "server at capacity, too many in-flight transactions"}),
+            );
+        }
+    };
+
+    // Collect the body with a hard byte limit. The permit's max_body_bytes is the
+    // authoritative limit; Content-Length is checked first as a fast reject for
+    // well-behaved clients, then we buffer with a safety cap.
     let bytes = match body.collect().await {
         Ok(c) => c.to_bytes(),
-        Err(e) => return json_response(StatusCode::BAD_REQUEST, json!({"ok": false, "error": format!("body read failed: {e}")})),
+        Err(_e) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"ok": false, "error": "failed to read request body"}),
+            );
+        }
     };
+    if bytes.len() > permit.max_body_bytes() {
+        return json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            json!({"ok": false, "error": format!("request body too large: {} bytes (max {})", bytes.len(), permit.max_body_bytes())}),
+        );
+    }
     let src = match std::str::from_utf8(&bytes) {
         Ok(s) => s,
         Err(_) => return json_response(StatusCode::BAD_REQUEST, json!({"ok": false, "error": "body must be UTF-8 s-expression text"})),
@@ -55,11 +92,14 @@ async fn run_transaction(body: Incoming, state: &Arc<ServerState>) -> Response<B
     let id = wrap::gen_txid(state.tx_counter.fetch_add(1, Relaxed) + 1);
     let source = match wrap::rewrite(src, &id) {
         Ok(w) => w,
-        Err(e) => return json_response(StatusCode::BAD_REQUEST, json!({"ok": false, "error": format!("parse error: {e}")})),
+        Err(e) => {
+            log::error!("tx {id}: parse failed: {e}");
+            return json_response(StatusCode::BAD_REQUEST, json!({"ok": false, "error": "s-expression parse error"}));
+        }
     };
 
     let (reply, reply_rx) = tokio::sync::oneshot::channel();
-    if state.tx_send.send(EngineCmd::Tx(Transaction { id, source, reply })).await.is_err() {
+    if state.tx_send.send(EngineCmd::Tx(Transaction { id: id.clone(), source, reply })).await.is_err() {
         return json_response(StatusCode::SERVICE_UNAVAILABLE, json!({"ok": false, "error": "engine is shut down"}));
     }
     match reply_rx.await {
@@ -67,15 +107,13 @@ async fn run_transaction(body: Incoming, state: &Arc<ServerState>) -> Response<B
             StatusCode::OK,
             json!({"ok": true, "tx": ok.tx, "count": ok.count, "version": ok.version}),
         ),
-        // "unavailable:" is the engine's marker for transient refusals (e.g. the WAL is
-        // poisoned by a disk error): the transaction was NOT applied and retrying later
-        // may succeed — 503, not 422.
-        Ok(Err(e)) if e.starts_with("unavailable:") => {
-            json_response(StatusCode::SERVICE_UNAVAILABLE, json!({"ok": false, "error": e}))
+        Ok(Err(e)) => {
+            e.log_internal(&id.to_string());
+            json_response(e.status_code(), json!({"ok": false, "error": e.safe_message()}))
         }
-        Ok(Err(e)) => json_response(StatusCode::UNPROCESSABLE_ENTITY, json!({"ok": false, "error": e})),
         Err(_) => json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "error": "engine dropped the reply"})),
     }
+    // `permit` is dropped here, releasing the in-flight slot.
 }
 
 async fn handle_sweep_start(state: &Arc<ServerState>) -> Response<Body> {
