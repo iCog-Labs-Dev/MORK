@@ -105,6 +105,7 @@ impl EvalScope {
                     while let CoroutineState::Yielded(i) = std::pin::pin!(&mut src).resume(()) {
                         top_frame.sink.write(i)?;
                     }
+                    self.expr.position += e.span().len();
                 } else {
                     let mut frame = StackFrame {
                         // yes this is just get_alloc but Rust is stupid
