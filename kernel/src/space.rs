@@ -41,6 +41,7 @@ pub static ACT_PATH: &'static str = "/dev/shm/";
 pub struct Space {
     pub btm: PathMap<u64>,
     pub was: WeightedAtomSweep,
+    pub sweep_specs: HashMap<String, SweepSpec>,
     pub sm: SharedMappingHandle,
     pub mmaps: HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
     pub z3s: HashMap<OwnedSourceItem, Box<Popen>>,
@@ -456,9 +457,115 @@ pub struct StepInfo<'e> {
     pub error: Option<&'static str>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CycleSchedulerStats {
+    pub cycles: usize,
+    pub sweep_steps: usize,
+    pub sweep_touched: usize,
+    pub sweep_new: bool,
+    pub metta_steps: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryPolicy {
+    All,
+    WeightedOne { engine: String, weight_policy: WeightPolicy },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WeightPolicy {
+    First,
+    Product,
+    Sum,
+    Expr(Vec<u8>),
+}
+
+impl Default for WeightPolicy {
+    fn default() -> Self {
+        Self::First
+    }
+}
+
+struct WeightedQueryCandidate {
+    weight: f64,
+    source_matches: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceWeightKind {
+    DirectBtm,
+    WrappedBtm,
+    NonBtm,
+}
+
+#[derive(Debug)]
+enum WeightEvalError {
+    InstantiationFailed,
+    InvalidNumeric(Vec<u8>),
+    NegativeOrNonFinite(f64),
+    PureEval(String),
+    MissingWeight(Vec<u8>),
+}
+
+impl WeightEvalError {
+    fn byte_text(bytes: &[u8]) -> String {
+        std::str::from_utf8(bytes)
+            .map(|text| text.to_owned())
+            .unwrap_or_else(|_| format!("{bytes:?}"))
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            WeightEvalError::InstantiationFailed => {
+                "weight expression could not be instantiated from query bindings".to_string()
+            }
+            WeightEvalError::InvalidNumeric(bytes) => {
+                format!("weight result is not numeric: {}", Self::byte_text(bytes))
+            }
+            WeightEvalError::NegativeOrNonFinite(weight) => {
+                format!("weight must be finite and non-negative, got {weight}")
+            }
+            WeightEvalError::PureEval(error) => {
+                format!("pure weight expression failed: {error}")
+            }
+            WeightEvalError::MissingWeight(bytes) => {
+                format!("no numeric, BTM, or pure weight for {}", serialize(bytes))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SweepOperationSpec {
+    pub op_type: String,
+    pub args: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SweepRuleSpec {
+    pub source: Vec<u8>,
+    pub sink: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SweepSpec {
+    pub name: String,
+    pub engine_type: String,
+    pub operations: Vec<SweepOperationSpec>,
+    pub rule: Option<SweepRuleSpec>,
+    pub weight_policy: WeightPolicy,
+    pub atom: Vec<u8>,
+}
+
+impl SweepSpec {
+    fn has_legacy_was_process(&self) -> bool {
+        !self.operations.is_empty() || self.rule.is_none()
+    }
+}
+
 impl Space {
     pub fn new() -> Self {
-        Self { btm: PathMap::new(), was: WeightedAtomSweep::new(WeightedAtomSweepSettings::default()), sm: SharedMapping::new(), mmaps: HashMap::new(), z3s: HashMap::new(), last_merkleize: Instant::now(), timing: false }
+        Self { btm: PathMap::new(), was: WeightedAtomSweep::new(WeightedAtomSweepSettings::default()), sweep_specs: HashMap::new(), sm: SharedMapping::new(), mmaps: HashMap::new(), z3s: HashMap::new(), last_merkleize: Instant::now(), timing: false }
     }
 
     pub fn parse_sexpr(&mut self, r: &[u8], buf: *mut u8) -> Result<(Expr, usize), ParserError> {
@@ -1146,6 +1253,15 @@ impl Space {
             mmaps: &mut HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
             z3s: &mut HashMap<OwnedSourceItem, Box<Popen>>,
             btm: &PathMap<u64>, pat_expr: Expr, mut effect: F) -> usize {
+        Self::query_multi_i_with_sources(no_source, mmaps, z3s, btm, pat_expr, |refs_bindings, loc, _sources| {
+            effect(refs_bindings, loc)
+        })
+    }
+
+    fn query_multi_i_with_sources<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr, &[Expr]) -> bool>(no_source: bool,
+            mmaps: &mut HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
+            z3s: &mut HashMap<OwnedSourceItem, Box<Popen>>,
+            btm: &PathMap<u64>, pat_expr: Expr, mut effect: F) -> usize {
         use crate::sources::{ASource, Resource, ResourceRequest, Source};
 
         let pat_newvars = pat_expr.newvars();
@@ -1153,7 +1269,7 @@ impl Space {
         let n_factors = pat_expr.arity().unwrap() as usize;
         debug_assert!(n_factors > 0);
         if n_factors == 1 {
-            effect(Err(BTreeMap::new()), pat_expr);
+            effect(Err(BTreeMap::new()), pat_expr, &[]);
             return 1;
         }
         let mut pat_args = Vec::with_capacity(n_factors);
@@ -1172,20 +1288,26 @@ impl Space {
             AFactor::CompatSource(primary) => {
                 let mut prz = ProductZipper::new(primary, &mut factors[..]);
                 prz.reserve_buffers(1 << 32, 32);
-                Self::query_multi_raw(&mut prz, &pat_args[1..], effect)
+                Self::query_multi_raw_with_sources(&mut prz, &pat_args[1..], effect)
             }
             primary => {
                 trace!(target: "query_multi_i", "PZG of {:?}", factors.len() + 1);
                 let mut prz = ProductZipperG::new(primary, &mut factors[..]);
                 prz.reserve_buffers(1 << 32, 32);
-                Self::query_multi_raw(&mut prz, &pat_args[1..], effect)
+                Self::query_multi_raw_with_sources(&mut prz, &pat_args[1..], effect)
             }
         }
     }
 
+    pub fn query_multi_raw<PZ : ZipperProduct, F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
+        Self::query_multi_raw_with_sources(prz, sources, |refs_bindings, loc, _sources| {
+            effect(refs_bindings, loc)
+        })
+    }
+
     #[cfg(feature="no_search")]
     #[inline(always)]
-    pub fn query_multi_raw<PZ : ZipperProduct, F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
+    fn query_multi_raw_with_sources<PZ : ZipperProduct, F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr, &[Expr]) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
         let mut candidate = 0;
 
         while prz.to_next_val() {
@@ -1193,9 +1315,12 @@ impl Space {
             let e = Expr { ptr: prz.origin_path().as_ptr().cast_mut() };
             trace!(target: "query_multi_ref", "pi {:?}", prz.path_indices());
             trace!(target: "query_multi_ref", "at {:?}", e);
+            let mut source_matches = Vec::with_capacity(sources.len());
+            source_matches.push(e);
             for &other_i in prz.path_indices() {
                 trace!(target: "query_multi_ref", "at {:?}",
                     Expr { ptr: unsafe { prz.origin_path().as_ptr().cast_mut().add(other_i) } });
+                source_matches.push(Expr { ptr: unsafe { prz.origin_path().as_ptr().cast_mut().add(other_i) } });
             }
             unifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // if e.variables() != 0 {
@@ -1216,7 +1341,7 @@ impl Space {
                 Ok(bs) => {
 
                     unsafe { std::ptr::write_volatile(&mut candidate, std::ptr::read_volatile(&candidate) + 1); }
-                    if !effect(Err(bs), e) {
+                    if !effect(Err(bs), e, &source_matches) {
                         break
                     }
                 }
@@ -1242,7 +1367,7 @@ impl Space {
 
     #[cfg(not(feature="no_search"))]
     #[inline(always)]
-    pub fn query_multi_raw<PZ : ZipperProduct, F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
+    fn query_multi_raw_with_sources<PZ : ZipperProduct, F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr, &[Expr]) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
         let mut stack = sources[0..].iter().rev().cloned().collect::<Vec<_>>();
 
         let mut references: Vec<u32> = vec![];
@@ -1257,9 +1382,12 @@ impl Space {
                     let e = Expr { ptr: loc.origin_path().as_ptr().cast_mut() };
                     trace!(target: "query_multi", "pi {:?}", loc.path_indices());
                     trace!(target: "query_multi", "at {:?}", e);
+                    let mut source_matches = Vec::with_capacity(sources.len());
+                    source_matches.push(e);
                     for &other_i in loc.path_indices() {
                         trace!(target: "query_multi", "at {:?}",
                             Expr { ptr: unsafe { loc.origin_path().as_ptr().cast_mut().add(other_i) } });
+                        source_matches.push(Expr { ptr: unsafe { loc.origin_path().as_ptr().cast_mut().add(other_i) } });
                     }
                     unifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // if e.variables() != 0 {
@@ -1279,7 +1407,7 @@ impl Space {
                         match bindings {
                             Ok(bs) => {
                                 unsafe { std::ptr::write_volatile(&mut candidate, std::ptr::read_volatile(&candidate) + 1); }
-                                if !effect(Err(bs), e) {
+                                if !effect(Err(bs), e, &source_matches) {
                                     unsafe { longjmp(a, 1) }
                                 }
                             }
@@ -1300,7 +1428,7 @@ impl Space {
                     } else {
                         trace!(target: "query_multi", "#variables==0 {:?}", e);
                         unsafe { std::ptr::write_volatile(&mut candidate, std::ptr::read_volatile(&candidate) + 1); }
-                        if !effect(Ok(unsafe { slice_from_raw_parts(references.as_ptr(), references.len()).as_ref().unwrap() }), e) {
+                        if !effect(Ok(unsafe { slice_from_raw_parts(references.as_ptr(), references.len()).as_ref().unwrap() }), e, &source_matches) {
                             unsafe { longjmp(a, 1) }
                         }
                     }
@@ -1596,12 +1724,483 @@ impl Space {
     }
 
     pub fn transform_multi_multi_io(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr, no_source: bool, no_sink: bool) -> (usize, bool) {
+        self.transform_multi_multi_io_with_policy(pat_expr, tpl_expr, add, no_source, no_sink, QueryPolicy::All)
+    }
+
+    fn instantiate_template_outputs(
+        pat_expr: Expr,
+        templates: &[Expr],
+        bindings: &BTreeMap<(u8, u8), ExprEnv>,
+    ) -> Option<Vec<(usize, Vec<u8>)>> {
+        let mut assignments: Vec<(u8, u8)> = vec![];
+        let mut trace: Vec<(u8, u8)> = vec![];
+        let mut ass = Vec::with_capacity(64);
+        let mut astack = Vec::with_capacity(64);
+        let mut buffer = Vec::with_capacity(4096);
+
+        let (oi, ni, true) = ({
+            let mut void = std::io::sink();
+            mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0,pat_expr,bindings,void,trace,assignments)
+        }) else { return None; };
+
+        let mut outputs = Vec::with_capacity(templates.len());
+        for (i, template) in templates.iter().enumerate() {
+            buffer.clear();
+            let (_, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue; };
+            outputs.push((i, buffer.clone()));
+        }
+
+        Some(outputs)
+    }
+
+    fn instantiate_exprs(
+        pat_expr: Expr,
+        exprs: &[Expr],
+        bindings: &BTreeMap<(u8, u8), ExprEnv>,
+    ) -> Option<Vec<Vec<u8>>> {
+        let mut assignments: Vec<(u8, u8)> = vec![];
+        let mut trace: Vec<(u8, u8)> = vec![];
+        let mut ass = Vec::with_capacity(64);
+        let mut astack = Vec::with_capacity(64);
+        let mut buffer = Vec::with_capacity(4096);
+
+        let (oi, ni, true) = ({
+            let mut void = std::io::sink();
+            mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0,pat_expr,bindings,void,trace,assignments)
+        }) else { return None; };
+
+        let mut outputs = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            buffer.clear();
+            let (_, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*expr,bindings,buffer,astack,ass) else { return None; };
+            outputs.push(buffer.clone());
+        }
+
+        Some(outputs)
+    }
+
+    fn source_match_bindings(
+        source_envs: &[ExprEnv],
+        source_matches: &[Vec<u8>],
+    ) -> Option<BTreeMap<(u8, u8), ExprEnv>> {
+        if source_envs.len() != source_matches.len() {
+            return None;
+        }
+
+        let mut pairs = Vec::with_capacity(source_envs.len());
+        for (source_env, source_match) in source_envs.iter().zip(source_matches) {
+            let source_match_expr = Expr { ptr: source_match.as_ptr().cast_mut() };
+            pairs.push((*source_env, ExprEnv::new((pairs.len() + 1) as u8, source_match_expr)));
+        }
+
+        #[cfg(feature="no_search")]
+        {
+            unify(pairs).ok()
+        }
+        #[cfg(not(feature="no_search"))]
+        {
+            unify(&mut pairs).ok()
+        }
+    }
+
+    fn instantiate_source_match_outputs(
+        pat_expr: Expr,
+        source_envs: &[ExprEnv],
+        source_matches: &[Vec<u8>],
+        templates: &[Expr],
+    ) -> Option<Vec<(usize, Vec<u8>)>> {
+        let bindings = Self::source_match_bindings(source_envs, source_matches)?;
+        Self::instantiate_template_outputs(pat_expr, templates, &bindings)
+    }
+
+    fn owned_source_matches(source_matches: &[Expr]) -> Vec<Vec<u8>> {
+        source_matches
+            .iter()
+            .map(|source_match| Self::expr_bytes(*source_match))
+            .collect()
+    }
+
+    fn strip_btm_source_wrapper(e: Expr) -> Option<Vec<u8>> {
+        let args = Self::expr_args(e)?;
+        args.get(1).map(|ee| Self::expr_bytes(ee.subsexpr()))
+    }
+
+    fn query_match_weight(btm: &PathMap<u64>, path: &[u8]) -> u64 {
+        btm.read_zipper_at_path(&path).val().copied().unwrap_or(1)
+    }
+
+    fn query_match_weight_f64(btm: &PathMap<u64>, path: &[u8]) -> f64 {
+        Self::query_match_weight(btm, path) as f64
+    }
+
+    fn source_weight_path(bytes: &[u8], kind: SourceWeightKind) -> Option<Vec<u8>> {
+        match kind {
+            SourceWeightKind::DirectBtm => Some(bytes.to_vec()),
+            SourceWeightKind::WrappedBtm => {
+                let expr = Expr { ptr: bytes.as_ptr().cast_mut() };
+                Self::strip_btm_source_wrapper(expr)
+            }
+            SourceWeightKind::NonBtm => None,
+        }
+    }
+
+    fn source_pattern_bytes_for_weight(e: Expr, kind: SourceWeightKind) -> Option<Vec<u8>> {
+        match kind {
+            SourceWeightKind::DirectBtm => Some(Self::expr_bytes(e)),
+            SourceWeightKind::WrappedBtm => Self::strip_btm_source_wrapper(e),
+            SourceWeightKind::NonBtm => None,
+        }
+    }
+
+    fn source_pattern_prefix_from_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+        let e = Expr { ptr: bytes.as_ptr().cast_mut() };
+        let prefix = unsafe {
+            e.prefix()
+                .unwrap_or_else(|full| full)
+                .as_ref()?
+                .to_vec()
+        };
+
+        if prefix.len() == bytes.len()
+            || matches!(
+                bytes.get(prefix.len()..),
+                Some([b]) if matches!(byte_item(*b), Tag::NewVar | Tag::VarRef(_))
+            )
+        {
+            Some(prefix)
+        } else {
+            None
+        }
+    }
+
+    fn source_pattern_prefix(e: Expr, kind: SourceWeightKind) -> Option<Vec<u8>> {
+        let bytes = Self::source_pattern_bytes_for_weight(e, kind)?;
+        Self::source_pattern_prefix_from_bytes(&bytes)
+    }
+
+    fn wrap_btm_source_match(path: &[u8]) -> Vec<u8> {
+        let mut wrapped = vec![item_byte(Tag::Arity(2)), item_byte(Tag::SymbolSize(3)), b'B', b'T', b'M'];
+        wrapped.extend_from_slice(path);
+        wrapped
+    }
+
+    fn source_match_from_weight_path(path: &[u8], kind: SourceWeightKind) -> Option<Vec<u8>> {
+        match kind {
+            SourceWeightKind::DirectBtm => Some(path.to_vec()),
+            SourceWeightKind::WrappedBtm => Some(Self::wrap_btm_source_match(path)),
+            SourceWeightKind::NonBtm => None,
+        }
+    }
+
+    fn weighted_random_btm_path_from_prefix(btm: &PathMap<u64>, prefix: &[u8]) -> Option<Vec<u8>> {
+        let mut z = btm.read_zipper_at_path(prefix);
+        let total_weight = z.agg_w();
+        if total_weight == 0 {
+            return None;
+        }
+
+        let mut ticket = rand::random_range(0..total_weight);
+        loop {
+            if let Some(value) = z.val() {
+                let node_weight = *value;
+                if ticket < node_weight {
+                    return Some(z.origin_path().to_vec());
+                }
+                ticket -= node_weight;
+            }
+
+            let mut found_child = false;
+            for byte in z.child_mask().iter() {
+                z.descend_to_byte(byte);
+                let child_weight = z.agg_w();
+                if ticket < child_weight {
+                    found_child = true;
+                    break;
+                }
+                ticket -= child_weight;
+                z.ascend_byte();
+            }
+
+            if !found_child {
+                return None;
+            }
+        }
+    }
+
+    fn weighted_cpq_btm_path_from_prefix(btm: &PathMap<u64>, prefix: &[u8]) -> Option<Vec<u8>> {
+        let mut z = btm.read_zipper_at_path(prefix);
+        let mut best: Option<(u64, Vec<u8>)> = None;
+        if let Some(value) = z.val() {
+            if *value > 0 {
+                best = Some((*value, z.origin_path().to_vec()));
+            }
+        }
+
+        while z.to_next_val() {
+            if !z.origin_path().starts_with(prefix) {
+                break;
+            }
+            let Some(value) = z.val() else {
+                continue;
+            };
+            if *value == 0 {
+                continue;
+            }
+            if best.as_ref().map(|(best_weight, _)| *value >= *best_weight).unwrap_or(true) {
+                best = Some((*value, z.origin_path().to_vec()));
+            }
+        }
+
+        best.map(|(_, path)| path)
+    }
+
+    fn try_weighted_btm_prefix_candidate(
+        btm: &PathMap<u64>,
+        source_envs: &[ExprEnv],
+        source_weight_kinds: &[SourceWeightKind],
+        engine: &str,
+        weight_policy: &WeightPolicy,
+    ) -> Option<Option<WeightedQueryCandidate>> {
+        if !matches!(engine, "random_walk" | "cpq")
+            || !matches!(weight_policy, WeightPolicy::First | WeightPolicy::Product | WeightPolicy::Sum)
+            || source_envs.len() != 1
+            || !matches!(source_weight_kinds.first(), Some(SourceWeightKind::DirectBtm | SourceWeightKind::WrappedBtm))
+        {
+            return None;
+        }
+
+        let source_weight_kind = source_weight_kinds[0];
+        let prefix = Self::source_pattern_prefix(source_envs[0].subsexpr(), source_weight_kind)?;
+        let path = match engine {
+            "random_walk" => Self::weighted_random_btm_path_from_prefix(btm, &prefix),
+            "cpq" => Self::weighted_cpq_btm_path_from_prefix(btm, &prefix),
+            _ => unreachable!(),
+        };
+        let Some(path) = path else {
+            return Some(None);
+        };
+        let weight = Self::query_match_weight_f64(btm, &path);
+        if weight <= 0.0 {
+            return Some(None);
+        }
+
+        let source_matches = vec![Self::source_match_from_weight_path(&path, source_weight_kind)?];
+        if Self::source_match_bindings(source_envs, &source_matches).is_none() {
+            return None;
+        }
+
+        Some(Some(WeightedQueryCandidate { weight, source_matches }))
+    }
+
+    fn symbol_bytes_to_name_with(sm: &SharedMappingHandle, bytes: &[u8]) -> Option<String> {
+        #[cfg(feature = "interning")]
+        {
+            if bytes.len() != mork_interning::SYM_LEN {
+                return None;
+            }
+            let symbol = i64::from_be_bytes(bytes.try_into().ok()?).to_be_bytes();
+            sm.get_bytes(symbol)
+                .and_then(|s| std::str::from_utf8(s).ok())
+                .map(|s| s.to_owned())
+        }
+        #[cfg(not(feature = "interning"))]
+        {
+            let _ = sm;
+            std::str::from_utf8(bytes).ok().map(|s| s.to_owned())
+        }
+    }
+
+    fn symbol_payload_bytes_with(sm: &SharedMappingHandle, e: Expr) -> Option<Vec<u8>> {
+        unsafe {
+            let Tag::SymbolSize(size) = byte_item(*e.ptr) else { return None; };
+            let bytes = slice_from_raw_parts(e.ptr.add(1), size as usize).as_ref().unwrap();
+            #[cfg(feature = "interning")]
+            {
+                if bytes.len() != mork_interning::SYM_LEN {
+                    return None;
+                }
+                let symbol = i64::from_be_bytes(bytes.try_into().ok()?).to_be_bytes();
+                sm.get_bytes(symbol).map(|s| s.to_vec())
+            }
+            #[cfg(not(feature = "interning"))]
+            {
+                let _ = sm;
+                Some(bytes.to_vec())
+            }
+        }
+    }
+
+    fn validate_weight(weight: f64) -> Result<f64, WeightEvalError> {
+        if weight.is_finite() && weight >= 0.0 {
+            Ok(weight)
+        } else {
+            Err(WeightEvalError::NegativeOrNonFinite(weight))
+        }
+    }
+
+    fn numeric_symbol_weight(bytes: &[u8]) -> Result<f64, WeightEvalError> {
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            if let Ok(weight) = text.parse::<u64>() {
+                return Ok(weight as f64);
+            }
+            if let Ok(weight) = text.parse::<f64>() {
+                return Self::validate_weight(weight);
+            }
+        }
+
+        Err(WeightEvalError::InvalidNumeric(bytes.to_vec()))
+    }
+
+    fn concrete_expr_weight(sm: &SharedMappingHandle, btm: &PathMap<u64>, bytes: &[u8]) -> Result<f64, WeightEvalError> {
+        let expr = Expr { ptr: bytes.as_ptr().cast_mut() };
+        if let Some(symbol_bytes) = Self::symbol_payload_bytes_with(sm, expr) {
+            return Self::numeric_symbol_weight(&symbol_bytes);
+        }
+
+        if let Some(weight) = btm.read_zipper_at_path(bytes).val().copied() {
+            return Ok(weight as f64);
+        }
+
+        Err(WeightEvalError::MissingWeight(bytes.to_vec()))
+    }
+
+    fn explicit_expr_weight(sm: &SharedMappingHandle, btm: &PathMap<u64>, bytes: &[u8]) -> Result<f64, WeightEvalError> {
+        match Self::concrete_expr_weight(sm, btm, bytes) {
+            Ok(weight) => return Ok(weight),
+            Err(WeightEvalError::MissingWeight(_)) => {}
+            Err(error) => return Err(error),
+        }
+
+        Self::pure_expr_weight(sm, btm, bytes)
+    }
+
+    #[cfg(feature = "grounding")]
+    fn pure_expr_weight(sm: &SharedMappingHandle, btm: &PathMap<u64>, bytes: &[u8]) -> Result<f64, WeightEvalError> {
+        let expr = Expr { ptr: bytes.as_ptr().cast_mut() };
+        if expr.arity().is_none() {
+            return Err(WeightEvalError::MissingWeight(bytes.to_vec()));
+        }
+
+        let mut scope = eval::EvalScope::new();
+        crate::pure::register(&mut scope);
+        let result = scope
+            .eval(eval_ffi::ExprSource::new(bytes.as_ptr()))
+            .map_err(|error| WeightEvalError::PureEval(error.to_string()))?;
+        Self::concrete_expr_weight(sm, btm, &result)
+    }
+
+    #[cfg(not(feature = "grounding"))]
+    fn pure_expr_weight(_sm: &SharedMappingHandle, _btm: &PathMap<u64>, bytes: &[u8]) -> Result<f64, WeightEvalError> {
+        Err(WeightEvalError::MissingWeight(bytes.to_vec()))
+    }
+
+    fn source_match_weights(
+        btm: &PathMap<u64>,
+        source_matches: &[Expr],
+        source_weight_kinds: &[SourceWeightKind],
+    ) -> Vec<f64> {
+        source_matches
+            .iter()
+            .zip(source_weight_kinds)
+            .filter_map(|(source_match, kind)| {
+                let bytes = Self::expr_bytes(*source_match);
+                let path = Self::source_weight_path(&bytes, *kind)?;
+                Some(Self::query_match_weight_f64(btm, &path))
+            })
+            .collect()
+    }
+
+    fn candidate_weight(
+        sm: &SharedMappingHandle,
+        btm: &PathMap<u64>,
+        pat_expr: Expr,
+        source_matches: &[Expr],
+        source_weight_kinds: &[SourceWeightKind],
+        weight_policy: &WeightPolicy,
+        bindings: &BTreeMap<(u8, u8), ExprEnv>,
+    ) -> Result<f64, WeightEvalError> {
+        match weight_policy {
+            WeightPolicy::First => {
+                let weights = Self::source_match_weights(btm, source_matches, source_weight_kinds);
+                Ok(weights.first().copied().unwrap_or(1.0))
+            }
+            WeightPolicy::Product => {
+                let weights = Self::source_match_weights(btm, source_matches, source_weight_kinds);
+                if weights.is_empty() {
+                    Ok(1.0)
+                } else {
+                    Ok(weights.into_iter().fold(1.0f64, |acc, weight| acc * weight))
+                }
+            }
+            WeightPolicy::Sum => {
+                let weights = Self::source_match_weights(btm, source_matches, source_weight_kinds);
+                if weights.is_empty() {
+                    Ok(1.0)
+                } else {
+                    Ok(weights.into_iter().sum())
+                }
+            }
+            WeightPolicy::Expr(weight_expr) => {
+                let weight_expr = Expr { ptr: weight_expr.as_ptr().cast_mut() };
+                let Some(mut instantiated) = Self::instantiate_exprs(pat_expr, &[weight_expr], bindings) else {
+                    return Err(WeightEvalError::InstantiationFailed);
+                };
+                let Some(weight_expr) = instantiated.pop() else {
+                    return Err(WeightEvalError::InstantiationFailed);
+                };
+                Self::explicit_expr_weight(sm, btm, &weight_expr)
+            }
+        }
+    }
+
+    fn weighted_candidate_should_replace(
+        engine: &str,
+        selected_weight: Option<f64>,
+        total_weight: &mut f64,
+        weight: f64,
+    ) -> bool {
+        if !weight.is_finite() || weight <= 0.0 {
+            return false;
+        }
+
+        match engine {
+            "random_walk" => {
+                *total_weight += weight;
+                rand::random_range(0.0..*total_weight) < weight
+            }
+            "cpq" => selected_weight.map(|selected_weight| weight >= selected_weight).unwrap_or(true),
+            _ => false,
+        }
+    }
+
+    pub fn transform_multi_multi_io_with_policy(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr, no_source: bool, no_sink: bool, policy: QueryPolicy) -> (usize, bool) {
         use crate::sinks::*;
         let mut buffer = Vec::with_capacity(1 << 32);
         unsafe { buffer.set_len(1 << 32); }
         let mut tpl_args = Vec::with_capacity(64);
         ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
         let mut templates: Vec<_> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
+        let mut pat_args = Vec::with_capacity(64);
+        ExprEnv::new(0, pat_expr).args(&mut pat_args);
+        let source_patterns: Vec<_> = pat_args[1..].iter().map(|ee| ee.subsexpr()).collect();
+        let source_weight_kinds: Vec<_> = if no_source {
+            source_patterns
+                .iter()
+                .map(|_| SourceWeightKind::DirectBtm)
+                .collect()
+        } else {
+            source_patterns
+                .iter()
+                .map(|source| {
+                    if matches!(self.expr_head_name(*source).as_deref(), Some("BTM")) {
+                        SourceWeightKind::WrappedBtm
+                    } else {
+                        SourceWeightKind::NonBtm
+                    }
+                })
+                .collect()
+        };
+        let sm = self.sm.clone();
         let mut sinks: Vec<_> = templates.iter().map(|e| { if no_sink { ASink::compat(*e) } else { ASink::new(*e) } }).collect();
         let mut template_prefixes: Vec<_> = sinks.iter().map(|sink|
             sink.request().next().unwrap()
@@ -1635,6 +2234,102 @@ impl Space {
 
         let mut ass = Vec::with_capacity(64);
         let mut astack = Vec::with_capacity(64);
+
+        let weighted = match policy {
+            QueryPolicy::All => None,
+            QueryPolicy::WeightedOne { engine, weight_policy } => Some((engine, weight_policy)),
+        };
+
+        if let Some((engine, weight_policy)) = weighted {
+            if !matches!(engine.as_str(), "random_walk" | "cpq") {
+                warn!("unknown weighted query engine '{}'", engine);
+                for wz in outstanding_wzs.iter_mut() {
+                    zh.cleanup_write_zipper(wz);
+                }
+                return (0, false);
+            }
+
+            let source_envs = &pat_args[1..];
+            let selected_candidate = match Self::try_weighted_btm_prefix_candidate(
+                &read_copy,
+                source_envs,
+                &source_weight_kinds,
+                &engine,
+                &weight_policy,
+            ) {
+                Some(candidate) => candidate,
+                None => {
+                    let mut selected_candidate = None;
+                    let mut total_weight = 0.0f64;
+                    Self::query_multi_i_with_sources(no_source, &mut self.mmaps, &mut self.z3s, &read_copy, pat_expr, |refs_bindings, _loc, source_matches| {
+                        match refs_bindings {
+                            Ok(_) => {
+                                unreachable!()
+                            }
+                            Err(ref bindings) => {
+                                #[cfg(debug_assertions)]
+                                bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
+
+                                let weight = match Self::candidate_weight(
+                                    &sm,
+                                    &read_copy,
+                                    pat_expr,
+                                    source_matches,
+                                    &source_weight_kinds,
+                                    &weight_policy,
+                                    bindings,
+                                ) {
+                                    Ok(weight) => weight,
+                                    Err(error) => {
+                                        warn!("weighted query candidate ignored for {:?}: {}", weight_policy, error.describe());
+                                        return true;
+                                    }
+                                };
+                                let selected_weight = selected_candidate.as_ref().map(|candidate: &WeightedQueryCandidate| candidate.weight);
+                                if Self::weighted_candidate_should_replace(&engine, selected_weight, &mut total_weight, weight) {
+                                    selected_candidate = Some(WeightedQueryCandidate {
+                                        weight,
+                                        source_matches: Self::owned_source_matches(source_matches),
+                                    });
+                                }
+                                true
+                            }
+                        }
+                    });
+                    selected_candidate
+                }
+            };
+
+            let mut any_new = false;
+            let touched = if let Some(candidate) = selected_candidate {
+                let Some(outputs) = Self::instantiate_source_match_outputs(pat_expr, source_envs, &candidate.source_matches, &templates) else {
+                    for wz in outstanding_wzs.iter_mut() {
+                        zh.cleanup_write_zipper(wz);
+                    }
+                    return (0, false);
+                };
+
+                writes.fetch_add(outputs.len(), std::sync::atomic::Ordering::Relaxed);
+                for (i, output) in &outputs {
+                    let wz = unsafe { std::ptr::read(&template_resources[subsumption[*i]]) };
+                    sinks[*i].sink(std::iter::once(wz), output);
+                }
+
+                for (i, s) in sinks.iter_mut().enumerate() {
+                    let wz = unsafe { std::ptr::read(&template_resources[subsumption[i]]) };
+                    any_new |= s.finalize(std::iter::once(wz));
+                }
+                1
+            } else {
+                0
+            };
+
+            for wz in outstanding_wzs.iter_mut() {
+                zh.cleanup_write_zipper(wz);
+            }
+
+            return (touched, any_new);
+        }
 
         let mut any_new = false;
         let touched = Self::query_multi_i(no_source, &mut self.mmaps, &mut self.z3s, &read_copy, pat_expr, |refs_bindings, loc| 'query : {
@@ -1693,162 +2388,247 @@ impl Space {
         { let mut rz = self.btm.read_zipper(); while rz.to_next_val() { trace!(target: "interpret", "on space {:?}", serialize(unsafe { rz.path() })); }; drop(rz); }
         destruct!(rt, ("exec" loc pat_expr tpl_expr), unsafe {
             debug_assert!(loc.variables() == 0);
-            if let Tag::Arity(i) = byte_item(*pat_expr.ptr) { if i == 0 { return Err("pattern expression can not be empty"); } } else { return Err("pattern must be an expression, not a symbol or variables") }
-            if *pat_expr.ptr.add(1) != item_byte(Tag::SymbolSize(1)) { return Err("pattern functor can only be , or I") }
-
-            if let Tag::Arity(i) = byte_item(*tpl_expr.ptr) { if i == 0 { return Err("template expression can not be empty"); } } else { return Err("template must be an expression, not a symbol or variables") }
-            if *tpl_expr.ptr.add(1) != item_byte(Tag::SymbolSize(1)) { return Err("template functor can only be , or O") }
+            let (no_source, no_sink) = self.transform_io_flags(pat_expr, tpl_expr)?;
 
             #[cfg(feature="specialize_io")]
-            let res = match (*pat_expr.ptr.add(2), *tpl_expr.ptr.add(2)) {
-                (b',', b',') => { self.transform_multi_multi_(pat_expr, tpl_expr, rt) }
-                (b'I', b',') => { self.transform_multi_multi_i(pat_expr, tpl_expr, rt) }
-                (b',', b'O') => { self.transform_multi_multi_o(pat_expr, tpl_expr, rt) }
-                (b'I', b'O') => { self.transform_multi_multi_io(pat_expr, tpl_expr, rt, false, false) }
-                (_, _) => { return Err("pattern functor can only be , or I and template functor can only be , or O") }
+            let res = match (no_source, no_sink) {
+                (true, true) => { self.transform_multi_multi_(pat_expr, tpl_expr, rt) }
+                (false, true) => { self.transform_multi_multi_i(pat_expr, tpl_expr, rt) }
+                (true, false) => { self.transform_multi_multi_o(pat_expr, tpl_expr, rt) }
+                (false, false) => { self.transform_multi_multi_io(pat_expr, tpl_expr, rt, false, false) }
             };
             #[cfg(not(feature="specialize_io"))]
-            let res = match (*pat_expr.ptr.add(2), *tpl_expr.ptr.add(2)) {
-                (b',', b',') => { self.transform_multi_multi_io(pat_expr, tpl_expr, rt, true, true) }
-                (b'I', b',') => { self.transform_multi_multi_io(pat_expr, tpl_expr, rt, false, true) }
-                (b',', b'O') => { self.transform_multi_multi_io(pat_expr, tpl_expr, rt, true, false) }
-                (b'I', b'O') => { self.transform_multi_multi_io(pat_expr, tpl_expr, rt, false, false) }
-                (_, _) => { return Err("pattern functor can only be , or I and template functor can only be , or O") }
-            };
+            let res = self.transform_multi_multi_io(pat_expr, tpl_expr, rt, no_source, no_sink);
 
             trace!(target: "interpret", "(run, changed) = {:?}", res);
             return Ok(res)
         }, _err => return Err("exec shape (exec <loc> <patterns> <templates>)"))
     }
 
-    /// Parse a single `(sweep engineName (e type) (o op args...) ...)` from raw path bytes.
-    /// Returns (engine_name, engine_type, operations) on success, None on parse failure.
-    fn parse_sweep_atom(path: &[u8]) -> Option<(String, String, Vec<(String, Vec<Vec<u8>>)>)> {
-        if path.len() < 7 { return None; }
-        if !matches!(byte_item(path[0]), Tag::Arity(_)) { return None; }
-        if byte_item(path[1]) != Tag::SymbolSize(5) { return None; }
-        if &path[2..7] != b"sweep" { return None; }
+    fn expr_bytes(e: Expr) -> Vec<u8> {
+        unsafe { e.span().as_ref().unwrap().to_vec() }
+    }
 
-        let mut i = 7;
-        // engine name: SymbolSize(L) + L bytes
-        let engine_name = match byte_item(path[i]) {
-            Tag::SymbolSize(sz) => {
-                i += 1;
-                if i + sz as usize > path.len() { return None; }
-                let s = std::str::from_utf8(&path[i..i + sz as usize]).ok()?.to_string();
-                i += sz as usize;
-                s
+    fn symbol_name(&self, e: Expr) -> Option<String> {
+        unsafe {
+            let Tag::SymbolSize(size) = byte_item(*e.ptr) else { return None; };
+            let bytes = slice_from_raw_parts(e.ptr.add(1), size as usize).as_ref().unwrap();
+            Self::symbol_bytes_to_name_with(&self.sm, bytes)
+        }
+    }
+
+    fn expr_args(e: Expr) -> Option<Vec<ExprEnv>> {
+        if !matches!(unsafe { byte_item(*e.ptr) }, Tag::Arity(_)) {
+            return None;
+        }
+        let mut args = Vec::with_capacity(e.arity().unwrap_or(0) as usize);
+        ExprEnv::new(0, e).args(&mut args);
+        Some(args)
+    }
+
+    fn expr_head_name(&self, e: Expr) -> Option<String> {
+        let args = Self::expr_args(e)?;
+        args.first().and_then(|ee| self.symbol_name(ee.subsexpr()))
+    }
+
+    fn validate_sweep_source_expr(&self, e: Expr) -> bool {
+        matches!(self.expr_head_name(e).as_deref(), Some(",") | Some("I"))
+    }
+
+    fn validate_sweep_sink_expr(&self, e: Expr) -> bool {
+        matches!(self.expr_head_name(e).as_deref(), Some(",") | Some("O"))
+    }
+
+    fn transform_io_flags(&self, pat_expr: Expr, tpl_expr: Expr) -> Result<(bool, bool), &'static str> {
+        if let Tag::Arity(i) = unsafe { byte_item(*pat_expr.ptr) } {
+            if i == 0 { return Err("pattern expression can not be empty"); }
+        } else {
+            return Err("pattern must be an expression, not a symbol or variables");
+        }
+
+        if let Tag::Arity(i) = unsafe { byte_item(*tpl_expr.ptr) } {
+            if i == 0 { return Err("template expression can not be empty"); }
+        } else {
+            return Err("template must be an expression, not a symbol or variables");
+        }
+
+        match (
+            self.expr_head_name(pat_expr).as_deref(),
+            self.expr_head_name(tpl_expr).as_deref(),
+        ) {
+            (Some(","), Some(",")) => Ok((true, true)),
+            (Some("I"), Some(",")) => Ok((false, true)),
+            (Some(","), Some("O")) => Ok((true, false)),
+            (Some("I"), Some("O")) => Ok((false, false)),
+            _ => Err("pattern functor can only be , or I and template functor can only be , or O"),
+        }
+    }
+
+    fn parse_sweep_operation_expr(&self, e: Expr) -> Option<SweepOperationSpec> {
+        if let Some(op_type) = self.symbol_name(e) {
+            return Some(SweepOperationSpec { op_type, args: Vec::new() });
+        }
+
+        let args = Self::expr_args(e)?;
+        let head = self.symbol_name(args.first()?.subsexpr())?;
+        if head == "o" {
+            let op_type = self.symbol_name(args.get(1)?.subsexpr())?;
+            let op_args = args[2..].iter().map(|ee| Self::expr_bytes(ee.subsexpr())).collect();
+            Some(SweepOperationSpec { op_type, args: op_args })
+        } else {
+            let op_args = args[1..].iter().map(|ee| Self::expr_bytes(ee.subsexpr())).collect();
+            Some(SweepOperationSpec { op_type: head, args: op_args })
+        }
+    }
+
+    fn parse_sweep_o_clause(&self, clause_args: &[ExprEnv]) -> Option<SweepOperationSpec> {
+        let op_type = self.symbol_name(clause_args.get(1)?.subsexpr())?;
+        let args = clause_args[2..].iter().map(|ee| Self::expr_bytes(ee.subsexpr())).collect();
+        Some(SweepOperationSpec { op_type, args })
+    }
+
+    fn parse_sweep_weight_clause(&self, name: &str, clause_args: &[ExprEnv]) -> Option<WeightPolicy> {
+        let mode = self.symbol_name(clause_args.get(1)?.subsexpr())?;
+        match mode.as_str() {
+            "first" => {
+                if clause_args.len() != 2 {
+                    warn!("sweep '{}' has malformed weight first clause", name);
+                    return None;
+                }
+                Some(WeightPolicy::First)
             }
-            _ => return None,
-        };
-
-        let mut engine_type = String::new();
-        let mut ops: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
-
-        while i < path.len() {
-            // each tuple: Arity(N) + first-child symbol tag + data ...
-            let arity = match byte_item(path[i]) {
-                Tag::Arity(a) => { i += 1; a }
-                _ => break,
-            };
-            if i >= path.len() { break; }
-            let tag = match byte_item(path[i]) {
-                Tag::SymbolSize(sz) => {
-                    i += 1;
-                    if i + sz as usize > path.len() { break; }
-                    let t = &path[i..i + sz as usize];
-                    i += sz as usize;
-                    t.to_vec()
+            "product" => {
+                if clause_args.len() != 2 {
+                    warn!("sweep '{}' has malformed weight product clause", name);
+                    return None;
                 }
-                _ => break,
-            };
-            match &tag[..] {
-                b"e" => {
-                    // (e <engine-type>) — engine definition
-                    if i >= path.len() { break; }
-                    engine_type = match byte_item(path[i]) {
-                        Tag::SymbolSize(sz) => {
-                            i += 1;
-                            if i + sz as usize > path.len() { break; }
-                            let s = std::str::from_utf8(&path[i..i + sz as usize]).ok()?.to_string();
-                            i += sz as usize;
-                            s
-                        }
-                        _ => break,
-                    };
+                Some(WeightPolicy::Product)
+            }
+            "sum" => {
+                if clause_args.len() != 2 {
+                    warn!("sweep '{}' has malformed weight sum clause", name);
+                    return None;
                 }
-                b"o" => {
-                    // (o <op-type> [args...]) — single operation
-                    if i >= path.len() { break; }
-                    let op_type = match byte_item(path[i]) {
-                        Tag::SymbolSize(sz) => {
-                            i += 1;
-                            if i + sz as usize > path.len() { break; }
-                            let s = std::str::from_utf8(&path[i..i + sz as usize]).ok()?.to_string();
-                            i += sz as usize;
-                            s
-                        }
-                        _ => break,
-                    };
-                    let mut args: Vec<Vec<u8>> = Vec::new();
-                    for _ in 2..arity {
-                        if i >= path.len() { break; }
-                        match byte_item(path[i]) {
-                            Tag::SymbolSize(sz) => {
-                                i += 1;
-                                if i + sz as usize > path.len() { break; }
-                                args.push(path[i..i + sz as usize].to_vec());
-                                i += sz as usize;
-                            }
-                            _ => break,
-                        }
+                Some(WeightPolicy::Sum)
+            }
+            "expr" => {
+                if clause_args.len() != 3 {
+                    warn!("sweep '{}' has malformed weight expr clause", name);
+                    return None;
+                }
+                Some(WeightPolicy::Expr(Self::expr_bytes(clause_args[2].subsexpr())))
+            }
+            other => {
+                warn!("sweep '{}' has unknown weight mode '{}'", name, other);
+                None
+            }
+        }
+    }
+
+    /// Parse a single `(sweep name (e type) ...)` atom into a typed sweep spec.
+    ///
+    /// Supported clauses:
+    /// - `(e <engine>)`
+    /// - `(o <operation> <arg>...)`
+    /// - `(, (<operation> <arg>...) (o <operation> <arg>...) ...)`
+    /// - `(src <source-expr>)`
+    /// - `(sink <sink-expr>)`
+    /// - `(weight first|product|sum|expr <expr>)`
+    fn parse_sweep_atom(&self, path: &[u8]) -> Option<SweepSpec> {
+        let sweep_expr = Expr { ptr: path.as_ptr().cast_mut() };
+        let args = Self::expr_args(sweep_expr)?;
+        if self.symbol_name(args.first()?.subsexpr())? != "sweep" {
+            return None;
+        }
+
+        let name = self.symbol_name(args.get(1)?.subsexpr())?;
+        let mut engine_type: Option<String> = None;
+        let mut operations = Vec::new();
+        let mut source: Option<Vec<u8>> = None;
+        let mut sink: Option<Vec<u8>> = None;
+        let mut weight_policy = WeightPolicy::First;
+        let mut weight_seen = false;
+
+        for clause in &args[2..] {
+            let Some(clause_args) = Self::expr_args(clause.subsexpr()) else {
+                warn!("sweep '{}' contains a non-expression clause, ignoring it", name);
+                continue;
+            };
+            let Some(head) = clause_args.first().and_then(|ee| self.symbol_name(ee.subsexpr())) else {
+                warn!("sweep '{}' contains a clause without a symbol head, ignoring it", name);
+                continue;
+            };
+
+            match head.as_str() {
+                "e" => {
+                    if clause_args.len() != 2 {
+                        warn!("sweep '{}' has malformed engine clause", name);
+                        return None;
                     }
-                    ops.push((op_type, args));
+                    engine_type = Some(self.symbol_name(clause_args[1].subsexpr())?);
                 }
-                b"," => {
-                    // (, (op1 args...) (op2 args...) ...) — multiple operations grouped
-                    for _ in 1..arity {
-                        if i >= path.len() { break; }
-                        let op_arity = match byte_item(path[i]) {
-                            Tag::Arity(a) => { i += 1; a }
-                            _ => break,
-                        };
-                        if i >= path.len() { break; }
-                        let op_type = match byte_item(path[i]) {
-                            Tag::SymbolSize(sz) => {
-                                i += 1;
-                                if i + sz as usize > path.len() { break; }
-                                let s = std::str::from_utf8(&path[i..i + sz as usize]).ok()?.to_string();
-                                i += sz as usize;
-                                s
-                            }
-                            _ => break,
-                        };
-                        let mut args: Vec<Vec<u8>> = Vec::new();
-                        for _ in 1..op_arity {
-                            if i >= path.len() { break; }
-                            match byte_item(path[i]) {
-                                Tag::SymbolSize(sz) => {
-                                    i += 1;
-                                    if i + sz as usize > path.len() { break; }
-                                    args.push(path[i..i + sz as usize].to_vec());
-                                    i += sz as usize;
-                                }
-                                _ => break,
-                            }
-                        }
-                        ops.push((op_type, args));
+                "o" => {
+                    operations.push(self.parse_sweep_o_clause(&clause_args)?);
+                }
+                "," => {
+                    for op_expr in &clause_args[1..] {
+                        operations.push(self.parse_sweep_operation_expr(op_expr.subsexpr())?);
                     }
                 }
-                _ => break,
+                "src" => {
+                    if clause_args.len() != 2 {
+                        warn!("sweep '{}' has malformed src clause", name);
+                        return None;
+                    }
+                    let source_expr = clause_args[1].subsexpr();
+                    if !self.validate_sweep_source_expr(source_expr) {
+                        warn!("sweep '{}' source must have ',' or 'I' as its head", name);
+                        return None;
+                    }
+                    source = Some(Self::expr_bytes(source_expr));
+                }
+                "sink" => {
+                    if clause_args.len() != 2 {
+                        warn!("sweep '{}' has malformed sink clause", name);
+                        return None;
+                    }
+                    let sink_expr = clause_args[1].subsexpr();
+                    if !self.validate_sweep_sink_expr(sink_expr) {
+                        warn!("sweep '{}' sink must have ',' or 'O' as its head", name);
+                        return None;
+                    }
+                    sink = Some(Self::expr_bytes(sink_expr));
+                }
+                "weight" => {
+                    if weight_seen {
+                        warn!("sweep '{}' has duplicate weight clauses", name);
+                        return None;
+                    }
+                    weight_seen = true;
+                    weight_policy = self.parse_sweep_weight_clause(&name, &clause_args)?;
+                }
+                other => {
+                    warn!("sweep '{}' contains unknown clause '{}', ignoring it", name, other);
+                }
             }
         }
 
-        if engine_type.is_empty() { None } else { Some((engine_name, engine_type, ops)) }
+        let engine_type = engine_type?;
+        let rule = match (source, sink) {
+            (Some(source), Some(sink)) => Some(SweepRuleSpec { source, sink }),
+            (None, None) => None,
+            _ => {
+                warn!("sweep '{}' must provide both src and sink clauses", name);
+                return None;
+            }
+        };
+
+        Some(SweepSpec { name, engine_type, operations, rule, weight_policy, atom: path.to_vec() })
     }
 
     pub fn sweep(&mut self) -> String {
-        let mut groups: HashMap<String, (String, Vec<(String, Vec<Vec<u8>>)>)> = HashMap::new();
+        let mut parsed: Vec<(Vec<u8>, SweepSpec)> = Vec::new();
+        let mut specs: HashMap<String, SweepSpec> = HashMap::new();
         // We must collect paths to remove first because the zipper `rz` borrows `self.btm`.
         // Mutating `self.btm` while the zipper is alive is not allowed by the borrow checker.
         let mut paths_to_remove: Vec<Vec<u8>> = Vec::new();
@@ -1857,45 +2637,177 @@ impl Space {
             let mut rz = self.btm.read_zipper();
             while rz.to_next_val() {
                 let path = rz.path();
-                if let Some((name, etype, ops)) = Self::parse_sweep_atom(path) {
-                    groups.insert(name.clone(), (etype, ops));
-                    paths_to_remove.push(path.to_vec());
+                if let Some(spec) = self.parse_sweep_atom(path) {
+                    parsed.push((path.to_vec(), spec));
                 }
             }
         }
 
-        if groups.is_empty() { return String::new(); }
+        if parsed.is_empty() { return String::new(); }
 
-        let valid_groups: Vec<(String, (String, Vec<(String, Vec<Vec<u8>>)>))> = groups.into_iter().filter(|(_, (et, _))| {
-            if build_strategy(et).is_none() {
-                warn!("unknown engine type '{}', skipping", et);
-                false
+        for (path, spec) in parsed {
+            if build_strategy(&spec.engine_type).is_none() {
+                warn!("unknown engine type '{}' for sweep '{}', skipping", spec.engine_type, spec.name);
             } else {
-                true
+                paths_to_remove.push(path);
+                specs.insert(spec.name.clone(), spec);
             }
-        }).collect();
+        }
 
-        if valid_groups.is_empty() { return String::new(); }
+        if specs.is_empty() { return String::new(); }
 
-        // Remove the sweep configuration atoms from self.btm so they won't be processed again
+        // Remove valid sweep configuration atoms from self.btm so they won't be processed again.
         for path in &paths_to_remove {
             self.btm.remove(path);
         }
 
+        for spec in specs.values() {
+            self.sweep_specs.insert(spec.name.clone(), spec.clone());
+        }
+
+        let legacy_specs: Vec<SweepSpec> = specs
+            .into_values()
+            .filter(|spec| spec.has_legacy_was_process())
+            .collect();
+
+        if legacy_specs.is_empty() {
+            return "sweep-config".to_string();
+        }
+
         self.was.take_trie(std::mem::take(&mut self.btm));
 
-        for (engine_name, (engine_type, ops)) in &valid_groups {
-            let process = self.was.add_engine(engine_name, engine_type);
-            for (op_type, op_args) in ops {
-                let args_refs: Vec<&[u8]> = op_args.iter().map(|a| &a[..]).collect();
-                if let Some(op) = build_operation(op_type, &args_refs) {
+        for spec in &legacy_specs {
+            let process = self.was.add_engine(&spec.name, &spec.engine_type);
+            for op in &spec.operations {
+                let args_refs: Vec<&[u8]> = op.args.iter().map(|a| &a[..]).collect();
+                if let Some(op) = build_operation(&op.op_type, &args_refs) {
                     process.subscribe(op);
                 } else {
-                    warn!("unknown op type '{}' for engine '{}', skipping", op_type, engine_name);
+                    warn!("unknown op type '{}' for engine '{}', skipping", op.op_type, spec.name);
                 }
             }
         }
         self.was.spawn()
+    }
+
+    fn run_sweep_spec_once(&mut self, spec: SweepSpec) -> Result<(usize, bool), &'static str> {
+        let SweepSpec { engine_type, rule, weight_policy, atom, .. } = spec;
+        let rule = rule.ok_or("sweep has no source/sink rule")?;
+        let mut source = rule.source;
+        let mut sink = rule.sink;
+        let pat_expr = Expr { ptr: source.as_mut_ptr() };
+        let tpl_expr = Expr { ptr: sink.as_mut_ptr() };
+        let (no_source, no_sink) = self.transform_io_flags(pat_expr, tpl_expr)?;
+
+        let mut sweep_atom = atom;
+        let add = Expr { ptr: sweep_atom.as_mut_ptr() };
+
+        Ok(self.transform_multi_multi_io_with_policy(
+            pat_expr,
+            tpl_expr,
+            add,
+            no_source,
+            no_sink,
+            QueryPolicy::WeightedOne {
+                engine: engine_type,
+                weight_policy,
+            },
+        ))
+    }
+
+    pub fn run_sweep_once(&mut self, name: &str) -> Result<(usize, bool), &'static str> {
+        let spec = self
+            .sweep_specs
+            .get(name)
+            .cloned()
+            .ok_or("sweep not found")?;
+
+        let was_paused = self.was.map.is_some();
+        if was_paused {
+            self.btm = self.was.pause_all();
+        }
+
+        let result = self.run_sweep_spec_once(spec);
+
+        if was_paused {
+            let btm = std::mem::take(&mut self.btm);
+            self.was.resume_all(btm);
+        }
+
+        result
+    }
+
+    pub fn run_sweep_cycles(&mut self, cycles: usize) -> Result<(usize, bool), &'static str> {
+        let mut names: Vec<String> = self
+            .sweep_specs
+            .iter()
+            .filter(|(_, spec)| spec.rule.is_some())
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+
+        let was_paused = self.was.map.is_some();
+        if was_paused {
+            self.btm = self.was.pause_all();
+        }
+
+        let result = (|| {
+            let mut touched = 0;
+            let mut any_new = false;
+            for _ in 0..cycles {
+                for name in &names {
+                    let spec = self
+                        .sweep_specs
+                        .get(name)
+                        .cloned()
+                        .ok_or("sweep not found")?;
+                    let (next_touched, next_new) = self.run_sweep_spec_once(spec)?;
+                    touched += next_touched;
+                    any_new |= next_new;
+                }
+            }
+            Ok((touched, any_new))
+        })();
+
+        if was_paused {
+            let btm = std::mem::take(&mut self.btm);
+            self.was.resume_all(btm);
+        }
+
+        result
+    }
+
+    fn metta_calculus_bounded(&mut self, steps: usize) -> usize {
+        if steps == 0 {
+            return 0;
+        }
+
+        let mut performed = 0;
+        self.metta_calculus_scoped(&[], steps, |_| {
+            performed += 1;
+            performed < steps
+        });
+        performed
+    }
+
+    pub fn cycle_scheduler(
+        &mut self,
+        sweep_steps: usize,
+        metta_steps: usize,
+        cycles: usize,
+    ) -> Result<CycleSchedulerStats, &'static str> {
+        let mut stats = CycleSchedulerStats::default();
+        for _ in 0..cycles {
+            if sweep_steps > 0 {
+                let (touched, new) = self.run_sweep_cycles(sweep_steps)?;
+                stats.sweep_steps += sweep_steps;
+                stats.sweep_touched += touched;
+                stats.sweep_new |= new;
+            }
+            stats.metta_steps += self.metta_calculus_bounded(metta_steps);
+            stats.cycles += 1;
+        }
+        Ok(stats)
     }
 
     pub fn metta_calculus(&mut self, steps: usize) -> usize {

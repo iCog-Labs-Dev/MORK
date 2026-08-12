@@ -5,6 +5,7 @@ the broadcast has no replay, so subscribing after a fast transaction loses its e
 """
 
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -15,6 +16,38 @@ from conftest import EXAMPLES_DIR
 TXID_RE = re.compile(r"\btx\d+_[a-z0-9]{8}\b")
 PEANO_FOUR = "(S (S (S (S Z))))"
 RESULT_PATTERN = "[2] petri [3] ! result $"
+MLN_SAMPLED_PATTERN = "[3] was-sampled mln [2] mln-site $"
+MLN_SAMPLED_TEMPLATE = "[3] was-sampled mln [2] mln-site _1"
+
+
+def wait_for_export_line(
+    server: MorkClient,
+    pattern: str,
+    template: str,
+    expected: str,
+    timeout: float = 5.0,
+) -> list[str]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        out = server.export(pattern=pattern, template=template)
+        if expected in out:
+            return out
+        time.sleep(0.05)
+    raise AssertionError(f"timed out waiting for {expected!r}, export={server.export()}")
+
+
+def assert_export_line_absent_for(
+    server: MorkClient,
+    pattern: str,
+    template: str,
+    unexpected: str,
+    duration: float = 0.25,
+) -> None:
+    deadline = time.monotonic() + duration
+    while time.monotonic() < deadline:
+        out = server.export(pattern=pattern, template=template)
+        assert unexpected not in out, f"unexpected {unexpected!r}, export={server.export()}"
+        time.sleep(0.05)
 
 
 def test_adder_end_to_end(server: MorkClient) -> None:
@@ -37,6 +70,95 @@ def test_data_only_transaction(server: MorkClient) -> None:
     out = server.export()
     assert "(parent tom bob)" in out
     assert "(parent bob ann)" in out
+
+
+def test_source_sink_sweep_start_emits_event_atom(server: MorkClient) -> None:
+    server.run(
+        """
+        (mln-site A (# 10))
+        (mln-site B (# 1))
+        (sweep mln
+          (e cpq)
+          (src (, (mln-site $x)))
+          (sink (O (+ (was-sampled mln (mln-site $x))))))
+        """
+    )
+
+    handle = server.sweep_start()
+    assert handle == "sweep-scheduler"
+
+    sampled = wait_for_export_line(
+        server,
+        MLN_SAMPLED_PATTERN,
+        MLN_SAMPLED_TEMPLATE,
+        "(was-sampled mln (mln-site A))",
+    )
+
+    assert "(was-sampled mln (mln-site B))" not in sampled
+    server.sweep_stop()
+
+
+def test_source_sink_sweep_pause_resume_stop_lifecycle(server: MorkClient) -> None:
+    server.run(
+        """
+        (mln-site A (# 10))
+        (sweep mln
+          (e cpq)
+          (src (, (mln-site $x)))
+          (sink (O (+ (was-sampled mln (mln-site $x))))))
+        """
+    )
+
+    assert server.sweep_start() == "sweep-scheduler"
+    assert server.sweep_start() == "sweep-scheduler"
+    wait_for_export_line(
+        server,
+        MLN_SAMPLED_PATTERN,
+        MLN_SAMPLED_TEMPLATE,
+        "(was-sampled mln (mln-site A))",
+    )
+
+    server.sweep_pause()
+    with server.events() as stream:
+        clear = server.run(
+            """
+            (exec clear-sampled
+              (, (was-sampled mln (mln-site $x)))
+              (O (- (was-sampled mln (mln-site $x)))))
+            """
+        )
+        stream.wait_for("quiescent", tx=clear.tx)
+    assert_export_line_absent_for(
+        server,
+        MLN_SAMPLED_PATTERN,
+        MLN_SAMPLED_TEMPLATE,
+        "(was-sampled mln (mln-site A))",
+    )
+
+    server.sweep_resume()
+    wait_for_export_line(
+        server,
+        MLN_SAMPLED_PATTERN,
+        MLN_SAMPLED_TEMPLATE,
+        "(was-sampled mln (mln-site A))",
+    )
+
+    server.sweep_stop()
+    with server.events() as stream:
+        clear = server.run(
+            """
+            (exec clear-sampled
+              (, (was-sampled mln (mln-site $x)))
+              (O (- (was-sampled mln (mln-site $x)))))
+            """
+        )
+        stream.wait_for("quiescent", tx=clear.tx)
+    assert_export_line_absent_for(
+        server,
+        MLN_SAMPLED_PATTERN,
+        MLN_SAMPLED_TEMPLATE,
+        "(was-sampled mln (mln-site A))",
+    )
 
 
 def test_parse_error_is_400(server: MorkClient) -> None:

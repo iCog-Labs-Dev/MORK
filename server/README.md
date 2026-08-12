@@ -23,6 +23,9 @@ cargo +nightly run --release -p mork-server -- --addr 127.0.0.1:8081
 | `--events-buffer` | `4096` | Per-subscriber event buffer; slower clients get `lagged` events instead of back-pressuring the engine |
 | `--step-budget` | `1000000` | Max VM steps one transaction may run; bounds how long a transaction can hold the (sequential) engine |
 | `--budget-action` | `commit` | On budget exhaustion: `commit` keeps partial progress and parks pending execs as `(paused …)` data; `abort` rolls the whole transaction back |
+| `--sweep-steps-per-cycle` | `1` | Source/sink sweep passes per cooperative scheduler cycle |
+| `--sweep-metta-steps` | `32` | Whole-space metta-calculus steps after each weighted sweep batch |
+| `--sweep-idle-ms` | `10` | Backoff when an active source/sink sweep cycle changes nothing |
 | `--data-dir` | *(absent)* | Enable persistence: WAL + crash recovery rooted here. Absent = pure in-memory |
 | `--fsync` | `everysec` | When the log is fsynced: `always` = 200 means on disk (group-committed) · `everysec` = durable within ~1 s (Redis-style; the loss window covers process crash and power failure) · `no` = page cache decides |
 | `--checkpoint-every` | `1024` | Snapshot the space and delete pre-checkpoint log segments every N finished transactions; `0` disables (the log grows unbounded, recovery replays it in full) |
@@ -120,6 +123,25 @@ printf '(exec 0 (, (edge $x $y)) (O (count (edges two) 2 (q $x $y))))' \
 # a "clear this subtree" transaction (replaces a /clear endpoint)
 printf '(exec 0 (, (edge $x $y)) (O (- (edge $x $y))))' \
   | curl -s -X POST --data-binary @- localhost:8081/run
+```
+
+## Sweep Control
+
+`POST /sweep/start` parses registered `(sweep ...)` atoms. Legacy operation sweeps still
+spawn background WAS controllers; source/sink sweeps start a cooperative scheduler on the
+engine thread:
+
+```
+weighted sweep emits event atoms -> bounded metta_calculus steps -> repeat
+```
+
+The lifecycle endpoints are:
+
+```sh
+curl -s -X POST localhost:8081/sweep/start
+curl -s -X POST localhost:8081/sweep/pause
+curl -s -X POST localhost:8081/sweep/resume
+curl -s -X POST localhost:8081/sweep/stop
 ```
 
 ## `GET /events` — Server-Sent Events
