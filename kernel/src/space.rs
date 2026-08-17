@@ -51,6 +51,15 @@ thread_local! {
 /// A 4 GiB allocation is an `mmap` under jemalloc, so allocating one per call cost a
 /// syscall pair plus a re-fault of every page touched. Pooling per thread keeps the
 /// mapping alive between calls; each worker thread gets its own, so nothing is shared.
+///
+/// A buffer handed back by `take()` may hold whatever bytes a previous borrower on
+/// this thread left in it — it is not zeroed between uses. That was already true of
+/// the un-pooled version (`with_capacity` + `set_len` produces unwritten, logically
+/// uninitialized bytes; reading them before writing was UB then too), so this is not
+/// a new obligation. Every call site is already required to only read back what it
+/// itself wrote, tracked by an explicit length (`ez.loc`, `oz.loc`, a prefix length,
+/// or `.clear()` before use as a `Write` sink) — never by scanning for a zero or
+/// sentinel. Keep that discipline for any new call site added to this pool.
 pub(crate) struct Scratch(Option<Vec<u8>>);
 
 impl Scratch {
@@ -60,6 +69,10 @@ impl Scratch {
             .unwrap_or_else(|| Vec::with_capacity(SCRATCH_SIZE));
         // Restore full length: callers slice `&buf[..n]` after writing through a raw
         // pointer, and sites that use the buffer as a `Write` sink leave len at 0.
+        // Safety: `v.capacity() >= SCRATCH_SIZE` on every path here — a freshly
+        // allocated `v` came from `with_capacity(SCRATCH_SIZE)` above, and a pooled
+        // `v` was pushed back by `Drop` at exactly this same capacity (`.clear()`,
+        // the only other mutation a caller performs, never shrinks capacity).
         unsafe { v.set_len(SCRATCH_SIZE) };
         Scratch(Some(v))
     }
