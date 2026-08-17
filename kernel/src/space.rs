@@ -101,7 +101,14 @@ pub struct Space {
     pub mmaps: HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
     pub z3s: HashMap<OwnedSourceItem, Box<Popen>>,
     pub last_merkleize: Instant,
-    pub timing: bool
+    pub timing: bool,
+    /// Ground prefixes of removal patterns executed since this was last drained.
+    /// Filled by the transforms, read by `metta_calculus_scoped`, cleared per step.
+    ///
+    /// A scratch side-channel rather than a return value threaded through
+    /// `interpret` and both transforms — each worker owns its `Space` exclusively,
+    /// so there is no sharing hazard.
+    pub removed_prefixes: Vec<Vec<u8>>,
 }
 
 pub(crate) const SIZES: [u64; 4] = {
@@ -510,11 +517,26 @@ pub struct StepInfo<'e> {
     pub new: bool,
     pub micros: u64,
     pub error: Option<&'static str>,
+    /// Ground prefixes of the removal patterns this step executed; empty for steps
+    /// that only added. Used for phantom detection at commit time.
+    pub remove_prefixes: &'e [Vec<u8>],
 }
 
 impl Space {
     pub fn new() -> Self {
-        Self { btm: PathMap::new(), sm: SharedMapping::new(), mmaps: HashMap::new(), z3s: HashMap::new(), last_merkleize: Instant::now(), timing: false }
+        Self { btm: PathMap::new(), sm: SharedMapping::new(), mmaps: HashMap::new(), z3s: HashMap::new(),
+               last_merkleize: Instant::now(), timing: false, removed_prefixes: Vec::new() }
+    }
+
+    /// A `Space` over an existing trie and an existing (shared) symbol table.
+    ///
+    /// This is how a worker thread gets a `Space`: `Space` is `!Send`, but `PathMap`
+    /// and `SharedMappingHandle` are both `Send + Sync`, so the worker builds the
+    /// `Space` locally around values handed to it. Using `new()` and overwriting the
+    /// fields would mint and immediately discard a fresh `SharedMapping`.
+    pub fn with(btm: PathMap<()>, sm: SharedMappingHandle) -> Self {
+        Self { btm, sm, mmaps: HashMap::new(), z3s: HashMap::new(),
+               last_merkleize: Instant::now(), timing: false, removed_prefixes: Vec::new() }
     }
 
     pub fn parse_sexpr(&mut self, r: &[u8], buf: *mut u8) -> Result<(Expr, usize), ParserError> {
@@ -1563,6 +1585,13 @@ impl Space {
         let mut template_prefixes: Vec<_> = sinks.iter().map(|sink|
             sink.request().next().unwrap()
         ).collect();
+        for (i, s) in sinks.iter().enumerate() {
+            if let ASink::RemoveSink(_) = s {
+                if let WriteResourceRequest::BTM(p) = template_prefixes[i] {
+                    self.removed_prefixes.push(p.to_vec());
+                }
+            }
+        }
         let mut subsumption = Self::prefix_subsumption_resources(&template_prefixes[..]);
         let mut placements = subsumption.clone();
         let mut read_copy = self.btm.clone();
@@ -1649,6 +1678,13 @@ impl Space {
         let mut template_prefixes: Vec<_> = sinks.iter().map(|sink|
             sink.request().next().unwrap()
         ).collect();
+        for (i, s) in sinks.iter().enumerate() {
+            if let ASink::RemoveSink(_) = s {
+                if let WriteResourceRequest::BTM(p) = template_prefixes[i] {
+                    self.removed_prefixes.push(p.to_vec());
+                }
+            }
+        }
         let mut subsumption = Self::prefix_subsumption_resources(&template_prefixes[..]);
         let mut placements = subsumption.clone();
         let mut read_copy = self.btm.clone();
@@ -1790,6 +1826,7 @@ impl Space {
                 self.btm.remove(&x[..]);
                 let mut xe = Expr{ ptr: x.as_mut_ptr() };
                 let start = Instant::now();
+                self.removed_prefixes.clear();
                 let (touched, new, error) = match self.interpret(xe) {
                     Ok((touched, new)) => (touched, new, None),
                     Err(e) => { debug!(target: "interpret", "not interpreting: {}", e); (0, false, Some(e)) }
@@ -1804,7 +1841,10 @@ impl Space {
                     trace!(target: "interpret", "interpret took {} ns", start_str);
                 }
                 let micros = start.elapsed().as_micros() as u64;
-                let cont = on_step(StepInfo { exec: &x[..], touched, new, micros, error });
+                let removed = core::mem::take(&mut self.removed_prefixes);
+                let cont = on_step(StepInfo { exec: &x[..], touched, new, micros, error,
+                                              remove_prefixes: &removed[..] });
+                self.removed_prefixes = removed;
                 done < steps && cont
             } else {
                 false
@@ -1907,5 +1947,49 @@ mod scratch_tests {
         }
         let b = Scratch::take();
         assert_eq!(b.len(), super::SCRATCH_SIZE);
+    }
+}
+
+#[cfg(test)]
+mod remove_prefix_tests {
+    use crate::space::Space;
+
+    /// A removing exec must report the ground prefix of its removal pattern.
+    #[test]
+    fn removing_exec_reports_its_ground_prefix() {
+        let mut s = Space::new();
+        s.add_all_sexpr(b"(edge a b)\n(edge a c)\n").unwrap();
+        // `,` pattern, `O` template with a `-` sink => transform_multi_multi_o => RemoveSink
+        s.add_all_sexpr(b"(exec 0 (, (edge $x $y)) (O (- (edge $x $y))))\n").unwrap();
+
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        s.metta_calculus_scoped(&[], 1, |info| {
+            seen.extend_from_slice(info.remove_prefixes);
+            true
+        });
+
+        assert!(!seen.is_empty(), "a RemoveSink step must report a prefix");
+        // The prefix is the ground head of `(edge $x $y)` — arity byte, then `edge`.
+        assert!(
+            seen.iter().any(|p| p.windows(4).any(|w| w == b"edge")),
+            "expected a prefix covering `edge`, got {seen:?}"
+        );
+    }
+
+    /// A purely additive exec must report nothing — otherwise every transaction
+    /// would look like it removed by a pattern and validation would over-abort.
+    #[test]
+    fn adding_exec_reports_no_prefix() {
+        let mut s = Space::new();
+        s.add_all_sexpr(b"(edge a b)\n").unwrap();
+        s.add_all_sexpr(b"(exec 0 (, (edge $x $y)) (O (+ (rev $y $x))))\n").unwrap();
+
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        s.metta_calculus_scoped(&[], 1, |info| {
+            seen.extend_from_slice(info.remove_prefixes);
+            true
+        });
+
+        assert!(seen.is_empty(), "an AddSink step must report no prefixes, got {seen:?}");
     }
 }
