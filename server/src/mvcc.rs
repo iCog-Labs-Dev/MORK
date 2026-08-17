@@ -46,6 +46,7 @@ use std::collections::VecDeque;
 
 /// One committed transaction's effect, retained only long enough for every
 /// still-running transaction older than it to validate against it (see `gc`).
+#[derive(Debug)]
 pub struct CommitRecord {
     pub version: u64,
     pub added: PathMap<()>,
@@ -59,7 +60,8 @@ pub struct CommitRecord {
 pub enum Conflict {
     /// A path this transaction added was removed by a concurrent one, or vice versa.
     WriteWrite,
-    /// A pattern-scoped removal raced an insertion that would have matched it.
+    /// A pattern-scoped removal on one side raced a concurrent insertion under the
+    /// same ground prefix, on either side.
     Phantom,
 }
 
@@ -67,13 +69,13 @@ impl Conflict {
     pub fn reason(&self) -> &'static str {
         match self {
             Conflict::WriteWrite => "conflict: a path this transaction wrote was concurrently written",
-            Conflict::Phantom => "phantom: a concurrent transaction wrote under a pattern this transaction removed by",
+            Conflict::Phantom => "phantom: a pattern-scoped removal raced a concurrent insertion under the same prefix",
         }
     }
 }
 
-/// Backward validation (paper §3): check this transaction's writeset against every
-/// transaction that committed after it started.
+/// Backward validation: check this transaction's writeset against every transaction
+/// that committed after it started.
 ///
 /// Four checks, and the two that are *absent* are as important as the two present:
 /// both transactions adding the same path is not a conflict, and both removing it is
@@ -82,13 +84,25 @@ impl Conflict {
 /// combination (checked in both directions via `meet`) is a write-write conflict.
 ///
 /// The prefix checks over-approximate: every path a pattern can match lies under its
-/// ground prefix, so a spurious abort is possible but a missed conflict is not.
+/// ground prefix, so a spurious abort is possible but a missed conflict is not. That
+/// soundness only holds if `remove_prefixes` actually names one ground prefix per
+/// removal pattern this transaction executed, each a genuine prefix of everything the
+/// pattern can match — a caller that omits a prefix, or supplies one narrower than the
+/// pattern, produces a silent **missed** conflict, not a spurious abort. The same is
+/// true of each `CommitRecord.remove_prefixes` this function reads from `history`.
 ///
 /// An empty prefix in `remove_prefixes` is a ground prefix over the whole space, so it
 /// conflicts with any non-empty concurrent writeset — this is not filtered out here,
 /// since a kernel that ever emits one has a bug that should surface, not be hidden.
 ///
-/// Callers must hold every record newer than `base_version`; `gc` maintains that.
+/// Callers must hold every record newer than `base_version`; `gc` maintains that. The
+/// assertion below only catches part of that precondition: it fires when the front of
+/// `history` is too new, i.e. a live transaction's base was trimmed past. It does
+/// *not* fire if `history` was trimmed all the way to empty while this transaction's
+/// base is still live, and it cannot detect a hole trimmed out of the middle of the
+/// deque — both would make `validate` silently miss real conflicts. The complete
+/// invariant needs the engine's current version alongside `history`, which this
+/// function does not have; it belongs to the caller that owns the version counter.
 pub fn validate(
     ws: &WriteSet,
     remove_prefixes: &[Vec<u8>],
@@ -97,7 +111,10 @@ pub fn validate(
 ) -> Result<(), Conflict> {
     debug_assert!(
         history.front().map_or(true, |c| c.version <= base_version + 1),
-        "history was trimmed past a live transaction's base — validation would miss conflicts"
+        "history's front is newer than this transaction's base plus one — a live \
+         transaction's base was trimmed past. NOTE: this does not catch history being \
+         trimmed to empty, or a hole trimmed from the middle; only the caller that \
+         owns the version counter can check the complete invariant."
     );
 
     for c in history.iter().filter(|c| c.version > base_version) {
@@ -198,6 +215,18 @@ mod tests {
     #[test]
     fn sibling_paths_under_a_shared_prefix_do_not_conflict() {
         let h = hist(vec![record(2, &[b"edge/a/c"], &[], &[])]);
+        let mine = ws(&[b"edge/a/b"], &[]);
+        assert!(validate(&mine, &[], 1, &h).is_ok());
+    }
+
+    #[test]
+    fn sibling_paths_do_not_conflict_when_both_writesets_are_non_empty() {
+        // Every other non-conflict test has an empty map on one side of the `meet`,
+        // so this pins the case where both sides actually hold a value and the
+        // sibling-prefix rationale ("edge/a/b" vs "edge/a/c" share a path prefix but
+        // are still unrelated paths) is exercised by a real intersection, not just by
+        // one side being trivially empty.
+        let h = hist(vec![record(2, &[], &[b"edge/a/c"], &[])]);
         let mine = ws(&[b"edge/a/b"], &[]);
         assert!(validate(&mine, &[], 1, &h).is_ok());
     }
