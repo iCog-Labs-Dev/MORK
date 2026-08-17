@@ -35,6 +35,53 @@ pub static writes: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 pub static ACT_PATH: &'static str = "/dev/shm/";
 // pub static ACT_PATH: &'static str = "/mnt/data/";
 
+/// Size of a scratch buffer. Callers write encoded expressions through raw pointers
+/// and slice the result, so this is the hard ceiling on one expression's byte length.
+/// Unchanged from the original per-call allocations — only the lifetime changed.
+pub(crate) const SCRATCH_SIZE: usize = 1 << 32;
+
+thread_local! {
+    /// Buffers returned by dropped `Scratch` handles, ready to be handed out again.
+    static SCRATCH_POOL: core::cell::RefCell<Vec<Vec<u8>>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// A `SCRATCH_SIZE` byte buffer borrowed from a per-thread pool, returned on drop.
+///
+/// A 4 GiB allocation is an `mmap` under jemalloc, so allocating one per call cost a
+/// syscall pair plus a re-fault of every page touched. Pooling per thread keeps the
+/// mapping alive between calls; each worker thread gets its own, so nothing is shared.
+pub(crate) struct Scratch(Option<Vec<u8>>);
+
+impl Scratch {
+    pub(crate) fn take() -> Self {
+        let mut v = SCRATCH_POOL
+            .with(|p| p.borrow_mut().pop())
+            .unwrap_or_else(|| Vec::with_capacity(SCRATCH_SIZE));
+        // Restore full length: callers slice `&buf[..n]` after writing through a raw
+        // pointer, and sites that use the buffer as a `Write` sink leave len at 0.
+        unsafe { v.set_len(SCRATCH_SIZE) };
+        Scratch(Some(v))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Some(v) = self.0.take() {
+            SCRATCH_POOL.with(|p| p.borrow_mut().push(v));
+        }
+    }
+}
+
+impl core::ops::Deref for Scratch {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> { self.0.as_ref().unwrap() }
+}
+
+impl core::ops::DerefMut for Scratch {
+    fn deref_mut(&mut self) -> &mut Vec<u8> { self.0.as_mut().unwrap() }
+}
+
 pub struct Space {
     pub btm: PathMap<()>,
     pub sm: SharedMappingHandle,
@@ -845,8 +892,7 @@ impl Space {
     pub fn add_all_sexpr(&mut self, r: &[u8]) -> Result<usize, String> { self.load_all_sexpr_impl(r, true) }
     pub fn remove_all_sexpr(&mut self, r: &[u8]) -> Result<usize, String> { self.load_all_sexpr_impl(r, false) }
     pub fn load_all_sexpr_impl(&mut self, r: &[u8], add: bool) -> Result<usize, String> {
-        let mut stack = Vec::with_capacity(1 << 32);
-        unsafe { stack.set_len(1 << 32); }
+        let mut stack = Scratch::take();
         let mut it = Context::new(r);
         let mut i = 0;
         let mut parser = ParDataParser::new(&self.sm);
@@ -872,10 +918,8 @@ impl Space {
     pub fn load_sexpr_impl(&mut self, r: &[u8], pattern: Expr, template: Expr, add: bool) -> Result<usize, String> {
         let constant_template_prefix = unsafe { template.prefix().unwrap_or_else(|_| template.span()).as_ref().unwrap() };
         let mut wz = self.btm.write_zipper_at_path(constant_template_prefix);
-        let mut buffer: Vec<u8> = Vec::with_capacity(1 << 32);
-        unsafe { buffer.set_len(1 << 32); }
-        let mut stack = Vec::with_capacity(1 << 32);
-        unsafe { stack.set_len(1 << 32); }
+        let mut buffer = Scratch::take();
+        let mut stack = Scratch::take();
         let mut it = Context::new(r);
         let mut i = 0;
         let mut parser = ParDataParser::new(&self.sm);
@@ -938,8 +982,7 @@ impl Space {
     pub fn dump_sexpr_from<W : Write>(btm: &PathMap<()>, sm: &SharedMappingHandle, pattern: Expr, template: Expr, w: &mut W) -> usize {
         let constant_template_prefix = unsafe { template.prefix().unwrap_or_else(|_| template.span()).as_ref().unwrap() };
 
-        let mut buffer = Vec::with_capacity(1 << 32);
-        unsafe { buffer.set_len(1 << 32); }
+        let mut buffer = Scratch::take();
         let mut pat = vec![item_byte(Tag::Arity(2)), item_byte(Tag::SymbolSize(1)), b','];
         pat.extend_from_slice(unsafe { pattern.span().as_ref().unwrap() });
 
@@ -954,13 +997,13 @@ impl Space {
                 }
                 Err(ref bindings) => {
                     buffer.clear();
-
-                    let (oi, ni, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0, pattern, bindings, buffer, stack, assignments)
+                    let mut buf = &mut *buffer;
+                    let (oi, ni, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0, pattern, bindings, buf, stack, assignments)
                     else { break 'query true};
 
                     buffer.clear();
-
-                    let (_,_,true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni, template, bindings, buffer, stack, assignments)
+                    let mut buf = &mut *buffer;
+                    let (_,_,true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni, template, bindings, buf, stack, assignments)
                     else { break 'query true;};
                 }
             }
@@ -1349,8 +1392,7 @@ impl Space {
 
     #[cfg(feature="specialize_io")]
     pub fn transform_multi_multi_(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr) -> (usize, bool) {
-        let mut buffer = Vec::with_capacity(1 << 32);
-        unsafe { buffer.set_len(1 << 32); }
+        let mut buffer = Scratch::take();
         let mut tpl_args = Vec::with_capacity(64);
         ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
         let mut templates: Vec<_> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
@@ -1404,7 +1446,8 @@ impl Space {
 
 
                         buffer.clear();
-                        let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue 'writes; };
+                        let mut buf = &mut *buffer;
+                        let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buf,astack,ass) else { continue 'writes; };
                         oi = toi;
 
 
@@ -1424,8 +1467,7 @@ impl Space {
 
     #[cfg(feature="specialize_io")]
     pub fn transform_multi_multi_i(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr) -> (usize, bool) {
-        let mut buffer = Vec::with_capacity(1 << 32);
-        unsafe { buffer.set_len(1 << 32); }
+        let mut buffer = Scratch::take();
         let mut tpl_args = Vec::with_capacity(64);
         ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
         let mut templates: Vec<_> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
@@ -1478,7 +1520,8 @@ impl Space {
                         trace!(target: "transform", "{i} template {} @ ({oi} {ni})", serialize(unsafe { template.span().as_ref().unwrap()}));
 
                         buffer.clear();
-                        let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue 'writes; };
+                        let mut buf = &mut *buffer;
+                        let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buf,astack,ass) else { continue 'writes; };
                         oi = toi;
 
 
@@ -1499,8 +1542,7 @@ impl Space {
     #[cfg(feature="specialize_io")]
     pub fn transform_multi_multi_o(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr) -> (usize, bool) {
         use crate::sinks::*;
-        let mut buffer = Vec::with_capacity(1 << 32);
-        unsafe { buffer.set_len(1 << 32); }
+        let mut buffer = Scratch::take();
         let mut tpl_args = Vec::with_capacity(64);
         ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
         let mut templates: Vec<_> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
@@ -1561,7 +1603,8 @@ impl Space {
                         trace!(target: "transform", "{i} template {} @ ({oi} {ni})", serialize(unsafe { template.span().as_ref().unwrap()}));
 
                         buffer.clear();
-                        let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue 'writes; };
+                        let mut buf = &mut *buffer;
+                        let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buf,astack,ass) else { continue 'writes; };
                         oi = toi;
 
                         trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
@@ -1585,8 +1628,7 @@ impl Space {
 
     pub fn transform_multi_multi_io(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr, no_source: bool, no_sink: bool) -> (usize, bool) {
         use crate::sinks::*;
-        let mut buffer = Vec::with_capacity(1 << 32);
-        unsafe { buffer.set_len(1 << 32); }
+        let mut buffer = Scratch::take();
         let mut tpl_args = Vec::with_capacity(64);
         ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
         let mut templates: Vec<_> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
@@ -1647,7 +1689,8 @@ impl Space {
                         trace!(target: "transform", "{i} template {} @ ({oi} {ni})", serialize(unsafe { template.span().as_ref().unwrap()}));
 
                         buffer.clear();
-                        let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue 'writes; };
+                        let mut buf = &mut *buffer;
+                        let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buf,astack,ass) else { continue 'writes; };
 
                         trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
                         sinks[i].sink(std::iter::once(wz), &buffer[..]);
@@ -1817,5 +1860,39 @@ impl Drop for Space {
             // z3.terminate();
             drop(z3.stdin.take())
         }
+    }
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::Scratch;
+
+    #[test]
+    fn scratch_is_full_length_and_recycled() {
+        // A fresh buffer must be fully addressable: callers write through a raw
+        // pointer and then slice `&buf[..n]`, which requires len == SCRATCH_SIZE.
+        let ptr = {
+            let mut a = Scratch::take();
+            assert_eq!(a.len(), super::SCRATCH_SIZE);
+            a[0] = 7;
+            a.as_ptr()
+        }; // dropped -> returned to the pool
+
+        let b = Scratch::take();
+        assert_eq!(b.len(), super::SCRATCH_SIZE, "len must be restored on take");
+        assert_eq!(b.as_ptr(), ptr, "the same allocation must be reused, not remalloc'd");
+    }
+
+    #[test]
+    fn cleared_buffer_is_restored_on_next_take() {
+        // Sites that use the buffer as a `Write` sink call `.clear()`, which sets
+        // len to 0. The pool must not hand that back to a raw-pointer site.
+        {
+            let mut a = Scratch::take();
+            a.clear();
+            assert_eq!(a.len(), 0);
+        }
+        let b = Scratch::take();
+        assert_eq!(b.len(), super::SCRATCH_SIZE);
     }
 }
