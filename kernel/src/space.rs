@@ -25,7 +25,7 @@ use mork_frontend::json_parser::Transcriber;
 use log::*;
 use subprocess::{Popen, PopenConfig, Redirection};
 use subprocess::unix::PopenExt;
-use crate::sinks::{WriteResource, WriteResourceRequest};
+use crate::sinks::{ASink, WriteResource, WriteResourceRequest};
 use crate::sources::{AFactor, Resource, ResourceRequest};
 
 pub static transitions: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1574,6 +1574,21 @@ impl Space {
         (touched, any_new)
     }
 
+    /// Records the ground prefix of every `RemoveSink` among `sinks` into
+    /// `self.removed_prefixes`, for phantom detection at commit time.
+    ///
+    /// Shared by `transform_multi_multi_o` and `transform_multi_multi_io` — the only
+    /// two transforms that construct `ASink`s and can therefore remove anything.
+    fn collect_removed_prefixes(&mut self, sinks: &[ASink], template_prefixes: &[WriteResourceRequest]) {
+        for (i, s) in sinks.iter().enumerate() {
+            if let ASink::RemoveSink(_) = s {
+                if let WriteResourceRequest::BTM(p) = template_prefixes[i] {
+                    self.removed_prefixes.push(p.to_vec());
+                }
+            }
+        }
+    }
+
     #[cfg(feature="specialize_io")]
     pub fn transform_multi_multi_o(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr) -> (usize, bool) {
         use crate::sinks::*;
@@ -1585,13 +1600,7 @@ impl Space {
         let mut template_prefixes: Vec<_> = sinks.iter().map(|sink|
             sink.request().next().unwrap()
         ).collect();
-        for (i, s) in sinks.iter().enumerate() {
-            if let ASink::RemoveSink(_) = s {
-                if let WriteResourceRequest::BTM(p) = template_prefixes[i] {
-                    self.removed_prefixes.push(p.to_vec());
-                }
-            }
-        }
+        self.collect_removed_prefixes(&sinks, &template_prefixes);
         let mut subsumption = Self::prefix_subsumption_resources(&template_prefixes[..]);
         let mut placements = subsumption.clone();
         let mut read_copy = self.btm.clone();
@@ -1678,13 +1687,7 @@ impl Space {
         let mut template_prefixes: Vec<_> = sinks.iter().map(|sink|
             sink.request().next().unwrap()
         ).collect();
-        for (i, s) in sinks.iter().enumerate() {
-            if let ASink::RemoveSink(_) = s {
-                if let WriteResourceRequest::BTM(p) = template_prefixes[i] {
-                    self.removed_prefixes.push(p.to_vec());
-                }
-            }
-        }
+        self.collect_removed_prefixes(&sinks, &template_prefixes);
         let mut subsumption = Self::prefix_subsumption_resources(&template_prefixes[..]);
         let mut placements = subsumption.clone();
         let mut read_copy = self.btm.clone();
@@ -1976,6 +1979,33 @@ mod remove_prefix_tests {
         );
     }
 
+    /// Same as `removing_exec_reports_its_ground_prefix`, but through the `I`/`O`
+    /// path (`transform_multi_multi_io`) rather than `,`/`O` (`transform_multi_multi_o`).
+    /// The collection block is duplicated across both transforms (via
+    /// `Space::collect_removed_prefixes`), and only this test exercises the `_io` copy.
+    #[test]
+    fn removing_via_io_reports_its_ground_prefix() {
+        let mut s = Space::new();
+        s.add_all_sexpr(b"(edge a b)\n(edge a c)\n").unwrap();
+        // `I (BTM ...)` pattern, `O` template with a `-` sink => transform_multi_multi_io => RemoveSink
+        s.add_all_sexpr(b"(exec 0 (I (BTM (edge $x $y))) (O (- (edge $x $y))))\n").unwrap();
+
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut touched_total = 0usize;
+        s.metta_calculus_scoped(&[], 1, |info| {
+            seen.extend_from_slice(info.remove_prefixes);
+            touched_total += info.touched;
+            true
+        });
+
+        assert!(touched_total > 0, "the exec must actually have matched something");
+        assert!(!seen.is_empty(), "a RemoveSink step must report a prefix");
+        assert!(
+            seen.iter().any(|p| p.windows(4).any(|w| w == b"edge")),
+            "expected a prefix covering `edge`, got {seen:?}"
+        );
+    }
+
     /// A purely additive exec must report nothing — otherwise every transaction
     /// would look like it removed by a pattern and validation would over-abort.
     #[test]
@@ -1985,11 +2015,14 @@ mod remove_prefix_tests {
         s.add_all_sexpr(b"(exec 0 (, (edge $x $y)) (O (+ (rev $y $x))))\n").unwrap();
 
         let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut touched_total = 0usize;
         s.metta_calculus_scoped(&[], 1, |info| {
             seen.extend_from_slice(info.remove_prefixes);
+            touched_total += info.touched;
             true
         });
 
+        assert!(touched_total > 0, "the exec must actually have matched something, otherwise an empty `seen` proves nothing");
         assert!(seen.is_empty(), "an AddSink step must report no prefixes, got {seen:?}");
     }
 }
