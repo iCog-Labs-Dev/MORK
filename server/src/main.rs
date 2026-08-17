@@ -8,6 +8,7 @@
 mod engine;
 mod events;
 mod http;
+mod mvcc;
 mod read;
 mod transaction;
 mod wal;
