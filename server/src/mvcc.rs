@@ -465,4 +465,17 @@ mod tests {
         c.end(old);
         assert!(c.history.is_empty());
     }
+
+    #[test]
+    fn gc_watermark_is_the_minimum_not_the_maximum_of_multiple_live_bases() {
+        let mut c = Committed::new(map(&[]), 0);
+        let old = c.begin();                          // base 0
+        c.install(ws(&[b"x"], &[]), vec![]);           // -> 1
+        let _mid = c.begin();                          // base 1
+        c.install(ws(&[b"y"], &[]), vec![]);           // -> 2
+        let young = c.begin();                         // base 2
+        c.end(young);                                  // active_bases now {0:1, 1:1} — two keys, genuinely
+        assert_eq!(old, 0);
+        assert_eq!(c.history.len(), 2, "watermark must be 0 (min), not 1 (max)");
+    }
 }
