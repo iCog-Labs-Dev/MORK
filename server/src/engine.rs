@@ -130,6 +130,12 @@ fn run(
 
     let mut in_flight: usize = 0;
     let mut finished: u64 = 0;
+    // The next `finished` count a checkpoint is due at. Distinct from "checkpoint every
+    // Nth commit" (an exact-multiple test) because a due checkpoint can be deferred
+    // while transactions are in flight (see `maybe_checkpoint`) — this must stay due
+    // across any number of skipped commits until one actually succeeds, or a
+    // permanently busy server would silently never checkpoint again after its first skip.
+    let mut next_checkpoint = cfg.checkpoint_every;
     loop {
         // Prefer draining finished work: it frees a worker and advances the version.
         match res_rx.try_recv() {
@@ -137,7 +143,7 @@ fn run(
                 commit(&mut committed, &mut bases, r, &sm, &snap_tx, &events, &active, wal);
                 in_flight -= 1;
                 finished += 1;
-                maybe_checkpoint(&committed, finished, &cfg, wal);
+                maybe_checkpoint(&committed, finished, &cfg, wal, &mut next_checkpoint);
                 continue;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
@@ -171,7 +177,7 @@ fn run(
                     commit(&mut committed, &mut bases, r, &sm, &snap_tx, &events, &active, wal);
                     in_flight -= 1;
                     finished += 1;
-                    maybe_checkpoint(&committed, finished, &cfg, wal);
+                    maybe_checkpoint(&committed, finished, &cfg, wal, &mut next_checkpoint);
                 }
                 Err(_) => break,
             }
@@ -234,8 +240,11 @@ fn recover(dir: &Path, cfg: &EngineConfig, sm: &SharedMappingHandle) -> io::Resu
     }
 
     let mut committed = mvcc::Committed::new(btm, version);
-    // Every base a not-yet-replayed record still refers to. Bounded in practice by the
-    // checkpoint interval (log tails are short), and each entry is an O(1) COW clone.
+    // Every base a not-yet-replayed record still refers to, keyed by committed version;
+    // each entry is an O(1) COW clone. Under a nonzero `--checkpoint-every` this is small
+    // (one entry per version since the last checkpoint), but `--checkpoint-every 0` is a
+    // documented, supported setting under which the log is never truncated — in that case
+    // this map holds one clone per version in the ENTIRE log. No pruning: out of scope.
     let mut snapshots: HashMap<u64, PathMap<()>> = HashMap::new();
     snapshots.insert(committed.version, committed.btm.clone());
 
@@ -243,7 +252,12 @@ fn recover(dir: &Path, cfg: &EngineConfig, sm: &SharedMappingHandle) -> io::Resu
     let n_recs = recs.len();
     for rec in recs {
         let OwnedRec::Commit { id, base_version, source, steps, version: logged } = rec;
-        max_tx = max_tx.max(txid_count(&id).unwrap_or(0));
+        // An unparsable id can only come from a foreign or corrupt log; treating it as 0
+        // (rather than erroring) would restore the tx counter too low, i.e. the exact
+        // txid collision `txid_count` exists to prevent — so this is a hard error too.
+        max_tx = max_tx.max(txid_count(&id).ok_or_else(|| {
+            io::Error::other(format!("replay of {id}: not a valid tx<n>_… id"))
+        })?);
 
         let base = snapshots.get(&base_version).cloned().ok_or_else(|| {
             io::Error::other(format!(
@@ -259,7 +273,12 @@ fn recover(dir: &Path, cfg: &EngineConfig, sm: &SharedMappingHandle) -> io::Resu
         let parts = worker::run_one(id.clone(), base.clone(), source, sm.clone(), cfg.step_budget, cfg.budget_action);
 
         if let worker::WorkerOutcome::Failed(e) = parts.outcome {
-            return Err(io::Error::other(format!("replay of {id} failed (determinism broken?): {e}")));
+            return Err(io::Error::other(format!(
+                "replay of {id} failed (determinism broken?): {e}. If you changed \
+                 --budget-action since this log was written, that is a likely cause: a \
+                 transaction that originally committed by parking under `commit` can fail \
+                 outright when replayed under `abort`.",
+            )));
         }
         // WorkerOutcome::Budget is a legitimate replay outcome only if the original run
         // also stopped at the budget, which the step-count check right below already
@@ -379,11 +398,41 @@ fn commit(
 }
 
 /// Every `checkpoint_every` finished transactions, hand the WAL an O(1) COW clone of the
-/// trie to persist. Currently inert (`wal` is always `None` in this task) but kept in
-/// the shape the persistence rework will reactivate.
-fn maybe_checkpoint(committed: &mvcc::Committed, finished: u64, cfg: &EngineConfig, wal: Option<&Wal>) {
+/// trie to persist.
+///
+/// Gated on nothing being in flight (`committed.active_bases.is_empty()`): a still-running
+/// transaction was dispatched at some earlier version, so its eventual commit record will
+/// carry a `base_version` older than this checkpoint. `Wal::checkpoint`'s rotation GCs
+/// every segment before the fresh one, which is exactly where that record's base would
+/// have lived — so checkpointing out from under an in-flight transaction deletes the log
+/// window `recover` needs for it, and recovery then fails with "base version ... is not in
+/// the log window" forever (the data directory is bricked, not transiently unavailable).
+/// With `active_bases` empty, every record already on disk has `base_version <=
+/// committed.version`, and this checkpoint's trie already reflects all of those — so GC'ing
+/// their segments is safe.
+///
+/// `*next_checkpoint` is a due-flag, not an exact-multiple test: a checkpoint deferred by
+/// the in-flight gate (or by one already writing) must stay due and be retried on every
+/// subsequent commit, advancing only once one actually succeeds — otherwise a server that's
+/// rarely idle would skip its schedule and never retry until a full `checkpoint_every`
+/// later, growing the log without bound under sustained load.
+fn maybe_checkpoint(
+    committed: &mvcc::Committed,
+    finished: u64,
+    cfg: &EngineConfig,
+    wal: Option<&Wal>,
+    next_checkpoint: &mut u64,
+) {
     let Some(w) = wal else { return };
-    if cfg.checkpoint_every == 0 || !finished.is_multiple_of(cfg.checkpoint_every) {
+    if cfg.checkpoint_every == 0 || finished < *next_checkpoint {
+        return;
+    }
+    if !committed.active_bases.is_empty() {
+        log::info!(
+            "checkpoint at version {} deferred: a transaction dispatched at an earlier \
+             version is still in flight; will retry on the next commit",
+            committed.version
+        );
         return;
     }
     let btm = committed.btm.clone();
@@ -395,7 +444,9 @@ fn maybe_checkpoint(committed: &mvcc::Committed, finished: u64, cfg: &EngineConf
             pathmap::paths_serialization::serialize_paths(btm.read_zipper(), &mut { out }).map(|_| ())
         }),
     );
-    if !accepted {
+    if accepted {
+        *next_checkpoint = finished + cfg.checkpoint_every;
+    } else {
         log::info!("checkpoint at version {} skipped: previous one still writing", committed.version);
     }
 }
@@ -514,4 +565,106 @@ pub fn exec_to_text(bytes: &[u8], sm: &SharedMappingHandle) -> String {
         s.pop();
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "mork-engine-test-{name}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn test_cfg(checkpoint_every: u64) -> EngineConfig {
+        EngineConfig {
+            step_budget: 1_000_000,
+            budget_action: BudgetAction::Commit,
+            data_dir: None,
+            fsync: FsyncPolicy::Always,
+            checkpoint_every,
+            tx_counter: Arc::new(AtomicU64::new(0)),
+            workers: std::num::NonZeroUsize::new(1).unwrap(),
+        }
+    }
+
+    /// Regression for the checkpoint/recovery interaction found in review: a checkpoint
+    /// that fires while an older-based transaction is still in flight would GC the exact
+    /// log segment `recover` needs to resolve that transaction's eventual commit record,
+    /// bricking the data directory permanently. This calls `maybe_checkpoint` directly —
+    /// deterministic and instant, unlike trying to force two real HTTP-dispatched
+    /// transactions to genuinely overlap under the committer's polling loop, which is a
+    /// timing race this test suite already documents elsewhere as unforceable from
+    /// outside the process (see `test_concurrent_conflict_one_transaction_aborts` in
+    /// `test_e2e.py`).
+    #[test]
+    fn checkpoint_is_deferred_while_a_transaction_is_in_flight_and_proceeds_once_it_ends() {
+        let dir = tmpdir("defer");
+        let cfg = test_cfg(1);
+        let mut committed = mvcc::Committed::new(PathMap::new(), 0);
+        let base = committed.begin(); // simulates a transaction dispatched and still running
+        let mut next_checkpoint = 1u64;
+
+        {
+            let wal = Wal::open(&dir, FsyncPolicy::Always).unwrap();
+
+            maybe_checkpoint(&committed, 1, &cfg, Some(&wal), &mut next_checkpoint);
+            assert!(
+                CkptMeta::load(&dir).unwrap().is_none(),
+                "a checkpoint must not install while a transaction is in flight"
+            );
+            assert_eq!(next_checkpoint, 1, "a deferred checkpoint must stay due, not advance");
+
+            committed.end(base); // the in-flight transaction finishes; nothing left running
+            maybe_checkpoint(&committed, 1, &cfg, Some(&wal), &mut next_checkpoint);
+            assert_eq!(
+                next_checkpoint,
+                1 + cfg.checkpoint_every,
+                "the due-flag advances once a checkpoint is actually accepted"
+            );
+            wal.shutdown(); // drains + joins: the async install is complete once this returns
+        }
+        assert!(
+            CkptMeta::load(&dir).unwrap().is_some(),
+            "the checkpoint must proceed once nothing is in flight"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Without the due-flag, a deferred checkpoint would only be retried on the next
+    /// exact multiple of `checkpoint_every` — under sustained load (where something is
+    /// almost always in flight) that means skipping potentially forever. `next_checkpoint`
+    /// must instead stay due across any number of "still in flight" and "previous
+    /// checkpoint still writing" skips, and only move once one truly succeeds.
+    #[test]
+    fn deferred_checkpoint_stays_due_across_multiple_skips() {
+        let dir = tmpdir("stays-due");
+        let cfg = test_cfg(10);
+        let mut committed = mvcc::Committed::new(PathMap::new(), 0);
+        let base = committed.begin();
+        let mut next_checkpoint = 10u64;
+
+        {
+            let wal = Wal::open(&dir, FsyncPolicy::Always).unwrap();
+            // "Due" fires at finished == 10, and stays due through finished == 15 despite
+            // three separate deferrals — never silently rearmed to wait for 20.
+            for finished in [10, 12, 15] {
+                maybe_checkpoint(&committed, finished, &cfg, Some(&wal), &mut next_checkpoint);
+                assert_eq!(next_checkpoint, 10, "still due: the transaction never ended");
+            }
+            committed.end(base);
+            maybe_checkpoint(&committed, 15, &cfg, Some(&wal), &mut next_checkpoint);
+            assert_eq!(next_checkpoint, 15 + cfg.checkpoint_every);
+            wal.shutdown();
+        }
+        assert!(CkptMeta::load(&dir).unwrap().is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
