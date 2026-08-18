@@ -81,6 +81,16 @@ pub enum FsyncPolicy {
 /// change (see `decode_payload`'s "written by a newer server?" for what a foreign
 /// tag means to a reader).
 ///
+/// **This is not just a versioning footnote — it's a silent-corruption trap for
+/// whoever writes recovery next.** An old-format `Rec::Tx` payload (`tag=1 | id_len
+/// | id | source`) fed to the new decoder does NOT reliably error: once `source` is
+/// ≥24 bytes (true of any real request body), `decode_payload` happily reads 24
+/// bytes of what used to be `source` as `base_version`/`steps`/`version` and hands
+/// back whatever's left as a truncated `source` — no error, just wrong values. The
+/// CRC does not catch this: it validates the bytes as written, not how they're
+/// interpreted. Do not point recovery at a data directory written before this
+/// change.
+///
 /// Borrowed fields, because the hot path just encodes into a frame and moves
 /// on; [`OwnedRec`] is the decoded twin the recovery scan hands back.
 pub enum Rec<'a> {
@@ -134,6 +144,11 @@ fn encode_payload(rec: &Rec) -> Vec<u8> {
     let mut p = Vec::new();
     match rec {
         Rec::Commit { id, base_version, source, steps, version } => {
+            debug_assert!(
+                id.len() <= u8::MAX as usize,
+                "txid too long for the u8 length prefix: {}",
+                id.len()
+            );
             p.push(1);
             p.push(id.len() as u8);
             p.extend_from_slice(id.as_bytes());

@@ -47,7 +47,7 @@ pub struct TxResult {
 }
 
 /// The parts of a `TxResult` that a run produces; the committer re-attaches the
-/// identity, base version, and the client's reply channel.
+/// identity, base version, source, and the client's reply channel.
 pub struct TxResultParts {
     pub btm: PathMap<()>,
     pub remove_prefixes: Vec<Vec<u8>>,
