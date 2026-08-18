@@ -4,7 +4,9 @@ Every test that watches events opens the stream BEFORE acting (subscribe-then-ac
 the broadcast has no replay, so subscribing after a fast transaction loses its events.
 """
 
+import json
 import re
+import socket
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -100,7 +102,7 @@ def test_exec_error_aborts_whole_transaction(server: MorkClient) -> None:
     assert excinfo.value.status == 422
     assert "exec" in excinfo.value.message
     out = server.export()
-    assert "(keepme 1)" not in out          # the tx's own data: gone
+    assert "(keepme 1)" not in out  # the tx's own data: gone
     assert not any("good-out" in line for line in out)  # the successful step: reverted
     # rollback doesn't poison the engine
     with server.events() as stream:
@@ -125,9 +127,9 @@ def test_budget_commit_keeps_partial_progress(server: MorkClient) -> None:
         ev = stream.wait_for("budget", tx=res.tx)
         assert ev.data["steps"] == 5
     out = server.export()
-    assert "(n (s z))" in out                      # partial progress kept
-    assert any(line.startswith("(paused ") for line in out)   # continuation parked
-    assert not any(line.startswith("(exec ") for line in out) # nothing left steppable
+    assert "(n (s z))" in out  # partial progress kept
+    assert any(line.startswith("(paused ") for line in out)  # continuation parked
+    assert not any(line.startswith("(exec ") for line in out)  # nothing left steppable
     # the queue is unblocked: a following tx runs to quiescence normally
     with server.events() as stream:
         ok = server.run("(alive 1)")
@@ -198,7 +200,9 @@ def test_concurrent_submissions_drain_sequentially(server: MorkClient) -> None:
                 open_tx = ev.data["tx"]
                 order.append(open_tx)
             elif ev.name == "quiescent":
-                assert ev.data["tx"] == open_tx, f"quiescent for {ev.data['tx']} while {open_tx} was open"
+                assert ev.data["tx"] == open_tx, (
+                    f"quiescent for {ev.data['tx']} while {open_tx} was open"
+                )
                 open_tx = None
                 pending.discard(ev.data["tx"])
                 if not pending:
@@ -221,3 +225,167 @@ def test_sees_predecessors_computed_results(server: MorkClient) -> None:
     out = server.export()
     assert "(derived 1)" in out
     assert "(final 1)" in out
+
+
+def _raw_post(host: str, port: int, body: bytes) -> socket.socket:
+    """Fire a `POST /run` and return the still-open socket, without reading the
+    response. Used in pairs so two requests hit the listener back-to-back with no
+    Python-level scheduling gap between them — a `ThreadPoolExecutor` measurably
+    widens that gap (see the comment on `test_concurrent_conflict_one_transaction_aborts`)."""
+    s = socket.create_connection((host, port), timeout=10)
+    req = (
+        f"POST /run HTTP/1.1\r\nHost: {host}\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
+    )
+    s.sendall(req)
+    return s
+
+
+def _raw_response(sock: socket.socket) -> tuple[int, str]:
+    """Read one HTTP/1.1 response (status code + body) off a socket from `_raw_post`."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    status = int(lines[0].split(b" ")[1])
+    length = next(
+        (
+            int(hdr.split(b":")[1].strip())
+            for hdr in lines[1:]
+            if hdr.lower().startswith(b"content-length:")
+        ),
+        0,
+    )
+    while len(rest) < length:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        rest += chunk
+    sock.close()
+    return status, rest.decode()
+
+
+def _raw_events(host: str, port: int) -> tuple[socket.socket, str]:
+    """Open `/events` as HTTP/1.0 (no chunked transfer-encoding, so frames can be read
+    as plain bytes with no chunk-size framing to decode) and consume the `hello` frame.
+    Returns the socket plus any bytes already read past the `hello` frame's boundary,
+    for `_raw_wait_for` to pick up.
+
+    Used instead of `MorkClient.events()` (`requests`-based) for this test only: that
+    combination — `requests`'s chunked-SSE consumption running concurrently with the
+    raw `/run` sockets below — was observed to intermittently stall during development
+    of this test. A minimal reproduction using nothing but raw sockets on both sides
+    (no `requests` anywhere) never stalled once across 100+ trials, which points at a
+    client-library interaction rather than a mork-server bug — but a test that can
+    stall either way isn't shippable, so this sidesteps `requests` for /events here."""
+    s = socket.create_connection((host, port), timeout=10)
+    s.sendall(f"GET /events HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
+    buf = ""
+    s.settimeout(10)
+    while "\n\n" not in buf:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        buf += chunk.decode()
+    _hello, _, rest = buf.partition("\n\n")
+    return s, rest
+
+
+def _raw_wait_for(
+    sock: socket.socket, buf: str, name: str, timeout: float = 10.0
+) -> tuple[dict, str]:
+    """Read SSE frames off a raw `/events` socket (as opened by `_raw_events`) until one
+    named `name` arrives. Returns its data plus any leftover buffered bytes, so callers
+    can keep making further calls against the same stream."""
+    sock.settimeout(timeout)
+    while True:
+        while "\n\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise AssertionError(f"events stream closed before {name!r} arrived")
+            buf += chunk.decode()
+        frame, _, buf = buf.partition("\n\n")
+        ev_name, data = None, None
+        for line in frame.split("\n"):
+            if line.startswith("event: "):
+                ev_name = line.removeprefix("event: ")
+            elif line.startswith("data: "):
+                data = json.loads(line.removeprefix("data: "))
+        if ev_name == name:
+            return data, buf
+
+
+@pytest.mark.parametrize("server", [["--workers", "4"]], indirect=True)
+def test_concurrent_conflict_one_transaction_aborts(server: MorkClient) -> None:
+    """A real MVCC conflict at `--workers 4`: one transaction removes-by-pattern
+    `(edge{n} $x $y)`, another concurrently adds a brand new `(edge{n} c d)` — the
+    phantom shape `mvcc::validate` exists to catch (a pattern-scoped removal racing a
+    concurrent insertion under the same ground prefix).
+
+    Getting two transactions to actually overlap (share a base version) from outside
+    the process is a genuine race, not something this test can force outright:
+    - Padding one side with a many-step loop to buy a guaranteed timing margin was
+      tried and abandoned — it uncovered a separate, serious bug (see the fix-round
+      report): a transaction that runs many interpreter steps concurrently with
+      *any* transaction that includes a removal exec intermittently hangs the
+      server, regardless of whether the two conflict. That is a real defect for a
+      follow-up task to fix, not something to route around by shipping a test that
+      can hang CI.
+    - A plain `ThreadPoolExecutor` race (as used elsewhere in this file) only
+      overlaps roughly 20% of the time — Python's own thread-scheduling gap between
+      the two `submit` calls is often wider than the two requests' actual server-side
+      overlap window. Firing both over pre-connected raw sockets, back-to-back with
+      no Python scheduling in between, closes most of that gap: empirically ~80% of
+      attempts overlap.
+
+    So this test retries with fresh, disjoint data each round (avoiding any
+    state leaking between attempts) until it observes an actual conflict, capped at
+    20 rounds. At an 80% measured per-round hit rate the odds of exhausting the cap
+    with no overlap are astronomically small (~1e-14); if it ever does exhaust, the
+    test fails loudly with a clear message rather than silently passing — this is
+    a bounded retry for a genuinely racy phenomenon, not a hope-it-works flake.
+    """
+    host, _, port_s = server.base_url.removeprefix("http://").partition(":")
+    port = int(port_s)
+    ev_sock, ev_buf = _raw_events(host, port)
+    for round_ in range(20):
+        a_src = (
+            f"(edge{round_} a b)\n(exec 0 (, (edge{round_} $x $y)) (O (- (edge{round_} $x $y))))\n"
+        )
+        b_src = f"(edge{round_} c d)\n"
+        sa = _raw_post(host, port, a_src.encode())
+        sb = _raw_post(host, port, b_src.encode())
+        status_a, body_a = _raw_response(sa)
+        status_b, body_b = _raw_response(sb)
+        if status_a == 422 or status_b == 422:
+            a_lost = status_a == 422
+            loser_status, loser_body = (status_a, body_a) if a_lost else (status_b, body_b)
+            winner_body = body_b if a_lost else body_a
+            break
+    else:
+        pytest.fail(
+            "no conflict observed in 20 rounds — either the race genuinely never overlapped "
+            "(vanishingly unlikely at the measured ~80% per-round rate) or commit's wiring "
+            "regressed; investigate before assuming bad luck"
+        )
+
+    assert loser_status == 422
+    assert "phantom" in loser_body
+    abort_data, ev_buf = _raw_wait_for(ev_sock, ev_buf, "abort")
+    assert "phantom" in abort_data["reason"]
+    ev_sock.close()
+    assert '"ok":true' in winner_body
+    out = server.export()
+    if a_lost:
+        # A (the remover) lost: B's add won outright, and A's own transaction
+        # (including its local add of "a b") was discarded entirely.
+        assert f"(edge{round_} c d)" in out
+        assert f"(edge{round_} a b)" not in out
+    else:
+        # B (the adder) lost: A's removal won, netting its own local "a b" add
+        # against its own removal to nothing, and B's "c d" never got installed.
+        assert f"(edge{round_} a b)" not in out
+        assert f"(edge{round_} c d)" not in out

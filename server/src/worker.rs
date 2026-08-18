@@ -133,7 +133,35 @@ pub fn spawn_workers(
                     let job = { jobs.lock().unwrap().recv() };
                     let Ok(job) = job else { break };
                     let Job { id, base, base_version, source, reply } = job;
-                    let parts = run_one(id.clone(), base, source, sm.clone(), step_budget, budget_action);
+                    // A kernel panic (e.g. an `unreachable!()` on a malformed exec — see
+                    // the worker tests) must still yield exactly one `TxResult`: without
+                    // this, the committer never hears back, `in_flight` never decrements,
+                    // and `committed.end` never runs — pinning `active_bases`' watermark
+                    // and growing `history` without bound forever after. On the panic
+                    // path the worker's `Space`/trie are simply discarded (never sent
+                    // anywhere), so asserting unwind-safety here is sound.
+                    let id2 = id.clone();
+                    let run = std::panic::AssertUnwindSafe(|| {
+                        run_one(id2, base, source, sm.clone(), step_budget, budget_action)
+                    });
+                    let parts = match std::panic::catch_unwind(run) {
+                        Ok(parts) => parts,
+                        Err(payload) => {
+                            let msg = payload
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "worker panicked".to_string());
+                            log::error!("worker panicked running {id}: {msg}");
+                            TxResultParts {
+                                btm: PathMap::new(),
+                                remove_prefixes: Vec::new(),
+                                count: 0,
+                                steps: 0,
+                                outcome: WorkerOutcome::Failed(format!("worker panicked: {msg}")),
+                            }
+                        }
+                    };
                     let _ = results.send(TxResult {
                         id,
                         base_version,
@@ -206,5 +234,48 @@ mod tests {
             crate::engine::BudgetAction::Commit,
         );
         assert!(!parts.remove_prefixes.is_empty(), "a removing tx must report prefixes");
+    }
+
+    #[test]
+    fn a_panicking_run_still_yields_exactly_one_failed_result() {
+        // Exercises the real `spawn_workers` thread body (not `run_one` directly), so
+        // this proves the committer's channel actually receives a `TxResult` after a
+        // kernel panic, not just that `run_one` would return one if called directly.
+        let sm = SharedMapping::new();
+        let (job_tx, job_rx) = mpsc::channel::<Job>();
+        let (res_tx, res_rx) = mpsc::channel::<TxResult>();
+        let _workers = spawn_workers(
+            1,
+            sm,
+            Arc::new(Mutex::new(job_rx)),
+            res_tx,
+            1_000_000,
+            crate::engine::BudgetAction::Commit,
+        );
+        let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+        job_tx
+            .send(Job {
+                id: "txpanic_test".to_string(),
+                base: PathMap::new(),
+                base_version: 0,
+                // A bare `I` pattern (missing the `BTM` wrapper — see the comment on
+                // `worker_collects_removal_prefixes`) hits `unreachable!()` deep in
+                // `ASource::new`, killing the thread if not caught.
+                source: "(exec 0 (I (edge $x $y)) (O (- (edge $x $y))))\n".to_string(),
+                reply,
+            })
+            .unwrap();
+
+        let result = res_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the worker must still report back after a panic, not go silent");
+        assert!(
+            matches!(result.outcome, WorkerOutcome::Failed(_)),
+            "a panicking run must surface as Failed, not be lost"
+        );
+        assert!(
+            res_rx.try_recv().is_err(),
+            "exactly one TxResult per dispatched job, even after a panic"
+        );
     }
 }

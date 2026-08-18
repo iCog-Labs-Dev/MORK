@@ -23,9 +23,10 @@ cargo +nightly run --release -p mork-server -- --addr 127.0.0.1:8081
 | `--events-buffer` | `4096` | Per-subscriber event buffer; slower clients get `lagged` events instead of back-pressuring the engine |
 | `--step-budget` | `1000000` | Max VM steps one transaction may run; bounds how long a transaction can hold the (sequential) engine |
 | `--budget-action` | `commit` | On budget exhaustion: `commit` keeps partial progress and parks pending execs as `(paused …)` data; `abort` rolls the whole transaction back |
-| `--data-dir` | *(absent)* | Enable persistence: WAL + crash recovery rooted here. Absent = pure in-memory |
-| `--fsync` | `everysec` | When the log is fsynced: `always` = 200 means on disk (group-committed) · `everysec` = durable within ~1 s (Redis-style; the loss window covers process crash and power failure) · `no` = page cache decides |
-| `--checkpoint-every` | `1024` | Snapshot the space and delete pre-checkpoint log segments every N finished transactions; `0` disables (the log grows unbounded, recovery replays it in full) |
+| `--workers` | `1` | Number of transactions that may execute concurrently; `1` = the previous sequential engine, exactly. Capped at the symbol table's writer-thread limit (`MAX_WRITER_THREADS`) |
+| `--data-dir` | *(absent)* | **Temporarily refused**: persistence for concurrent execution is being reworked (see Task 6+ of the MVCC plan), and the server exits at startup rather than serve a space recovery can't yet reconstruct soundly. Absent = pure in-memory, the only supported mode right now |
+| `--fsync` | `everysec` | When the log is fsynced: `always` = 200 means on disk (group-committed) · `everysec` = durable within ~1 s (Redis-style; the loss window covers process crash and power failure) · `no` = page cache decides. (Inert while `--data-dir` is refused; kept so the flag's shape doesn't change again once persistence is reworked.) |
+| `--checkpoint-every` | `1024` | Snapshot the space and delete pre-checkpoint log segments every N finished transactions; `0` disables (the log grows unbounded, recovery replays it in full). Same inert status as `--fsync` for now |
 
 Logging via `env_logger`: `RUST_LOG=info cargo +nightly run -p mork-server`.
 Stop with Ctrl-C (open connections are closed, the engine thread is joined).
@@ -91,7 +92,12 @@ Submit a transaction and start executing it.
 
 - **Body**: MeTTa s-expression text (UTF-8) — data and/or `(exec …)` programs, exactly the
   CLI's input syntax.
-- **Returns immediately** (execution continues in the background; watch `/events`):
+- **Blocks until the transaction reaches its outcome** — load, then every step to
+  quiescence (or to a budget/abort outcome), all before the HTTP response is sent. Request
+  duration is bounded by `--step-budget`, not by how fast the network is: a long-running
+  program holds the connection open for as long as it actually runs, so size any
+  client-side HTTP timeout to your `--step-budget`, not to "should be quick". `/events`
+  carries the same events for anyone watching rather than waiting on this one response.
 
 ```json
 {"ok": true, "tx": "tx17_si49f8v6", "count": 6, "version": 42}
@@ -101,10 +107,13 @@ Submit a transaction and start executing it.
 |---|---|
 | `tx` | Transaction id, format `tx<count>_<unique 8-char alphanumeric>`. Doubles as the loc-namespace symbol |
 | `count` | Expressions added by this transaction |
-| `version` | Global step counter after the (atomic) load |
+| `version` | Version after this transaction committed — one bump per transaction, not per step |
 
 **Errors**: `400` non-UTF-8 body or s-expression parse error (nothing applied) ·
-`422` kernel load failure (rolled back — nothing applied) ·
+`422` the transaction was rolled back — kernel load failure, a rejected exec, a conflict
+  with a concurrently-committed transaction, or `--budget-action abort` exhausting the
+  step budget (nothing applied in any case; no `200` is ever sent for a transaction that
+  ends up rolled back — see the lifecycle note under `/events` below) ·
 `503` engine shut down.
 
 Examples:
@@ -140,20 +149,25 @@ client can totally order what it observes.
 | Event | Payload | Meaning |
 |---|---|---|
 | `hello` | `{version, count, active_txs}` | First frame on connect: snapshot version, expression count, transactions with pending execs |
-| `tx` | `{tx, count, version}` | A transaction was applied atomically |
-| `step` | `{tx, exec, touched, new, us, version}` | One VM step ran for `tx`. `exec` = the s-expression that executed (namespace unwrapped), `touched` = template instantiations written, `new` = whether anything not already present was written, `us` = duration in microseconds |
+| `tx` | `{tx, count, version}` | A transaction committed — applied atomically. **Not emitted for a transaction that aborts**: an aborted transaction gets only the `abort` event below, never a `tx` |
 | `quiescent` | `{tx, version}` | **Per-transaction**: `tx` committed — nothing steppable left; its effects are permanent. The next queued transaction, if any, starts after this |
 | `idle` | `{version}` | **Global**: nothing steppable and nothing queued; the engine is parked awaiting transactions |
-| `delta` | `{version, added, removed}` | Opt-in snapshot diff: expressions added/removed between two consecutively observed snapshots (arrays of s-expression strings). Computed off the engine thread with PathMap set algebra; under load several steps may coalesce into one delta |
-| `abort` | `{tx, reason, version}` | The transaction was **rolled back** (failed load, rejected exec, or budget exhaustion under `--budget-action abort`): the space is exactly as if it never happened |
+| `delta` | `{version, added, removed}` | Opt-in snapshot diff: expressions added/removed between two consecutively observed snapshots (arrays of s-expression strings). Computed off the engine thread with PathMap set algebra; under load several commits may coalesce into one delta |
+| `abort` | `{tx, reason, version}` | The transaction was **rolled back** (failed load, rejected exec, a conflict with a concurrently-committed transaction, or budget exhaustion under `--budget-action abort`): the space is exactly as if it never happened. This is the only event such a transaction ever gets — no `tx` precedes it |
 | `budget` | `{tx, steps, version}` | The transaction hit `--step-budget` under `--budget-action commit`: partial progress is kept, still-pending execs are parked as inert `(paused (exec …))` data — inspect via `/export`, resume with a follow-up transaction that rewrites them back to `(exec …)` |
 | `lagged` | `{skipped}` | *You* consumed too slowly and missed `skipped` events (buffer overrun). Re-sync with `/export`; the engine was never slowed down |
+
+A per-step `step` event existed before workers ran transactions to completion before
+commit; it no longer does, because a step that hasn't committed isn't public state. What
+you get instead is the transaction's outcome, in full, once it's known: `tx` (or `abort`)
+followed by `quiescent`/`budget`/nothing further.
 
 Typical lifecycle of one transaction on the stream:
 
 ```
-tx → step → step → … → quiescent        committed  (then idle, if nothing is queued)
-tx → step → step → … → abort            rolled back — space as if it never happened
+tx → quiescent      committed — effects permanent  (then idle, if nothing is queued)
+abort                rolled back — space as if it never happened (no `tx` precedes this)
+tx → budget          quiesced by force under --budget-action commit; partial progress kept
 ```
 
 ## `GET /export`
@@ -182,9 +196,9 @@ curl -s localhost:8081/export
 curl -s 'localhost:8081/export?pattern=%5B2%5D%20petri%20%5B3%5D%20%21%20result%20%24&template=_1'
 ```
 
-**Consistency note**: exports see the last *committed* step (snapshot isolation) — a
-slightly stale but always consistent view. To coordinate, compare the `version` on your
-`/run` reply or `step` events with the `x-mork-version` header.
+**Consistency note**: exports see the last *committed* transaction (snapshot isolation) —
+a slightly stale but always consistent view. To coordinate, compare the `version` on your
+`/run` reply or `tx`/`quiescent` events with the `x-mork-version` header.
 
 ---
 
@@ -196,11 +210,17 @@ slightly stale but always consistent view. To coordinate, compare the `version` 
 - **Deep nesting**: expression machinery recurses per nesting level; the engine thread
   reserves a 512 MB stack (lazily committed) and tokio threads 64 MB, so deeply nested
   terms like a 400-deep `(S (S … Z))` are fine.
+- **Per-transaction `Space`**: each transaction runs on a worker against its own `Space`,
+  built fresh for that transaction and dropped when it ends — not one `Space` shared for
+  the process lifetime. A program that opens a `z3` subprocess or memory-maps an ACT file
+  gets that resource for its own transaction only; it does not persist into the next one.
 - **Runaway programs**: a program whose continuations never stop can't wedge the queue —
   after `--step-budget` steps it is either quiesced by force (`commit`: results kept,
   continuations parked as `(paused …)` data) or rolled back (`abort`). Size the budget to
   your workload: it's the upper bound on how long one transaction can hold the engine.
-- **Durability** (`--data-dir`): a logical command log — transaction sources plus
+- **Durability** (`--data-dir`) — **temporarily refused at startup** (see the flags table);
+  the description below is the design this will return to once the WAL/recovery rework
+  for concurrent execution lands. It's a logical command log — transaction sources plus
   commit/abort outcome records — with the engine never touching a file (a dedicated
   writer thread owns all I/O and fsync timing; under `--fsync always` it also fires the
   client's 200 after the group-commit fsync). Recovery replays the log against the

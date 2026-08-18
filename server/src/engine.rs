@@ -50,7 +50,9 @@ pub struct EngineConfig {
     /// Shared with the HTTP layer; recovery restores it before `ready` fires.
     pub tx_counter: Arc<AtomicU64>,
     /// Number of concurrent worker threads. 1 = the previous sequential engine.
-    pub workers: usize,
+    /// Non-zero by construction: a pool of 0 workers would leave `run`'s loop blocked
+    /// forever on `res_rx.recv()` with nothing that could ever send to it.
+    pub workers: std::num::NonZeroUsize,
 }
 
 /// Returned alongside the channels: fires once startup is done and the snapshot is
@@ -113,7 +115,7 @@ fn run(
     let (job_tx, job_rx) = std::sync::mpsc::channel::<worker::Job>();
     let (res_tx, res_rx) = std::sync::mpsc::channel::<worker::TxResult>();
     let _workers = worker::spawn_workers(
-        cfg.workers,
+        cfg.workers.get(),
         sm.clone(),
         Arc::new(Mutex::new(job_rx)),
         res_tx,
@@ -136,7 +138,7 @@ fn run(
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
-        if in_flight < cfg.workers {
+        if in_flight < cfg.workers.get() {
             match rx.try_recv() {
                 Ok(t) => {
                     dispatch(&mut committed, &mut bases, t, &job_tx, &active);
@@ -185,7 +187,8 @@ fn dispatch(
     active: &Arc<Mutex<HashSet<TxId>>>,
 ) {
     let base_version = committed.begin();
-    bases.insert(t.id.clone(), committed.btm.clone()); // O(1)
+    let clobbered = bases.insert(t.id.clone(), committed.btm.clone()); // O(1)
+    debug_assert!(clobbered.is_none(), "duplicate TxId {}: would hand commit the wrong base", t.id);
     active.lock().unwrap().insert(t.id.clone());
     let _ = job_tx.send(worker::Job {
         id: t.id,

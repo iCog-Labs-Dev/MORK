@@ -11,6 +11,9 @@ mod http;
 mod mvcc;
 mod read;
 mod transaction;
+// Persistence is refused at startup (see engine::run), so nothing outside wal.rs's own
+// tests calls its API right now; reactivated once the WAL/recovery rework lands.
+#[allow(dead_code)]
 mod wal;
 mod worker;
 mod wrap;
@@ -84,7 +87,10 @@ fn main() {
         fsync: args.fsync,
         checkpoint_every: args.checkpoint_every,
         tx_counter: tx_counter.clone(),
-        workers: args.workers,
+        // Checked non-zero just above; NonZeroUsize downstream makes "0 workers" (which
+        // would block run()'s loop forever on a pool with nobody in it) unrepresentable
+        // rather than a case every reader has to remember is excluded.
+        workers: std::num::NonZeroUsize::new(args.workers).expect("checked non-zero above"),
     };
     let (tx_send, snap_rx, ready, engine_join) = engine::spawn_engine(events.clone(), active.clone(), cfg);
 

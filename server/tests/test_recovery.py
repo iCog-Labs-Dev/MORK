@@ -9,9 +9,15 @@ loss-window differences are only observable under real power failure.
 
 import time
 
+import pytest
+
 from client import MorkClient
 from conftest import EXAMPLES_DIR
 from test_e2e import DIVERGING, PEANO_FOUR, RESULT_PATTERN
+
+pytestmark = pytest.mark.skip(
+    reason="--data-dir refused while WAL/recovery is reworked; re-enable in the persistence task"
+)
 
 
 def _run_and_wait(client: MorkClient, src: str, outcome: str = "quiescent"):
@@ -106,7 +112,7 @@ def test_checkpoint_restore_and_log_gc(spawner, tmp_path) -> None:
     assert "checkpoint.meta" in names
     assert any(n.startswith("checkpoint-") and n.endswith(".paths") for n in names)
     assert "wal-000000.log" not in names  # pre-checkpoint segment GC'd
-    assert "wal-000001.log" in names      # the tail segment
+    assert "wal-000001.log" in names  # the tail segment
 
     p1.kill()
     p1.wait(timeout=10)
