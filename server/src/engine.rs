@@ -11,6 +11,9 @@
 //! installed only if nothing it read or removed-by-pattern was concurrently written.
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -22,7 +25,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::mvcc;
 use crate::transaction::{Event, ReadSnapshot, Transaction, TxId, TxOk};
-use crate::wal::{FsyncPolicy, Rec, Wal};
+use crate::wal::{self, CkptMeta, FsyncPolicy, OwnedRec, Rec, Wal};
 use crate::{worker, wrap};
 
 /// What happens when a transaction exhausts its step budget.
@@ -37,12 +40,11 @@ pub enum BudgetAction {
 pub struct EngineConfig {
     pub step_budget: u64,
     pub budget_action: BudgetAction,
-    /// Persistence root; `None` = pure in-memory (no WAL, no recovery). Temporarily
-    /// `Some` is refused at startup — see the comment in `run`.
+    /// Persistence root; `None` = pure in-memory (no WAL, no recovery). `Some` triggers
+    /// `recover()` at startup and opens the WAL for append thereafter.
     pub data_dir: Option<std::path::PathBuf>,
-    /// Unread while persistence is disabled (see `run`); kept so the CLI flag and
-    /// `EngineConfig`'s shape don't need to change again once the WAL rework lands.
-    #[allow(dead_code)]
+    /// When the log is fsynced (`--fsync`); also the policy `recover()` reopens the WAL
+    /// under.
     pub fsync: FsyncPolicy,
     /// Checkpoint + rotate + GC old segments every N finished transactions; 0 = never
     /// (the log then grows without bound and recovery replays it in full).
@@ -94,19 +96,22 @@ fn run(
     cfg: EngineConfig,
     ready: std::sync::mpsc::SyncSender<()>,
 ) {
-    if cfg.data_dir.is_some() {
-        log::error!(
-            "--data-dir is temporarily unsupported: persistence for concurrent \
-             execution is being reworked in a later step of this plan. Run without \
-             --data-dir for now."
-        );
-        std::process::exit(1);
-    }
-    let wal: Option<&Wal> = None; // persistence disabled pending the WAL/recovery rework
-
     let space = Space::new(); // built only to mint the initial (empty) symbol table
     let sm = space.sm.clone();
-    let mut committed = mvcc::Committed::new(space.btm.clone(), 0); // O(1): Space has Drop, can't move the field out
+
+    // Recovery, if any, must finish before `publish`/`ready` below fire — a request
+    // arriving mid-recovery could mint a txid that collides with a replayed one.
+    let (wal_owned, mut committed): (Option<Wal>, mvcc::Committed) = match &cfg.data_dir {
+        Some(dir) => match recover(dir, &cfg, &sm) {
+            Ok((w, c)) => (Some(w), c),
+            Err(e) => {
+                log::error!("recovery failed, refusing to serve: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => (None, mvcc::Committed::new(space.btm.clone(), 0)), // O(1): Space has Drop, can't move the field out
+    };
+    let wal = wal_owned.as_ref();
     let mut bases: HashMap<TxId, PathMap<()>> = HashMap::new();
 
     publish(&snap_tx, &committed, &sm);
@@ -173,6 +178,126 @@ fn run(
         }
     }
     log::info!("engine: transaction channel closed, shutting down");
+}
+
+/// The numeric prefix of a `tx<n>_…` id — what the shared counter must clear after
+/// recovery so freshly minted ids can never collide with replayed ones.
+fn txid_count(id: &str) -> Option<u64> {
+    id.strip_prefix("tx")?.split_once('_')?.0.parse().ok()
+}
+
+/// Rebuild `Committed` from `data_dir` — checkpoint restore plus log replay — and open
+/// the WAL for append.
+///
+/// Each logged transaction records the version it ran against, so replay reconstructs
+/// that exact snapshot from a running table of committed versions and re-runs the
+/// transaction against it, rather than against whatever the serial predecessor
+/// happened to leave behind — required because concurrent workers can commit in an
+/// order that differs from the order they began, so "the previous committed state"
+/// is not necessarily a transaction's actual base. Installing the results back in log
+/// order reproduces the live serialization order exactly, regardless of how many
+/// workers produced it.
+///
+/// Validation is deliberately skipped: every logged transaction already passed it
+/// live, and replaying from the same bases in the same order yields the same
+/// writesets and the same installs, so re-checking would be pure cost. What replay
+/// does check is determinism itself (see the step-count and version comparisons
+/// below) — if either disagrees with the log, the recovered state provably is not
+/// the state that was committed, and this refuses to start rather than serve it.
+fn recover(dir: &Path, cfg: &EngineConfig, sm: &SharedMappingHandle) -> io::Result<(Wal, mvcc::Committed)> {
+    fs::create_dir_all(dir)?;
+    let mut first_segment = 0u64;
+    let mut max_tx = 0u64;
+    let mut btm: PathMap<()> = PathMap::new();
+    let mut version = 0u64;
+
+    if let Some(m) = CkptMeta::load(dir)? {
+        if m.format != "paths" {
+            return Err(io::Error::other(format!("unsupported checkpoint format '{}'", m.format)));
+        }
+        let snap_path = dir.join(&m.snapshot);
+        // `Space::restore_paths` does `File::open(path).unwrap()` (kernel/src/space.rs),
+        // so it PANICS rather than returning `Err` on a permissions error or similar —
+        // out of scope to fix here. This check only rules out the missing-file case;
+        // it is a TOCTOU mitigation, not a guarantee.
+        if !snap_path.exists() {
+            return Err(io::Error::other(format!(
+                "checkpoint.meta names missing snapshot '{}'", m.snapshot)));
+        }
+        let mut tmp = Space::with(PathMap::new(), sm.clone());
+        tmp.restore_paths(&snap_path)?;
+        btm = tmp.btm.clone(); // O(1): Space has Drop, can't move the field out
+        version = m.version;
+        max_tx = m.tx_counter;
+        first_segment = m.first_segment;
+        log::info!("recovered checkpoint '{}' at version {}", m.snapshot, m.version);
+    }
+
+    let mut committed = mvcc::Committed::new(btm, version);
+    // Every base a not-yet-replayed record still refers to. Bounded in practice by the
+    // checkpoint interval (log tails are short), and each entry is an O(1) COW clone.
+    let mut snapshots: HashMap<u64, PathMap<()>> = HashMap::new();
+    snapshots.insert(committed.version, committed.btm.clone());
+
+    let recs = wal::read_segments(dir, first_segment)?;
+    let n_recs = recs.len();
+    for rec in recs {
+        let OwnedRec::Commit { id, base_version, source, steps, version: logged } = rec;
+        max_tx = max_tx.max(txid_count(&id).unwrap_or(0));
+
+        let base = snapshots.get(&base_version).cloned().ok_or_else(|| {
+            io::Error::other(format!(
+                "replay of {id}: base version {base_version} is not in the log window"))
+        })?;
+
+        // The live budget, not the logged step count: run_one's loop checks the budget
+        // BEFORE stepping, so replaying with budget == logged N would fire the budget
+        // action at step N instead of reaching Done — the transaction would never
+        // reach the state it actually quiesced (or budgeted) to. Using the live budget
+        // lets replay run exactly as the original run did; the logged `steps` becomes
+        // a pure determinism canary, checked below instead of fed back in.
+        let parts = worker::run_one(id.clone(), base.clone(), source, sm.clone(), cfg.step_budget, cfg.budget_action);
+
+        if let worker::WorkerOutcome::Failed(e) = parts.outcome {
+            return Err(io::Error::other(format!("replay of {id} failed (determinism broken?): {e}")));
+        }
+        // WorkerOutcome::Budget is a legitimate replay outcome only if the original run
+        // also stopped at the budget, which the step-count check right below already
+        // establishes — no separate check needed here.
+        if parts.steps != steps {
+            return Err(io::Error::other(format!(
+                "replay of {id} diverged: ran {} steps, log says {steps}. \
+                 The recovered state would not match what was committed, so the server \
+                 will not start. If you changed --step-budget since this log was written, \
+                 that is the likely cause: a transaction that originally stopped at the \
+                 budget will step differently under a new one.",
+                parts.steps
+            )));
+        }
+
+        let ws = mvcc::writeset(&base, &parts.btm);
+        let v = committed.install(ws, parts.remove_prefixes);
+        if v != logged {
+            return Err(io::Error::other(format!(
+                "replay of {id} diverged: installed at version {v}, log says {logged}. \
+                 The recovered state would not match what was committed, so the server \
+                 will not start. If you changed --step-budget since this log was written, \
+                 that is the likely cause: a transaction that originally stopped at the \
+                 budget will step differently under a new one."
+            )));
+        }
+        snapshots.insert(v, committed.btm.clone());
+    }
+
+    cfg.tx_counter.store(max_tx, Ordering::Relaxed);
+    // Nothing can validate against replayed history: no transaction is live to need it.
+    committed.history.clear();
+    let w = Wal::open(dir, cfg.fsync)?;
+    log::info!(
+        "recovery complete: {n_recs} transactions replayed, version {}, tx counter {max_tx}",
+        committed.version
+    );
+    Ok((w, committed))
 }
 
 /// Hand a queued transaction to a worker, stamped with the version it starts from.

@@ -11,8 +11,9 @@ mod http;
 mod mvcc;
 mod read;
 mod transaction;
-// Persistence is refused at startup (see engine::run), so nothing outside wal.rs's own
-// tests calls its API right now; reactivated once the WAL/recovery rework lands.
+// `engine::recover` and `commit` drive the append/checkpoint/replay paths; `Ack` and
+// `Wal::poisoned` have no caller yet outside wal.rs's own tests (nothing acks writes or
+// checks poisoning before accepting new transactions), hence the blanket allow.
 #[allow(dead_code)]
 mod wal;
 mod worker;

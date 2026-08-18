@@ -8,16 +8,11 @@ loss-window differences are only observable under real power failure.
 """
 
 import time
-
-import pytest
+from concurrent.futures import ThreadPoolExecutor
 
 from client import MorkClient
 from conftest import EXAMPLES_DIR
 from test_e2e import DIVERGING, PEANO_FOUR, RESULT_PATTERN
-
-pytestmark = pytest.mark.skip(
-    reason="--data-dir refused while WAL/recovery is reworked; re-enable in the persistence task"
-)
 
 
 def _run_and_wait(client: MorkClient, src: str, outcome: str = "quiescent"):
@@ -54,24 +49,22 @@ def test_recovery_under_everysec(spawner, tmp_path) -> None:
     assert c2.export() == before
 
 
-def test_crash_mid_execution_reruns_dangling_tx(spawner, tmp_path) -> None:
-    """A TX record with no COMMIT/ABORT (killed mid-steps) is re-run fresh on startup
-    under the CURRENT budget config, and closed with a real outcome record."""
+def test_crash_mid_execution_leaves_no_trace(spawner, tmp_path) -> None:
+    """Under the current WAL schema, one record is written per COMMITTED transaction
+    only (see wal.rs's module doc) — an uncommitted transaction is invisible, so a
+    crash mid-run and an explicit abort are the same fact: "this never happened".
+    There is no dangling TX record to re-run on restart, unlike the old sequential
+    engine's log. A transaction killed before it ever reaches commit must therefore
+    leave no trace at all after recovery, not partial progress."""
     c1, p1 = spawner(["--data-dir", str(tmp_path), "--fsync", "always"])
-    c1.run(DIVERGING)  # 200 = TX record fsynced; the program then steps ~forever
-    time.sleep(0.3)  # let it get properly mid-execution
-    p1.kill()
-    p1.wait(timeout=10)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(c1.run, DIVERGING)  # blocks until commit; DIVERGING never quiesces
+        time.sleep(0.3)  # let it get properly mid-execution
+        p1.kill()
+        p1.wait(timeout=10)
 
-    # Respawn with a tiny budget: recovery re-runs the dangling tx, which budget-commits
-    # BEFORE the listener binds — so the state is already settled when we connect.
-    c2, _ = spawner(["--data-dir", str(tmp_path), "--fsync", "always", "--step-budget", "5"])
-    out = c2.export()
-    assert "(n (s z))" in out  # partial progress from the re-run
-    assert any(line.startswith("(paused ") for line in out)
-    # and the outcome record closed it: another restart must NOT re-run it again
-    p2 = spawner(["--data-dir", str(tmp_path), "--fsync", "always", "--step-budget", "5"])[0]
-    assert p2.export() == out
+    c2, _ = spawner(["--data-dir", str(tmp_path), "--fsync", "always"])
+    assert c2.export() == []
 
 
 def test_tx_counter_and_version_survive(spawner, tmp_path) -> None:
@@ -137,3 +130,35 @@ def test_clean_restart(spawner, tmp_path) -> None:
 
     c2, _ = spawner(args)
     assert c2.export() == before
+
+
+def test_concurrent_writes_survive_restart(spawner, tmp_path) -> None:
+    """Transactions committed under --workers 4 must all be present after a restart."""
+    args = ["--data-dir", str(tmp_path), "--workers", "4"]
+    c1, p1 = spawner(args)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        # Fired concurrently, not one at a time: up to 4 may genuinely be in flight
+        # together, so the resulting log has interleaved base_versions, not a serial chain.
+        list(pool.map(c1.run, (f"(edge n{i} m{i})" for i in range(20))))
+    before = c1.export()
+
+    p1.kill()
+    p1.wait(timeout=10)
+
+    c2, _ = spawner(args)
+    assert sorted(c2.export()) == sorted(before)
+
+
+def test_recovery_is_order_independent_of_worker_count(spawner, tmp_path) -> None:
+    """Replay follows the log's commit order, not the worker count, so recovering
+    a 4-worker log with 1 worker must produce the same space."""
+    c1, p1 = spawner(["--data-dir", str(tmp_path), "--workers", "4"])
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(c1.run, (f"(edge n{i} m{i})" for i in range(20))))
+    expected = sorted(c1.export())
+
+    p1.kill()
+    p1.wait(timeout=10)
+
+    c2, _ = spawner(["--data-dir", str(tmp_path), "--workers", "1"])
+    assert sorted(c2.export()) == expected
