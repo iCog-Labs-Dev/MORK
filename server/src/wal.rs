@@ -61,29 +61,35 @@ pub enum FsyncPolicy {
     No,
 }
 
-/// The record schema (Layer 2) — one variant per transaction-lifecycle fact.
+/// The record schema (Layer 2) — one variant per durable transaction fact.
 ///
-/// With deterministic sequential execution these three facts are the ENTIRE
-/// durable history: what arrived (`Tx`), how far it ran (`Commit.steps`), or that it
-/// never happened (`Abort`). Replay = re-execute; no trie changes are ever logged.
-/// `Commit.steps` semantically encodes "sequential, deterministic replay" — a future
-/// parallel scheduler adds a new tag rather than reinterpreting this one.
+/// Under MVCC an uncommitted transaction is invisible: nothing it did is ever
+/// observable until `commit` installs it. So a crash mid-run and an explicit abort
+/// are the same fact from the log's point of view — "this never happened" — and
+/// neither needs a record. The old `Tx`/`Abort` pairing (log what arrived, log
+/// whether it stuck) existed only because the previous sequential engine applied a
+/// transaction to the live trie before it knew whether it had succeeded; the new
+/// committer never does that, so one record per transaction is the entire history.
+///
+/// `base_version` is the version of the committed trie the transaction actually ran
+/// against. Recovery replays each transaction from ITS OWN base rather than from
+/// whatever the serial predecessor happened to leave behind — required because
+/// concurrent workers can commit in an order that differs from the order they began.
+///
+/// Tag `1` is reused from the old `Tx` tag; the two schemas are not
+/// forward-compatible in any case, and the format is not versioned across this
+/// change (see `decode_payload`'s "written by a newer server?" for what a foreign
+/// tag means to a reader).
 ///
 /// Borrowed fields, because the hot path just encodes into a frame and moves
 /// on; [`OwnedRec`] is the decoded twin the recovery scan hands back.
 pub enum Rec<'a> {
-    Tx {
-        id: &'a str,
-        source: &'a str,
-    },
     Commit {
         id: &'a str,
+        base_version: u64,
+        source: &'a str,
         steps: u64,
         version: u64,
-    },
-    Abort {
-        id: &'a str,
-        reason: &'a str,
     },
 }
 
@@ -91,18 +97,12 @@ pub enum Rec<'a> {
 /// form can't outlive the file buffer it was decoded from).
 #[derive(Clone, Debug, PartialEq)]
 pub enum OwnedRec {
-    Tx {
-        id: String,
-        source: String,
-    },
     Commit {
         id: String,
+        base_version: u64,
+        source: String,
         steps: u64,
         version: u64,
-    },
-    Abort {
-        id: String,
-        reason: String,
     },
 }
 
@@ -123,28 +123,24 @@ pub struct Ack {
 // ---------------------------------------------------------------------------
 // Record encoding
 
-/// Payload bytes for one record: `tag:u8 | txid_len:u8 | txid | tag-specific rest`.
+/// Payload bytes for one record: `tag:u8 | id_len:u8 | id | base_version:u64le |
+/// steps:u64le | version:u64le | source (rest of payload)`.
+///
+/// `source` is unprefixed and trailing — an entire request body routinely exceeds
+/// 255 bytes, so unlike `id` it can't use the same `u8` length prefix without
+/// silently truncating; keeping it as "everything after the fixed fields" sidesteps
+/// the width question the way the old `Tx`/`Abort` trailing strings already did.
 fn encode_payload(rec: &Rec) -> Vec<u8> {
     let mut p = Vec::new();
     match rec {
-        Rec::Tx { id, source } => {
+        Rec::Commit { id, base_version, source, steps, version } => {
             p.push(1);
             p.push(id.len() as u8);
             p.extend_from_slice(id.as_bytes());
-            p.extend_from_slice(source.as_bytes());
-        }
-        Rec::Commit { id, steps, version } => {
-            p.push(2);
-            p.push(id.len() as u8);
-            p.extend_from_slice(id.as_bytes());
+            p.extend_from_slice(&base_version.to_le_bytes());
             p.extend_from_slice(&steps.to_le_bytes());
             p.extend_from_slice(&version.to_le_bytes());
-        }
-        Rec::Abort { id, reason } => {
-            p.push(3);
-            p.push(id.len() as u8);
-            p.extend_from_slice(id.as_bytes());
-            p.extend_from_slice(reason.as_bytes());
+            p.extend_from_slice(source.as_bytes());
         }
     }
     p
@@ -177,24 +173,16 @@ fn decode_payload(p: &[u8]) -> Result<OwnedRec, String> {
         .to_string();
     let rest = &p[rest_at..];
     match p[0] {
-        1 => Ok(OwnedRec::Tx {
-            id,
-            source: str::from_utf8(rest).map_err(|_| err())?.to_string(),
-        }),
-        2 => {
-            if rest.len() != 16 {
+        1 => {
+            if rest.len() < 24 {
                 return Err(err());
             }
-            Ok(OwnedRec::Commit {
-                id,
-                steps: u64::from_le_bytes(rest[..8].try_into().unwrap()),
-                version: u64::from_le_bytes(rest[8..].try_into().unwrap()),
-            })
+            let base_version = u64::from_le_bytes(rest[0..8].try_into().unwrap());
+            let steps = u64::from_le_bytes(rest[8..16].try_into().unwrap());
+            let version = u64::from_le_bytes(rest[16..24].try_into().unwrap());
+            let source = str::from_utf8(&rest[24..]).map_err(|_| err())?.to_string();
+            Ok(OwnedRec::Commit { id, base_version, source, steps, version })
         }
-        3 => Ok(OwnedRec::Abort {
-            id,
-            reason: str::from_utf8(rest).map_err(|_| err())?.to_string(),
-        }),
         t => Err(format!(
             "unknown record tag {t} (written by a newer server?)"
         )),
@@ -431,8 +419,7 @@ struct CkptJob {
 /// ```ignore
 /// let recs = wal::read_segments(dir, first_segment)?;  // scan first: truncates torn tail
 /// let wal = Wal::open(dir, FsyncPolicy::Everysec)?;    // appends to what the scan left
-/// wal.append(Rec::Tx { id, source }, ack);             // ack fires when durable (µs for the caller)
-/// wal.append(Rec::Commit { id, steps, version }, None);
+/// wal.append(Rec::Commit { id, base_version, source, steps, version }, ack); // ack fires when durable (µs for the caller)
 /// // drop (or .shutdown()) drains the queue, final-fsyncs, joins the thread
 /// ```
 pub struct Wal {
@@ -817,24 +804,24 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_all_tags() {
+    fn roundtrip_commit_tag() {
+        // Only one tag remains (Tx/Abort collapsed into Commit); this now exercises
+        // encode/decode across varied field values (long source, unicode, zero steps)
+        // rather than across distinct tags.
         let recs = [
-            Rec::Tx {
-                id: "tx1_abcd1234",
-                source: "(a b)\n(exec (tx1_abcd1234 0) $x $y)\n",
-            },
-            Rec::Tx {
-                id: "tx2_efgh5678",
-                source: "(unicode ⍼ \"quoted \\\" str\")",
-            },
             Rec::Commit {
                 id: "tx1_abcd1234",
+                base_version: 0,
+                source: "(a b)\n(exec (tx1_abcd1234 0) $x $y)\n",
                 steps: 42,
                 version: 1234567890123,
             },
-            Rec::Abort {
+            Rec::Commit {
                 id: "tx2_efgh5678",
-                reason: "exec (bad): pattern functor",
+                base_version: 1234567890123,
+                source: "(unicode ⍼ \"quoted \\\" str\")",
+                steps: 0,
+                version: 1234567890124,
             },
         ];
         for r in &recs {
@@ -843,23 +830,21 @@ mod tests {
             assert_eq!(len + 8, f.len());
             let dec = decode_payload(&f[8..]).unwrap();
             match (r, &dec) {
-                (Rec::Tx { id, source }, OwnedRec::Tx { id: i2, source: s2 }) => {
-                    assert_eq!((*id, *source), (i2.as_str(), s2.as_str()));
-                }
                 (
-                    Rec::Commit { id, steps, version },
+                    Rec::Commit { id, base_version, source, steps, version },
                     OwnedRec::Commit {
                         id: i2,
+                        base_version: bv2,
+                        source: s2,
                         steps: st2,
                         version: v2,
                     },
                 ) => {
-                    assert_eq!((*id, *steps, *version), (i2.as_str(), *st2, *v2));
+                    assert_eq!(
+                        (*id, *base_version, *source, *steps, *version),
+                        (i2.as_str(), *bv2, s2.as_str(), *st2, *v2)
+                    );
                 }
-                (Rec::Abort { id, reason }, OwnedRec::Abort { id: i2, reason: r2 }) => {
-                    assert_eq!((*id, *reason), (i2.as_str(), r2.as_str()));
-                }
-                _ => panic!("tag mismatch"),
             }
         }
     }
@@ -872,19 +857,9 @@ mod tests {
         write_frames(
             &p,
             &[
-                Rec::Tx {
-                    id: "tx1_aaaaaaaa",
-                    source: "(a)",
-                },
-                Rec::Commit {
-                    id: "tx1_aaaaaaaa",
-                    steps: 1,
-                    version: 2,
-                },
-                Rec::Tx {
-                    id: "tx2_bbbbbbbb",
-                    source: "(b)",
-                },
+                Rec::Commit { id: "tx1_aaaaaaaa", base_version: 0, source: "(a)", steps: 1, version: 1 },
+                Rec::Commit { id: "tx1_aaaaaaaa", base_version: 1, source: "(a2)", steps: 1, version: 2 },
+                Rec::Commit { id: "tx2_bbbbbbbb", base_version: 2, source: "(b)", steps: 1, version: 3 },
             ],
         );
         // tear the last record: chop 3 bytes off the file
@@ -921,14 +896,8 @@ mod tests {
         write_frames(
             &p,
             &[
-                Rec::Tx {
-                    id: "tx1_aaaaaaaa",
-                    source: "(a)",
-                },
-                Rec::Tx {
-                    id: "tx2_bbbbbbbb",
-                    source: "(b)",
-                },
+                Rec::Commit { id: "tx1_aaaaaaaa", base_version: 0, source: "(a)", steps: 0, version: 1 },
+                Rec::Commit { id: "tx2_bbbbbbbb", base_version: 1, source: "(b)", steps: 0, version: 2 },
             ],
         );
         let mut buf = fs::read(&p).unwrap();
@@ -939,9 +908,12 @@ mod tests {
         let recs = read_segments(&dir, 0).unwrap();
         assert_eq!(
             recs,
-            vec![OwnedRec::Tx {
+            vec![OwnedRec::Commit {
                 id: "tx1_aaaaaaaa".into(),
-                source: "(a)".into()
+                base_version: 0,
+                source: "(a)".into(),
+                steps: 0,
+                version: 1,
             }]
         );
         fs::remove_dir_all(&dir).unwrap();
@@ -953,18 +925,12 @@ mod tests {
         create_segment(&dir, 0).unwrap();
         write_frames(
             &seg_path(&dir, 0),
-            &[Rec::Tx {
-                id: "tx1_aaaaaaaa",
-                source: "(a)",
-            }],
+            &[Rec::Commit { id: "tx1_aaaaaaaa", base_version: 0, source: "(a)", steps: 0, version: 1 }],
         );
         create_segment(&dir, 1).unwrap();
         write_frames(
             &seg_path(&dir, 1),
-            &[Rec::Tx {
-                id: "tx2_bbbbbbbb",
-                source: "(b)",
-            }],
+            &[Rec::Commit { id: "tx2_bbbbbbbb", base_version: 1, source: "(b)", steps: 0, version: 2 }],
         );
         // flip a payload byte in segment 0 (not the last)
         let p0 = seg_path(&dir, 0);
@@ -985,24 +951,66 @@ mod tests {
         create_segment(&dir, 0).unwrap();
         write_frames(
             &seg_path(&dir, 0),
-            &[Rec::Tx {
-                id: "tx1_aaaaaaaa",
-                source: "(a)",
-            }],
+            &[Rec::Commit { id: "tx1_aaaaaaaa", base_version: 0, source: "(a)", steps: 0, version: 1 }],
         );
         create_segment(&dir, 1).unwrap();
         write_frames(
             &seg_path(&dir, 1),
-            &[Rec::Commit {
-                id: "tx1_aaaaaaaa",
-                steps: 3,
-                version: 4,
-            }],
+            &[Rec::Commit { id: "tx2_bbbbbbbb", base_version: 1, source: "(b)", steps: 3, version: 4 }],
         );
         let recs = read_segments(&dir, 0).unwrap();
         assert_eq!(recs.len(), 2);
-        assert!(matches!(recs[0], OwnedRec::Tx { .. }));
-        assert!(matches!(recs[1], OwnedRec::Commit { .. }));
+        let OwnedRec::Commit { id: id0, version: v0, .. } = &recs[0];
+        let OwnedRec::Commit { id: id1, version: v1, .. } = &recs[1];
+        assert_eq!((id0.as_str(), *v0), ("tx1_aaaaaaaa", 1));
+        assert_eq!((id1.as_str(), *v1), ("tx2_bbbbbbbb", 4));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn commit_record_roundtrips_with_base_version() {
+        let dir = tmpdir();
+        {
+            let w = Wal::open(&dir, FsyncPolicy::Always).unwrap();
+            w.append(Rec::Commit {
+                id: "tx7_abcdefgh",
+                base_version: 41,
+                source: "(edge a b)\n",
+                steps: 3,
+                version: 42,
+            }, None);
+        }
+        let recs = read_segments(&dir, 0).unwrap();
+        assert_eq!(recs.len(), 1);
+        match &recs[0] {
+            OwnedRec::Commit { id, base_version, source, steps, version } => {
+                assert_eq!(id, "tx7_abcdefgh");
+                assert_eq!(*base_version, 41);
+                assert_eq!(source, "(edge a b)\n");
+                assert_eq!(*steps, 3);
+                assert_eq!(*version, 42);
+            }
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn interleaved_commits_are_read_back_in_log_order() {
+        // Under MVCC two transactions may share a base and commit in either order.
+        // The log must preserve the order they were appended in — that IS the
+        // serialization order recovery replays.
+        let dir = tmpdir();
+        {
+            let w = Wal::open(&dir, FsyncPolicy::Always).unwrap();
+            w.append(Rec::Commit { id: "txA", base_version: 0, source: "(a)\n", steps: 0, version: 1 }, None);
+            w.append(Rec::Commit { id: "txB", base_version: 0, source: "(b)\n", steps: 0, version: 2 }, None);
+        }
+        let recs = read_segments(&dir, 0).unwrap();
+        assert_eq!(recs.len(), 2);
+        let OwnedRec::Commit { id: a, version: va, .. } = &recs[0];
+        let OwnedRec::Commit { id: b, version: vb, .. } = &recs[1];
+        assert_eq!((a.as_str(), *va), ("txA", 1));
+        assert_eq!((b.as_str(), *vb), ("txB", 2));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1036,20 +1044,13 @@ mod tests {
             version: 1,
         };
         wal.append(
-            Rec::Tx {
-                id: "tx1_aaaaaaaa",
-                source: "(a b)",
-            },
+            Rec::Commit { id: "tx1_aaaaaaaa", base_version: 0, source: "(a b)", steps: 1, version: 1 },
             Some(Ack { reply, ok }),
         );
         let acked = rx.blocking_recv().unwrap().unwrap();
         assert_eq!(acked.version, 1);
         wal.append(
-            Rec::Commit {
-                id: "tx1_aaaaaaaa",
-                steps: 1,
-                version: 2,
-            },
+            Rec::Commit { id: "tx2_bbbbbbbb", base_version: 1, source: "(b)", steps: 1, version: 2 },
             None,
         );
         wal.shutdown(); // drains + joins
@@ -1058,9 +1059,12 @@ mod tests {
         assert_eq!(recs.len(), 2);
         assert_eq!(
             recs[0],
-            OwnedRec::Tx {
+            OwnedRec::Commit {
                 id: "tx1_aaaaaaaa".into(),
-                source: "(a b)".into()
+                base_version: 0,
+                source: "(a b)".into(),
+                steps: 1,
+                version: 1,
             }
         );
         fs::remove_dir_all(&dir).unwrap();
@@ -1070,11 +1074,10 @@ mod tests {
     fn checkpoint_rotates_installs_and_gcs() {
         let dir = tmpdir();
         let wal = Wal::open(&dir, FsyncPolicy::No).unwrap();
-        wal.append(Rec::Tx { id: "tx1_aaaaaaaa", source: "(a)" }, None);
-        wal.append(Rec::Commit { id: "tx1_aaaaaaaa", steps: 0, version: 1 }, None);
+        wal.append(Rec::Commit { id: "tx1_aaaaaaaa", base_version: 0, source: "(a)", steps: 0, version: 1 }, None);
         assert!(wal.checkpoint(1, 1, "paths", Box::new(|w| w.write_all(b"SNAP"))));
         // FIFO: this lands in the freshly rotated segment
-        wal.append(Rec::Tx { id: "tx2_bbbbbbbb", source: "(b)" }, None);
+        wal.append(Rec::Commit { id: "tx2_bbbbbbbb", base_version: 1, source: "(b)", steps: 0, version: 2 }, None);
         wal.shutdown(); // joins writer AND checkpointer: the install is complete
 
         let meta = CkptMeta::load(&dir).unwrap().unwrap();
@@ -1083,7 +1086,16 @@ mod tests {
         assert_eq!(fs::read(dir.join(&meta.snapshot)).unwrap(), b"SNAP");
         assert!(!seg_path(&dir, 0).exists(), "pre-checkpoint segment must be GC'd");
         let tail = read_segments(&dir, meta.first_segment).unwrap();
-        assert_eq!(tail, vec![OwnedRec::Tx { id: "tx2_bbbbbbbb".into(), source: "(b)".into() }]);
+        assert_eq!(
+            tail,
+            vec![OwnedRec::Commit {
+                id: "tx2_bbbbbbbb".into(),
+                base_version: 1,
+                source: "(b)".into(),
+                steps: 0,
+                version: 2,
+            }]
+        );
 
         // reopen sweeps snapshot files the meta doesn't name, keeps the one it does
         fs::write(dir.join("checkpoint-000099.paths"), b"orphan").unwrap();
@@ -1100,10 +1112,7 @@ mod tests {
         {
             let wal = Wal::open(&dir, FsyncPolicy::No).unwrap();
             wal.append(
-                Rec::Tx {
-                    id: "tx1_aaaaaaaa",
-                    source: "(a)",
-                },
+                Rec::Commit { id: "tx1_aaaaaaaa", base_version: 0, source: "(a)", steps: 0, version: 1 },
                 None,
             );
         } // drop = drain + join
@@ -1111,10 +1120,7 @@ mod tests {
         {
             let wal = Wal::open(&dir, FsyncPolicy::No).unwrap();
             wal.append(
-                Rec::Tx {
-                    id: "tx2_bbbbbbbb",
-                    source: "(b)",
-                },
+                Rec::Commit { id: "tx2_bbbbbbbb", base_version: 1, source: "(b)", steps: 0, version: 2 },
                 None,
             );
         }

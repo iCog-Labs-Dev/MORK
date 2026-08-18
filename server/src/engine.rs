@@ -22,7 +22,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::mvcc;
 use crate::transaction::{Event, ReadSnapshot, Transaction, TxId, TxOk};
-use crate::wal::{FsyncPolicy, Wal};
+use crate::wal::{FsyncPolicy, Rec, Wal};
 use crate::{worker, wrap};
 
 /// What happens when a transaction exhausts its step budget.
@@ -212,9 +212,8 @@ fn commit(
     active: &Arc<Mutex<HashSet<TxId>>>,
     wal: Option<&Wal>,
 ) {
-    let worker::TxResult { id, base_version, btm, remove_prefixes, count, steps, outcome, reply } = r;
+    let worker::TxResult { id, base_version, source, btm, remove_prefixes, count, steps, outcome, reply } = r;
     let base = bases.remove(&id).expect("dispatch always inserts a base for every id it sends to a worker");
-    let _ = wal; // persistence deferred; see the startup refusal in `run`
 
     if let worker::WorkerOutcome::Failed(reason) = outcome {
         // Nothing to validate: the transaction's trie is discarded either way.
@@ -236,6 +235,9 @@ fn commit(
     }
 
     let version = committed.install(ws, remove_prefixes);
+    if let Some(w) = wal {
+        w.append(Rec::Commit { id: &id, base_version, source: &source, steps, version }, None);
+    }
     publish(snap_tx, committed, sm);
     let _ = events.send(Event::Tx { tx: id.clone(), count, version });
     match outcome {

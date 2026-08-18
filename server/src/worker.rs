@@ -37,6 +37,7 @@ pub struct Job {
 pub struct TxResult {
     pub id: TxId,
     pub base_version: u64,
+    pub source: String,
     pub btm: PathMap<()>,
     pub remove_prefixes: Vec<Vec<u8>>,
     pub count: usize,
@@ -141,8 +142,9 @@ pub fn spawn_workers(
                     // path the worker's `Space`/trie are simply discarded (never sent
                     // anywhere), so asserting unwind-safety here is sound.
                     let id2 = id.clone();
+                    let source2 = source.clone(); // `source` survives for the TxResult below
                     let run = std::panic::AssertUnwindSafe(|| {
-                        run_one(id2, base, source, sm.clone(), step_budget, budget_action)
+                        run_one(id2, base, source2, sm.clone(), step_budget, budget_action)
                     });
                     let parts = match std::panic::catch_unwind(run) {
                         Ok(parts) => parts,
@@ -165,6 +167,7 @@ pub fn spawn_workers(
                     let _ = results.send(TxResult {
                         id,
                         base_version,
+                        source,
                         btm: parts.btm,
                         remove_prefixes: parts.remove_prefixes,
                         count: parts.count,
