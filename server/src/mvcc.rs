@@ -138,6 +138,82 @@ pub fn validate(
     Ok(())
 }
 
+use std::collections::BTreeMap;
+
+/// The authoritative state, owned outright by the committer thread. No lock: there is
+/// exactly one owner, and workers receive their base snapshot by message.
+pub struct Committed {
+    pub btm: PathMap<()>,
+    pub version: u64,
+    /// Effects of recently committed transactions, for validating older ones.
+    pub history: VecDeque<CommitRecord>,
+    /// base_version -> number of live transactions started at it. The smallest key is
+    /// the watermark below which history can be discarded.
+    pub active_bases: BTreeMap<u64, usize>,
+}
+
+impl Committed {
+    pub fn new(btm: PathMap<()>, version: u64) -> Self {
+        Self { btm, version, history: VecDeque::new(), active_bases: BTreeMap::new() }
+    }
+
+    /// Register a transaction starting now, and return the version it starts from.
+    /// Its snapshot is `self.btm.clone()` — taken by the caller, O(1).
+    pub fn begin(&mut self) -> u64 {
+        *self.active_bases.entry(self.version).or_insert(0) += 1;
+        self.version
+    }
+
+    /// Deregister a finished transaction (committed OR aborted) and collect history.
+    pub fn end(&mut self, base_version: u64) {
+        if let Some(n) = self.active_bases.get_mut(&base_version) {
+            *n -= 1;
+            if *n == 0 { self.active_bases.remove(&base_version); }
+        }
+        self.gc();
+    }
+
+    /// Apply a validated writeset and return the new version.
+    ///
+    /// `added` and `removed` are disjoint, so the order of these two operations does
+    /// not matter. Both cost O(changed region) because the algebra short-circuits on
+    /// pointer identity wherever `btm` and the writeset share structure.
+    ///
+    /// `remove_prefixes` is stored verbatim into the resulting `CommitRecord` for
+    /// future callers of `validate` to read back out of `history`. The caller must
+    /// supply one ground prefix per removal pattern this transaction executed, each a
+    /// genuine prefix of everything that pattern can match — the same precondition
+    /// `validate` documents, since this is where that data is produced for it.
+    /// Omitting one, or supplying one narrower than the pattern, causes a silent
+    /// missed conflict later, not a spurious abort now.
+    pub fn install(&mut self, ws: WriteSet, remove_prefixes: Vec<Vec<u8>>) -> u64 {
+        self.btm = self.btm.join(&ws.added).subtract(&ws.removed);
+        self.version += 1;
+        self.history.push_back(CommitRecord {
+            version: self.version,
+            added: ws.added,
+            removed: ws.removed,
+            remove_prefixes,
+        });
+        self.version
+    }
+
+    /// Drop history no live transaction can still validate against.
+    ///
+    /// The watermark is the oldest live base, not the newest: `validate` walks
+    /// `history` looking for every record newer than a transaction's own base, so a
+    /// long-running transaction that started early still needs every record after it,
+    /// even ones a younger transaction (which started later and so already saw them)
+    /// no longer does. Using the newest base as the watermark would trim records the
+    /// old transaction still needs, producing missed conflicts.
+    fn gc(&mut self) {
+        let watermark = self.active_bases.keys().next().copied().unwrap_or(self.version);
+        while self.history.front().is_some_and(|c| c.version <= watermark) {
+            self.history.pop_front();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +407,62 @@ mod tests {
             validate(&mine, &[Vec::new()], 1, &h),
             Err(Conflict::Phantom)
         ));
+    }
+
+    // --- Committed: install and history GC ---
+
+    #[test]
+    fn install_applies_adds_and_removes_and_bumps_the_version() {
+        let mut c = Committed::new(map(&[b"a", b"b"]), 5);
+        let v = c.install(ws(&[b"c"], &[b"a"]), vec![]);
+        assert_eq!(v, 6);
+        assert_eq!(c.version, 6);
+        assert!(c.btm.contains(b"b"), "untouched path survives");
+        assert!(c.btm.contains(b"c"), "added path is present");
+        assert!(!c.btm.contains(b"a"), "removed path is gone");
+    }
+
+    #[test]
+    fn install_records_history_for_later_validators() {
+        let mut c = Committed::new(map(&[]), 0);
+        c.install(ws(&[b"x"], &[]), vec![b"edge".to_vec()]);
+        assert_eq!(c.history.len(), 1);
+        assert_eq!(c.history[0].version, 1);
+        assert_eq!(c.history[0].remove_prefixes, vec![b"edge".to_vec()]);
+    }
+
+    #[test]
+    fn gc_keeps_records_a_live_transaction_still_needs() {
+        let mut c = Committed::new(map(&[]), 0);
+        let old = c.begin();                        // base 0, stays live
+        c.install(ws(&[b"x"], &[]), vec![]);         // -> version 1
+        c.install(ws(&[b"y"], &[]), vec![]);         // -> version 2
+        let young = c.begin();                       // base 2, starts and ends immediately
+        c.end(young);                                // forces a gc call, watermark = 0 (old is still live)
+        assert_eq!(old, 0);
+        assert_eq!(c.history.len(), 2, "both records are newer than the still-live old transaction's base");
+    }
+
+    #[test]
+    fn gc_drops_records_no_transaction_can_still_need() {
+        let mut c = Committed::new(map(&[]), 0);
+        let base = c.begin();
+        c.install(ws(&[b"x"], &[]), vec![]);
+        c.install(ws(&[b"y"], &[]), vec![]);
+        c.end(base);                                 // no live transactions left
+        assert!(c.history.is_empty(), "nothing can validate against these any more");
+    }
+
+    #[test]
+    fn gc_respects_the_oldest_live_base_not_the_newest() {
+        let mut c = Committed::new(map(&[]), 0);
+        let old = c.begin();                         // base 0
+        c.install(ws(&[b"x"], &[]), vec![]);         // -> 1
+        let young = c.begin();                       // base 1
+        c.install(ws(&[b"y"], &[]), vec![]);         // -> 2
+        c.end(young);                                // the YOUNG one finishes first
+        assert_eq!(c.history.len(), 2, "the old transaction still needs both records");
+        c.end(old);
+        assert!(c.history.is_empty());
     }
 }
