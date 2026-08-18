@@ -33,10 +33,6 @@ pub struct TxOk {
 pub enum Event {
     /// A transaction's expressions were applied atomically; `count` = expressions added.
     Tx { tx: TxId, count: usize, version: u64 },
-    /// One VM step ran for `tx`: `exec` is the s-expr that executed (loc reported
-    /// unwrapped), `touched` = template instantiations performed, `new` = whether anything
-    /// not already present was written, `us` = duration in microseconds.
-    Step { tx: TxId, exec: String, touched: usize, new: bool, us: u64, version: u64 },
     /// **Per-transaction**: `tx` committed — it ran to quiescence (nothing steppable
     /// left) and its effects are permanent. The next queued transaction, if any, starts
     /// after this. Contrast with [`Event::Idle`].
@@ -64,7 +60,6 @@ impl Event {
     pub fn name(&self) -> &'static str {
         match self {
             Event::Tx { .. } => "tx",
-            Event::Step { .. } => "step",
             Event::Quiescent { .. } => "quiescent",
             Event::Idle { .. } => "idle",
             Event::Delta { .. } => "delta",
@@ -76,8 +71,6 @@ impl Event {
     pub fn data(&self) -> Value {
         match self {
             Event::Tx { tx, count, version } => json!({"tx": tx, "count": count, "version": version}),
-            Event::Step { tx, exec, touched, new, us, version } =>
-                json!({"tx": tx, "exec": exec, "touched": touched, "new": new, "us": us, "version": version}),
             Event::Quiescent { tx, version } => json!({"tx": tx, "version": version}),
             Event::Idle { version } => json!({"version": version}),
             Event::Delta { version, added, removed } => json!({"version": version, "added": added, "removed": removed}),
@@ -90,7 +83,7 @@ impl Event {
     /// (idle, delta, global errors) pass every filter.
     pub fn tx_id(&self) -> Option<&str> {
         match self {
-            Event::Tx { tx, .. } | Event::Step { tx, .. } | Event::Quiescent { tx, .. }
+            Event::Tx { tx, .. } | Event::Quiescent { tx, .. }
             | Event::Abort { tx, .. } | Event::Budget { tx, .. } => Some(tx),
             Event::Idle { .. } | Event::Delta { .. } => None,
         }

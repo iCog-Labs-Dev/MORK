@@ -12,6 +12,7 @@ mod mvcc;
 mod read;
 mod transaction;
 mod wal;
+mod worker;
 mod wrap;
 
 use std::collections::HashSet;
@@ -58,11 +59,20 @@ struct Args {
     /// transactions; 0 disables (the log grows unbounded).
     #[arg(long, default_value_t = 1024)]
     checkpoint_every: u64,
+    /// Number of transactions that may execute concurrently. 1 = the previous
+    /// sequential engine, exactly. Capped by the symbol table's writer-thread limit.
+    #[arg(long, default_value_t = 1)]
+    workers: usize,
 }
 
 fn main() {
     env_logger::init();
     let args = Args::parse();
+
+    if args.workers == 0 || args.workers > mork_interning::MAX_WRITER_THREADS {
+        eprintln!("--workers must be between 1 and {}", mork_interning::MAX_WRITER_THREADS);
+        std::process::exit(2);
+    }
 
     let (events, _keep) = broadcast::channel(args.events_buffer);
     let active = Arc::new(Mutex::new(HashSet::new()));
@@ -74,6 +84,7 @@ fn main() {
         fsync: args.fsync,
         checkpoint_every: args.checkpoint_every,
         tx_counter: tx_counter.clone(),
+        workers: args.workers,
     };
     let (tx_send, snap_rx, ready, engine_join) = engine::spawn_engine(events.clone(), active.clone(), cfg);
 

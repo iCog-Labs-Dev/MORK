@@ -75,26 +75,30 @@ def test_tx_filter(server: MorkClient) -> None:
             leaked.append(ev)
         assert leaked == []
 
-    # positive control: an unfiltered stream carries the third tx's step
+    # positive control: an unfiltered stream carries the third tx's quiescent event
+    # (per-step events aren't public state under concurrent execution; only
+    # per-transaction outcomes are)
     with server.events() as unfiltered:
         third = server.run("(exec go (, (fdst2 $x)) (, (fdst3 $x)))")
-        step = unfiltered.wait_for("step", tx=third.tx)
-        assert "fdst2" in step.data["exec"]
+        unfiltered.wait_for("quiescent", tx=third.tx)
 
 
 def test_exec_error_aborts_whole_transaction(server: MorkClient) -> None:
     """Atomicity: an exec the interpreter rejects rolls back the ENTIRE transaction —
-    including its data and the steps that already ran — and the server stays healthy."""
-    with server.events() as stream:
-        # First exec fires fine (good-out), second has a malformed pattern functor and
-        # is rejected by the interpreter — everything must revert.
-        res = server.run(
+    including its data and the steps that already ran — and the server stays healthy.
+    A worker runs a transaction to completion (load + step to its outcome) before the
+    committer's single reply fires, so a failing exec now surfaces as a rejected
+    POST /run (422) rather than a 200 followed by a later `abort` event."""
+    # First exec fires fine (good-out), second has a malformed pattern functor and
+    # is rejected by the interpreter — everything must revert.
+    with pytest.raises(MorkError) as excinfo:
+        server.run(
             "(keepme 1)\n"
             "(exec 0 (, (keepme $x)) (, (good-out $x)))\n"
             "(exec 1 (bad pattern) (bad template))"
         )
-        ev = stream.wait_for("abort", tx=res.tx)
-        assert "exec" in ev.data["reason"]
+    assert excinfo.value.status == 422
+    assert "exec" in excinfo.value.message
     out = server.export()
     assert "(keepme 1)" not in out          # the tx's own data: gone
     assert not any("good-out" in line for line in out)  # the successful step: reverted
@@ -134,10 +138,13 @@ def test_budget_commit_keeps_partial_progress(server: MorkClient) -> None:
     "server", [["--step-budget", "5", "--budget-action", "abort"]], indirect=True
 )
 def test_budget_abort_rolls_back(server: MorkClient) -> None:
-    with server.events() as stream:
-        res = server.run(DIVERGING)
-        ev = stream.wait_for("abort", tx=res.tx)
-        assert "budget" in ev.data["reason"]
+    """`--budget-action abort` fails the worker's run outright, so — same reply-timing
+    change as `test_exec_error_aborts_whole_transaction` — this now surfaces as a
+    rejected POST /run rather than a 200 followed by a later `abort` event."""
+    with pytest.raises(MorkError) as excinfo:
+        server.run(DIVERGING)
+    assert excinfo.value.status == 422
+    assert "budget" in excinfo.value.message
     out = server.export()
     assert not any("(n " in line or "prog" in line for line in out)  # no trace at all
 
@@ -151,22 +158,20 @@ def test_deltas_stream_added_expressions(server: MorkClient) -> None:
 
 
 def test_exec_namespaces_are_isolated(server: MorkClient) -> None:
-    """Two programs using the same exec loc run exactly one step each, sequentially —
-    namespacing keeps the second from re-firing the first's (already consumed) exec.
-    (The data region is shared by design, so both see `isrc`.)"""
+    """Two programs using the same exec loc run independently — namespacing keeps the
+    second from re-firing the first's (already consumed) exec.
+    (The data region is shared by design, so both see `isrc`.)
+    Per-step events are gone (not observable state under concurrent execution), so
+    isolation is checked via each tx quiescing and producing its own output only."""
     with server.events() as stream:
         a = server.run("(exec 0 (, (isrc $x)) (, (a-out $x)))\n(isrc 1)")
         b = server.run("(exec 0 (, (isrc $x)) (, (b-out $x)))")
-        steps: dict[str, int] = {}
         pending = {a.tx, b.tx}
         for ev in stream:
-            if ev.name == "step":
-                steps[ev.data["tx"]] = steps.get(ev.data["tx"], 0) + 1
-            elif ev.name == "quiescent":
+            if ev.name == "quiescent":
                 pending.discard(ev.data["tx"])
                 if not pending:
                     break
-        assert steps == {a.tx: 1, b.tx: 1}
     out = server.export()
     assert "(a-out 1)" in out
     assert "(b-out 1)" in out
@@ -174,27 +179,31 @@ def test_exec_namespaces_are_isolated(server: MorkClient) -> None:
 
 def test_concurrent_submissions_drain_sequentially(server: MorkClient) -> None:
     """8 adders submitted concurrently on distinct result channels: every racing
-    submission is queued and computes 2+2, and the sequential scheduler never
-    interleaves two transactions — each tx's steps form one contiguous block in the
-    event stream."""
+    submission is queued and computes 2+2, and with the default single worker the
+    committer never runs two transactions at once — each tx's `tx` event is
+    immediately followed by its own `quiescent`, with no other tx's events between
+    them. (Per-step events are gone under concurrent execution, so this checks
+    non-interleaving at the transaction granularity instead of the step granularity.)"""
     base = (EXAMPLES_DIR / "adder.metta").read_text()
     sources = [base.replace("result", f"result{i}") for i in range(8)]
     with server.events() as stream:
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(server.run, sources))
         pending = {r.tx for r in results}
-        step_order: list[str] = []
+        order: list[str] = []
+        open_tx: str | None = None
         for ev in stream:
-            if ev.name == "step":
-                step_order.append(ev.data["tx"])
+            if ev.name == "tx":
+                assert open_tx is None, f"tx {ev.data['tx']} started while {open_tx} was still open"
+                open_tx = ev.data["tx"]
+                order.append(open_tx)
             elif ev.name == "quiescent":
+                assert ev.data["tx"] == open_tx, f"quiescent for {ev.data['tx']} while {open_tx} was open"
+                open_tx = None
                 pending.discard(ev.data["tx"])
                 if not pending:
                     break
-    # Collapse consecutive runs; a tx appearing twice after collapsing means another
-    # transaction's step ran in the middle of its block.
-    collapsed = [tx for i, tx in enumerate(step_order) if i == 0 or tx != step_order[i - 1]]
-    assert len(collapsed) == len(set(collapsed)), f"steps interleaved: {collapsed}"
+    assert len(order) == len(set(order)), f"transactions interleaved: {order}"
     for i in range(8):
         out = server.export(pattern=f"[2] petri [3] ! result{i} $", template="_1")
         assert out == [PEANO_FOUR], f"adder {i} result wrong: {out}"
