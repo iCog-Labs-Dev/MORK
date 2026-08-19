@@ -17,6 +17,27 @@ The workspace requires the nightly toolchain:
 cargo +nightly run --release -p mork-server -- --addr 127.0.0.1:8081
 ```
 
+To enable long-running WAS background processes, provide a scheduler configuration:
+
+```sh
+cargo +nightly run --release -p mork-server -- \
+  --scheduler-config server/examples/scheduler.toml
+```
+
+```toml
+foreground_transactions_per_round = 10
+poll_interval_ms = 10
+
+[[processes]]
+id = "process_1"
+engine = "random_walk"
+cycles = 2
+```
+
+Process IDs must be unique, cycle counts must be positive, and engine names must be
+registered WAS traversal strategies. MM2 rules refer to these configured IDs with
+`(WAS process_1 <pattern>)`; MM2 never creates or starts an engine.
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--addr` | `127.0.0.1:8081` | Listen address |
@@ -26,6 +47,7 @@ cargo +nightly run --release -p mork-server -- --addr 127.0.0.1:8081
 | `--data-dir` | *(absent)* | Enable persistence: WAL + crash recovery rooted here. Absent = pure in-memory |
 | `--fsync` | `everysec` | When the log is fsynced: `always` = 200 means on disk (group-committed) · `everysec` = durable within ~1 s (Redis-style; the loss window covers process crash and power failure) · `no` = page cache decides |
 | `--checkpoint-every` | `1024` | Snapshot the space and delete pre-checkpoint log segments every N finished transactions; `0` disables (the log grows unbounded, recovery replays it in full) |
+| `--scheduler-config` | *(absent)* | TOML file defining WAS process IDs, traversal engines, cycle credits, and idle polling |
 
 Logging via `env_logger`: `RUST_LOG=info cargo +nightly run -p mork-server`.
 Stop with Ctrl-C (open connections are closed, the engine thread is joined).
