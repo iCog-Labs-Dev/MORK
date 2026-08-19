@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::{fs, io};
 
 use mork::space::Space;
+use mork::scheduler::{CycleScheduler, SchedulePolicy};
 use mork_expr::Expr;
 use mork_interning::SharedMappingHandle;
 use pathmap::PathMap;
@@ -25,6 +26,8 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::transaction::{EngineCmd, Event, ReadSnapshot, Transaction, TxId, TxOk};
 use crate::wal::{Ack, CkptMeta, FsyncPolicy, OwnedRec, Rec, Wal};
 use crate::{wal, wrap};
+use crate::scheduler_config::SchedulerConfig;
+use weighted_atom_sweep::ProcessId;
 
 /// What happens when a transaction exhausts its step budget.
 #[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
@@ -46,6 +49,7 @@ pub struct EngineConfig {
     pub checkpoint_every: u64,
     /// Shared with the HTTP layer; recovery restores it before `ready` fires.
     pub tx_counter: Arc<AtomicU64>,
+    pub scheduler: Option<SchedulerConfig>,
 }
 
 /// Returned alongside the channels: fires once recovery is done and the snapshot is
@@ -108,29 +112,77 @@ fn run(
     });
     let wal = wal.as_ref();
 
+    let mut scheduler = cfg.scheduler.as_ref().map(|scheduler_config| {
+        space.configure_was(scheduler_config.processes.iter().map(|process| {
+            (process.id.as_str(), process.engine.as_str())
+        })).expect("validated scheduler configuration must initialize WAS");
+
+        let mut scheduler = CycleScheduler::new(SchedulePolicy::Fair {
+            foreground_credits: scheduler_config.foreground_transactions_per_round,
+            background_credits_per_process: 1,
+        });
+        for process in &scheduler_config.processes {
+            scheduler.configure_process(ProcessId(process.id.clone()), process.cycles);
+        }
+        scheduler
+    });
+
     publish(&snap_tx, &space, version);
     let _ = ready.send(());
 
     let mut finished: u64 = 0; // transactions run to an outcome, for the checkpoint trigger
+    let mut idle_announced = false;
     loop {
-        // Drain queued submissions before parking; `Idle` is only truthful when both the
-        // space and the queue are empty.
-        match rx.try_recv() {
-            Ok(cmd) => {
-                dispatch_cmd(cmd, &mut space, &mut version, &snap_tx, &events, &active, &cfg, wal, &mut finished);
+        if let Some(cycle_scheduler) = scheduler.as_mut() {
+            let scheduler_config = cfg.scheduler.as_ref().unwrap();
+            let mut foreground_done = 0;
+            let mut disconnected = false;
+            for _ in 0..scheduler_config.foreground_transactions_per_round {
+                match rx.try_recv() {
+                    Ok(cmd) => {
+                        dispatch_cmd(cmd, &mut space, &mut version, &snap_tx, &events, &active, &cfg, wal, &mut finished);
+                        foreground_done += 1;
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            if disconnected {
+                break;
+            }
+
+            let background_done = cycle_scheduler.run_background_round(&mut space);
+            if background_done > 0 {
+                version += 1;
+                publish(&snap_tx, &space, version);
+            }
+            if foreground_done > 0 || background_done > 0 {
+                idle_announced = false;
                 continue;
             }
-            Err(mpsc::error::TryRecvError::Disconnected) => break,
-            Err(mpsc::error::TryRecvError::Empty) => {}
-        }
-        let _ = events.send(Event::Idle { version });
-        match rx.blocking_recv() {
-            Some(cmd) => {
-                dispatch_cmd(cmd, &mut space, &mut version, &snap_tx, &events, &active, &cfg, wal, &mut finished);
+            if !idle_announced {
+                let _ = events.send(Event::Idle { version });
+                idle_announced = true;
             }
-            None => break,
+            std::thread::sleep(std::time::Duration::from_millis(scheduler_config.poll_interval_ms));
+        } else {
+            if !idle_announced {
+                let _ = events.send(Event::Idle { version });
+                idle_announced = true;
+            }
+            match rx.blocking_recv() {
+                Some(cmd) => {
+                    dispatch_cmd(cmd, &mut space, &mut version, &snap_tx, &events, &active, &cfg, wal, &mut finished);
+                    idle_announced = false;
+                }
+                None => break,
+            }
         }
     }
+    space.was.shutdown_all();
     log::info!("engine: transaction channel closed, shutting down");
     // Dropping the Wal (owner is still in scope) drains its queue and final-fsyncs.
 }
@@ -152,47 +204,6 @@ fn dispatch_cmd(
             run_tx(space, t, version, snap_tx, events, active, cfg, wal);
             *finished += 1;
             maybe_checkpoint(space, *version, *finished, cfg, wal);
-        }
-        EngineCmd::SweepStart { reply } => {
-            println!("SERVER DEBUG: btm val_count BEFORE sweep = {}, root agg_w = {}", space.btm.val_count(), space.btm.read_zipper_at_path(&[]).agg_w());
-            let handle_name = space.sweep();
-            println!("SERVER DEBUG: btm val_count AFTER sweep = {}", space.btm.val_count());
-            if handle_name.is_empty() {
-                let _ = reply.send(Err("No (sweep ...) configuration found in space".into()));
-            } else {
-                let _ = reply.send(Ok(handle_name));
-            }
-        }
-        EngineCmd::SweepPause { reply } => {
-            if !space.was.controllers.is_empty() {
-                space.btm = space.was.pause_all();
-                *version += 1;
-                publish(snap_tx, space, *version);
-                let _ = reply.send(Ok(()));
-            } else {
-                let _ = reply.send(Err("No active sweep controllers to pause".into()));
-            }
-        }
-        EngineCmd::SweepResume { reply } => {
-            if !space.was.controllers.is_empty() {
-                let btm = std::mem::take(&mut space.btm);
-                space.was.resume_all(btm);
-                let _ = reply.send(Ok(()));
-            } else {
-                let _ = reply.send(Err("No sweep controllers to resume".into()));
-            }
-        }
-        EngineCmd::SweepStop { reply } => {
-            if !space.was.controllers.is_empty() {
-                if let Some(btm) = space.was.shutdown_all() {
-                    space.btm = btm;
-                }
-                *version += 1;
-                publish(snap_tx, space, *version);
-                let _ = reply.send(Ok(()));
-            } else {
-                let _ = reply.send(Err("No sweep controllers running".into()));
-            }
         }
     }
 }
@@ -261,11 +272,6 @@ fn run_tx(
         }
     }
 
-    let was_running = space.was.map.is_some();
-    if was_running {
-        space.btm = space.was.pause_all();
-    }
-
     let undo = space.btm.clone();
     match space.add_all_sexpr(source.as_bytes()) {
         Ok(count) => {
@@ -322,20 +328,12 @@ fn run_tx(
                 version: *version,
             });
             let _ = reply.send(Err(reason));
-            if was_running {
-                let btm = std::mem::take(&mut space.btm);
-                space.was.resume_all(btm);
-            }
             return;
         }
     }
 
     finish_tx(space, &id, undo, version, snap_tx, events, active, cfg, wal);
 
-    if was_running {
-        let btm = std::mem::take(&mut space.btm);
-        space.was.resume_all(btm);
-    }
 }
 
 /// Step `txid` to its outcome — quiescent commit, budget stop, or abort — emitting the
@@ -446,6 +444,13 @@ fn finish_tx(
             }
         }
     }
+    // WAS workers may only observe a transaction after it has reached a final
+    // commit or rollback state. Publish that immutable boundary snapshot here,
+    // rather than the intermediate snapshots exposed by individual VM steps.
+    space.snapshot_version = *version;
+    space
+        .was
+        .publish_snapshot(space.btm.clone(), space.snapshot_version);
     active.lock().unwrap().remove(txid);
 }
 

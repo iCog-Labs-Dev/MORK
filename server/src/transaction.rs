@@ -25,10 +25,6 @@ pub struct Transaction {
 /// goes through this channel — `Space` is `!Send`, so only the engine thread touches it.
 pub enum EngineCmd {
     Tx(Transaction),
-    SweepStart { reply: tokio::sync::oneshot::Sender<Result<String, String>> },
-    SweepPause { reply: tokio::sync::oneshot::Sender<Result<(), String>> },
-    SweepResume { reply: tokio::sync::oneshot::Sender<Result<(), String>> },
-    SweepStop { reply: tokio::sync::oneshot::Sender<Result<(), String>> },
 }
 
 pub struct TxOk {

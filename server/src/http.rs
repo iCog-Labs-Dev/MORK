@@ -24,10 +24,6 @@ pub async fn handle(req: Request<Incoming>, state: Arc<ServerState>) -> Result<R
     let query = parse_query(parts.uri.query().unwrap_or(""));
     let resp = match (parts.method.clone(), parts.uri.path()) {
         (Method::POST, "/run") => run_transaction(body, &state).await,
-        (Method::POST, "/sweep/start") => handle_sweep_start(&state).await,
-        (Method::POST, "/sweep/pause") => handle_sweep_pause(&state).await,
-        (Method::POST, "/sweep/resume") => handle_sweep_resume(&state).await,
-        (Method::POST, "/sweep/stop") => handle_sweep_stop(&state).await,
         (Method::GET, "/events") => events::sse_response(
             &state,
             query.get("tx").cloned(),
@@ -73,54 +69,6 @@ async fn run_transaction(body: Incoming, state: &Arc<ServerState>) -> Response<B
         Ok(Err(e)) if e.starts_with("unavailable:") => {
             json_response(StatusCode::SERVICE_UNAVAILABLE, json!({"ok": false, "error": e}))
         }
-        Ok(Err(e)) => json_response(StatusCode::UNPROCESSABLE_ENTITY, json!({"ok": false, "error": e})),
-        Err(_) => json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "error": "engine dropped the reply"})),
-    }
-}
-
-async fn handle_sweep_start(state: &Arc<ServerState>) -> Response<Body> {
-    let (reply, reply_rx) = tokio::sync::oneshot::channel();
-    if state.tx_send.send(EngineCmd::SweepStart { reply }).await.is_err() {
-        return json_response(StatusCode::SERVICE_UNAVAILABLE, json!({"ok": false, "error": "engine is shut down"}));
-    }
-    match reply_rx.await {
-        Ok(Ok(handle)) => json_response(StatusCode::OK, json!({"ok": true, "handle": handle})),
-        Ok(Err(e)) => json_response(StatusCode::UNPROCESSABLE_ENTITY, json!({"ok": false, "error": e})),
-        Err(_) => json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "error": "engine dropped the reply"})),
-    }
-}
-
-async fn handle_sweep_pause(state: &Arc<ServerState>) -> Response<Body> {
-    let (reply, reply_rx) = tokio::sync::oneshot::channel();
-    if state.tx_send.send(EngineCmd::SweepPause { reply }).await.is_err() {
-        return json_response(StatusCode::SERVICE_UNAVAILABLE, json!({"ok": false, "error": "engine is shut down"}));
-    }
-    match reply_rx.await {
-        Ok(Ok(())) => json_response(StatusCode::OK, json!({"ok": true})),
-        Ok(Err(e)) => json_response(StatusCode::UNPROCESSABLE_ENTITY, json!({"ok": false, "error": e})),
-        Err(_) => json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "error": "engine dropped the reply"})),
-    }
-}
-
-async fn handle_sweep_resume(state: &Arc<ServerState>) -> Response<Body> {
-    let (reply, reply_rx) = tokio::sync::oneshot::channel();
-    if state.tx_send.send(EngineCmd::SweepResume { reply }).await.is_err() {
-        return json_response(StatusCode::SERVICE_UNAVAILABLE, json!({"ok": false, "error": "engine is shut down"}));
-    }
-    match reply_rx.await {
-        Ok(Ok(())) => json_response(StatusCode::OK, json!({"ok": true})),
-        Ok(Err(e)) => json_response(StatusCode::UNPROCESSABLE_ENTITY, json!({"ok": false, "error": e})),
-        Err(_) => json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "error": "engine dropped the reply"})),
-    }
-}
-
-async fn handle_sweep_stop(state: &Arc<ServerState>) -> Response<Body> {
-    let (reply, reply_rx) = tokio::sync::oneshot::channel();
-    if state.tx_send.send(EngineCmd::SweepStop { reply }).await.is_err() {
-        return json_response(StatusCode::SERVICE_UNAVAILABLE, json!({"ok": false, "error": "engine is shut down"}));
-    }
-    match reply_rx.await {
-        Ok(Ok(())) => json_response(StatusCode::OK, json!({"ok": true})),
         Ok(Err(e)) => json_response(StatusCode::UNPROCESSABLE_ENTITY, json!({"ok": false, "error": e})),
         Err(_) => json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "error": "engine dropped the reply"})),
     }
