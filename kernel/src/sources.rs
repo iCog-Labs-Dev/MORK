@@ -5,16 +5,18 @@ use pathmap::zipper::*;
 use mork_expr::{byte_item, destruct, item_byte, serialize, Expr, Tag};
 use mork_expr::macros::SerializableExpr;
 
-pub enum ResourceRequest {
+pub(crate) enum ResourceRequest {
     BTM(&'static [u8]),
     ACT(&'static str),
-    Z3(&'static str)
+    Z3(&'static str),
+    WAS(weighted_atom_sweep::ProcessId),
 }
 
 pub(crate) enum Resource<'trie, 'path> {
     BTM(ReadZipperUntracked<'trie, 'path, u64>),
     ACT(ACTMmapZipper<'trie, u64>),
-    Z3(ReadZipperOwned<u64>)
+    Z3(ReadZipperOwned<u64>),
+    WAS(ReadZipperOwned<u64>),
 }
 
 pub(crate) trait Source {
@@ -127,6 +129,50 @@ impl Source for Z3Source {
     }
 }
 
+pub(crate) struct WASSource {
+    e: Expr,
+    process_id: weighted_atom_sweep::ProcessId,
+}
+impl Source for WASSource {
+    fn new(e: Expr) -> Self {
+        destruct!(e, ("WAS" {process_id: &str} se), {
+            return WASSource {
+                e,
+                process_id: weighted_atom_sweep::ProcessId(process_id.to_string()),
+            }
+        }, _err => { panic!("WAS not the right shape: {:?}", e) });
+    }
+
+    fn request(&self) -> impl Iterator<Item = ResourceRequest> {
+        std::iter::once(ResourceRequest::WAS(self.process_id.clone()))
+    }
+
+    fn source<'trie, 'path, It: Iterator<Item = Resource<'trie, 'path>>>(
+        &self,
+        mut it: It,
+    ) -> AFactor<'trie, u64>
+    where
+        'path: 'trie,
+    {
+        static CONSTANT_PREFIX: [u8; 5] = [
+            item_byte(Tag::Arity(3)),
+            item_byte(Tag::SymbolSize(3)),
+            b'W',
+            b'A',
+            b'S',
+        ];
+        let Resource::WAS(rz) = it.next().unwrap() else {
+            unreachable!()
+        };
+        let process_name = &self.process_id.0;
+        let mut prefix = vec![];
+        prefix.extend_from_slice(&CONSTANT_PREFIX[..]);
+        prefix.push(item_byte(Tag::SymbolSize(process_name.len() as u8)));
+        prefix.extend_from_slice(process_name.as_bytes());
+        let rz = PrefixZipper::new(prefix, rz);
+        AFactor::WASSource(rz)
+    }
+}
 
 struct CmpSource {
     e: Expr,
@@ -194,7 +240,8 @@ impl Source for CmpSource {
 
 pub enum ASource { PosSource(BTMSource), ACTSource(ACTSource), CmpSource(CmpSource), CompatSource(CompatSource),
     #[cfg(feature = "z3")]
-    Z3Source(Z3Source)
+    Z3Source(Z3Source),
+    WASSource(WASSource),
 }
 
 #[derive(PolyZipper)]
@@ -206,6 +253,7 @@ pub enum AFactor<'trie, V: Clone + Send + Sync + Unpin + 'static = u64> {
         ReadZipperOwned<V>, V, (usize, PathMap<u64>), for<'a> fn((usize, PathMap<u64>), &'a [u8], usize) -> ((usize, PathMap<u64>), Option<ReadZipperOwned<V>>)>>),
     #[cfg(feature = "z3")]
     Z3Source(PrefixZipper<'trie, ReadZipperOwned<V>>),
+    WASSource(PrefixZipper<'trie, ReadZipperOwned<V>>),
 }
 
 impl ASource {
@@ -225,6 +273,8 @@ impl Source for ASource {
             return ASource::Z3Source(Z3Source::new(e));
             #[cfg(not(feature = "z3"))]
             panic!("MORK was not built with the z3 feature, yet trying to call {:?}", e);
+        } else if unsafe { *e.ptr == item_byte(Tag::Arity(3)) && *e.ptr.offset(1) == item_byte(Tag::SymbolSize(3)) && *e.ptr.offset(2) == b'W' && *e.ptr.offset(3) == b'A' && *e.ptr.offset(4) == b'S' } {
+            ASource::WASSource(WASSource::new(e))
         } else if unsafe { *e.ptr == item_byte(Tag::Arity(3)) && *e.ptr.offset(1) == item_byte(Tag::SymbolSize(2)) && (*e.ptr.offset(2) == b'=' || *e.ptr.offset(2) == b'!') && *e.ptr.offset(3) == b'=' } {
             ASource::CmpSource(CmpSource::new(e))
         } else {
@@ -239,6 +289,7 @@ impl Source for ASource {
                 ASource::ACTSource(s) => { for i in s.request().into_iter() { yield i } }
                 ASource::CmpSource(s) => { for i in s.request().into_iter() { yield i } }
                 ASource::CompatSource(s) => { for i in s.request().into_iter() { yield i } }
+                ASource::WASSource(s) => { for i in s.request().into_iter() { yield i } }
                 #[cfg(feature = "z3")]
                 ASource::Z3Source(s) => { for i in s.request().into_iter() { yield i } }
             }
@@ -252,7 +303,8 @@ impl Source for ASource {
             ASource::CmpSource(s) => { s.source(it) }
             ASource::CompatSource(s) => { s.source(it) }
             #[cfg(feature = "z3")]
-            ASource::Z3Source(s) => { s.source(it) }
+            ASource::Z3Source(s) => { s.source(it) },
+            ASource::WASSource(s) => s.source(it),
         }
     }
 }
