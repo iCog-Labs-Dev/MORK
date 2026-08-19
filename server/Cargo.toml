@@ -9,6 +9,7 @@ mork-expr = { workspace = true }
 mork-interning = { workspace = true }
 mork-frontend = { workspace = true }
 pathmap = { workspace = true }
+weighted-atom-sweep = { path = "../weighted-atom-sweep" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "signal", "macros"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -18,6 +19,8 @@ http-body-util = "0.1"
 bytes = "1"
 
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
 crc32fast = "1"
 clap = { version = "4", features = ["derive"] }
 log = { workspace = true }

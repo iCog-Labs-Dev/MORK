@@ -6,6 +6,7 @@
 //! execs) IS running it.
 
 mod engine;
+mod scheduler_config;
 mod events;
 mod http;
 mod read;
@@ -57,11 +58,18 @@ struct Args {
     /// transactions; 0 disables (the log grows unbounded).
     #[arg(long, default_value_t = 1024)]
     checkpoint_every: u64,
+    /// TOML configuration for long-running WAS processes and scheduler credits.
+    #[arg(long)]
+    scheduler_config: Option<std::path::PathBuf>,
 }
 
 fn main() {
     env_logger::init();
     let args = Args::parse();
+    let scheduler = args.scheduler_config.as_deref().map(|path| {
+        scheduler_config::SchedulerConfig::from_path(path)
+            .unwrap_or_else(|e| panic!("invalid scheduler config {}: {e}", path.display()))
+    });
 
     let (events, _keep) = broadcast::channel(args.events_buffer);
     let active = Arc::new(Mutex::new(HashSet::new()));
@@ -73,6 +81,7 @@ fn main() {
         fsync: args.fsync,
         checkpoint_every: args.checkpoint_every,
         tx_counter: tx_counter.clone(),
+        scheduler,
     };
     let (tx_send, snap_rx, ready, engine_join) = engine::spawn_engine(events.clone(), active.clone(), cfg);
 

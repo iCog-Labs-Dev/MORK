@@ -1,0 +1,12 @@
+foreground_transactions_per_round = 10
+poll_interval_ms = 10
+
+[[processes]]
+id = "walker"
+engine = "random_walk"
+cycles = 3
+
+[[processes]]
+id = "priority"
+engine = "cpq"
+cycles = 3
