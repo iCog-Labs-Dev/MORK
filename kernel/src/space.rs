@@ -22,21 +22,29 @@ use pathmap::zipper::*;
 use pathmap::arena_compact::ArenaCompactTree;
 use pathmap::{zipper, PathMap};
 use weighted_atom_sweep::{WeightedAtomSweep, WeightedAtomSweepSettings};
-use weighted_atom_sweep::new_eng_op::{build_operation, build_strategy};
-use weighted_atom_sweep::OperationObserver;
+use subprocess::{Popen, PopenConfig, Redirection};
+use weighted_atom_sweep::traversal_factory::build_strategy;
 use mork_frontend::json_parser::Transcriber;
 use log::*;
-use subprocess::{Popen, PopenConfig, Redirection};
 use subprocess::unix::PopenExt;
 use crate::sinks::{WriteResource, WriteResourceRequest};
 use crate::sources::{AFactor, Resource, ResourceRequest};
 
-pub static transitions: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static unifications: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static writes: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static mut transitions: usize = 0;
+pub static mut unifications: usize = 0;
+pub static mut writes: usize = 0;
 
 pub static ACT_PATH: &'static str = "/dev/shm/";
 // pub static ACT_PATH: &'static str = "/mnt/data/";
+
+/// One consumed exec reported by scoped metta-calculus execution.
+pub struct StepInfo<'e> {
+    pub exec: &'e [u8],
+    pub touched: usize,
+    pub new: bool,
+    pub micros: u64,
+    pub error: Option<&'static str>,
+}
 
 pub struct Space {
     pub btm: PathMap<u64>,
@@ -45,7 +53,8 @@ pub struct Space {
     pub mmaps: HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
     pub z3s: HashMap<OwnedSourceItem, Box<Popen>>,
     pub last_merkleize: Instant,
-    pub timing: bool
+    pub timing: bool,
+    pub snapshot_version: u64,
 }
 
 pub(crate) const SIZES: [u64; 4] = {
@@ -118,7 +127,7 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
     trace!(target: "coref trans", "loc {}    len {}", serialize(loc.path()), loc.path().len());
     // trace!(target: "coref trans", "loc {} ({:?})    len {}    ops {:?} ({:?})", serialize(loc.path()), loc.path(), loc.path().len(), loc.child_mask(), loc.child_mask().iter().map(byte_item).collect::<Vec<_>>());
     trace!(target: "coref trans", "top {}", stack.last().map(|x| x.show()).unwrap_or_else(|| "empty".into()));
-    transitions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    unsafe { transitions += 1 };
     match stack.pop() {
         None => { f(loc) }
         Some(e) => {
@@ -126,14 +135,12 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
 
             match byte_item(e_byte) {
                 Tag::NewVar => {
-                    let restore = if e.n == 0 {
-                        let idx = e.v as usize;
-                        if references.len() <= idx { references.resize(idx + 1, u32::MAX) }
-                        let prev = references[idx];
-                        references[idx] = loc.path().len() as u32;
-                        Some((idx, prev))
-                    } else { None };
-
+                    if e.n == 0 {
+                        references.push(loc.path().len() as u32);
+                    } else {
+                        trace!(target: "coref trans", "not putting {} {}", e.n, e.show());
+                        // trace!(target: "coref trans", "not putting against {:?}", loc.child_mask());
+                    }
                     vs!(e, true);
 
                     let m = loc.child_mask().and(&ByteMask(SIZES));
@@ -164,10 +171,11 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
                         if !loc.ascend_byte() { unreachable_unchecked() };
                     }
 
-                    if let Some((idx, prev)) = restore { references[idx] = prev; }
+                    if e.n == 0 { references.pop(); }
                 }
                 Tag::VarRef(i) => {
-                    let addition = if e.n == 0 && (i as usize) < references.len() && references[i as usize] != u32::MAX {
+                    // let addition = if e.n == 0 && references[i as usize] != u32::MAX {
+                    let addition = if e.n == 0 {
                         if i as usize >= references.len() {
                             trace!(target: "coref trans", "i {i} #references {}", references.len());
                             stack.push(e);
@@ -210,9 +218,9 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
                 }
             }
 
-            stack.push(e);
+                stack.push(e);
+            }
         }
-    }
     }
 }
 
@@ -275,7 +283,7 @@ impl <'a, 'b, 'c> SpaceTranscriber<'a, 'b, 'c> {
         let mut path = vec![item_byte(Tag::SymbolSize(token.len() as u8))];
         path.extend(token);
         self.wz.descend_to(&path[..]);
-        self.wz.set_val(1u64);
+        self.wz.set_val_w(1u64);
         self.wz.ascend(path.len());
     }
 }
@@ -447,18 +455,18 @@ macro_rules! sexpr {
     }};
 }
 
-/// One consumed exec, reported by [`Space::metta_calculus_scoped`]'s `on_step` callback.
-pub struct StepInfo<'e> {
-    pub exec: &'e [u8],
-    pub touched: usize,
-    pub new: bool,
-    pub micros: u64,
-    pub error: Option<&'static str>,
-}
-
 impl Space {
     pub fn new() -> Self {
-        Self { btm: PathMap::new(), was: WeightedAtomSweep::new(WeightedAtomSweepSettings::default()), sm: SharedMapping::new(), mmaps: HashMap::new(), z3s: HashMap::new(), last_merkleize: Instant::now(), timing: false }
+        Self {
+            btm: PathMap::new(),
+            was: WeightedAtomSweep::new(WeightedAtomSweepSettings::default()),
+            sm: SharedMapping::new(),
+            mmaps: HashMap::new(),
+            z3s: HashMap::new(),
+            last_merkleize: Instant::now(),
+            timing: false,
+            snapshot_version: 0,
+        }
     }
 
     pub fn parse_sexpr(&mut self, r: &[u8], buf: *mut u8) -> Result<(Expr, usize), ParserError> {
@@ -669,10 +677,10 @@ impl Space {
         let graph = Graph::new(uri, user, pass).unwrap();
 
         let rt = tokio::runtime::Builder::new_current_thread()
-          .enable_io()
-          // .unhandled_panic(tokio::runtime::UnhandledPanic::Ignore)
-          .build()
-          .unwrap();
+            .enable_io()
+            // .unhandled_panic(tokio::runtime::UnhandledPanic::Ignore)
+            .build()
+            .unwrap();
         let mut pdp = ParDataParser::new(&self.sm);
 
         let mut count = 0;
@@ -710,7 +718,10 @@ impl Space {
                 ez.loc += internal.len() + 1;
             }
             // println!("{}", serialize(ez.span()));
-            unsafe {                 self.btm.insert(ez.span(), 1u64); }
+            unsafe {
+                let mut wz = self.btm.write_zipper_at_path(ez.span());
+                wz.set_val_w(1u64);
+            }
             count += 1;
             if count % 1000000 == 0 {
                 println!("{count} triples");
@@ -725,13 +736,13 @@ impl Space {
         let graph = Graph::new(uri, user, pass).unwrap();
 
         let rt = tokio::runtime::Builder::new_current_thread()
-          .enable_io()
-          // .unhandled_panic(tokio::runtime::UnhandledPanic::Ignore)
-          .build()
-          .unwrap();
+            .enable_io()
+            // .unhandled_panic(tokio::runtime::UnhandledPanic::Ignore)
+            .build()
+            .unwrap();
         let mut pdp = ParDataParser::new(&self.sm);
         let zh = self.btm.zipper_head();
-        let mut wz = zh.write_zipper_at_exclusive_path(&[]).unwrap();
+        let mut wz = zh.write_zipper_at_exclusive_root_w().unwrap();
         let sa_symbol = pdp.tokenizer("NKV".as_bytes());
         let mut nodes = 0;
         let mut attributes = 0;
@@ -797,13 +808,13 @@ impl Space {
         let graph = Graph::new(uri, user, pass).unwrap();
 
         let rt = tokio::runtime::Builder::new_current_thread()
-          .enable_io()
-          // .unhandled_panic(tokio::runtime::UnhandledPanic::Ignore)
-          .build()
-          .unwrap();
+            .enable_io()
+            // .unhandled_panic(tokio::runtime::UnhandledPanic::Ignore)
+            .build()
+            .unwrap();
         let mut pdp = ParDataParser::new(&self.sm);
         let zh = self.btm.zipper_head();
-        let mut wz = zh.write_zipper_at_exclusive_path(&[]).unwrap();
+        let mut wz = zh.write_zipper_at_exclusive_root_w().unwrap();
         let sa_symbol = pdp.tokenizer("NL".as_bytes());
         let mut nodes = 0;
         let mut labels = 0;
@@ -865,8 +876,9 @@ impl Space {
                             wz.set_val_w(weight);
                             zh.cleanup_write_zipper_w(wz);
                         }
+                    } else {
+                        self.btm.remove_val_at_w(data, true);
                     }
-                    else { self.btm.remove(data); }
                 }
                 Err(ParserError::InputFinished) => { break }
                 Err(other) => { panic!("{:?}", other) }
@@ -903,8 +915,11 @@ impl Space {
                     }
                     let new_data = &buffer[..oz.loc];
                     wz.move_to_path(&new_data[constant_template_prefix.len()..]);
-                    if add { wz.set_val(weight); }
-                    else { wz.remove_val(true); }
+                    if add {
+                        wz.set_val_w(weight);
+                    } else if wz.set_val_w(0u64).is_some() {
+                        wz.remove_val(true);
+                    }
                     wz.reset();
                 }
                 Err(ParserError::InputFinished) => { break }
@@ -927,12 +942,12 @@ impl Space {
             // println!("{}", serialize(rz.path()));
             Expr{ ptr: rz.path().as_ptr().cast_mut() }.serialize2(w, |s| {
                 #[cfg(feature="interning")]
-                {
-                    let symbol = i64::from_be_bytes(s.try_into().unwrap()).to_be_bytes();
+                    {
+                        let symbol = i64::from_be_bytes(s.try_into().unwrap()).to_be_bytes();
                     let mstr = sm.get_bytes(symbol).map(unsafe { |x| std::str::from_utf8_unchecked(x) });
-                    // println!("symbol {symbol:?}, bytes {mstr:?}");
+                        // println!("symbol {symbol:?}, bytes {mstr:?}");
                     unsafe { std::mem::transmute(mstr.expect(format!("failed to look up {:?}", symbol).as_str())) }
-                }
+                    }
                 #[cfg(not(feature="interning"))]
                 unsafe { std::mem::transmute(std::str::from_utf8_unchecked(s)) }
             }, |i, intro| { Expr::VARNAMES[i as usize] });
@@ -960,57 +975,57 @@ impl Space {
         Self::query_multi(btm, Expr{ ptr: pat.leak().as_mut_ptr() }, |refs_bindings, loc| 'query : {
             let mut oz = ExprZipper::new(Expr { ptr: buffer.as_mut_ptr() });
 
-            match refs_bindings {
-                Ok(refs) => {
-                    assert!(false)
-                }
-                Err(ref bindings) => {
-                    buffer.clear();
+                match refs_bindings {
+                    Ok(refs) => {
+                        assert!(false)
+                    }
+                    Err(ref bindings) => {
+                        buffer.clear();
 
                     let (oi, ni, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0, pattern, bindings, buffer, stack, assignments)
-                    else { break 'query true};
+                    else { break 'query false};
 
-                    buffer.clear();
+                        buffer.clear();
 
                     let (_,_,true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni, template, bindings, buffer, stack, assignments)
-                    else { break 'query true;};
+                    else { break 'query false;};
+                    }
                 }
-            }
 
-            // &buffer[constant_template_prefix.len()..oz.loc]
+                // &buffer[constant_template_prefix.len()..oz.loc]
             Expr{ ptr: buffer.as_ptr().cast_mut() }.serialize2(w, |s| {
                 #[cfg(feature="interning")]
-                {
-                    let symbol = i64::from_be_bytes(s.try_into().unwrap()).to_be_bytes();
+                        {
+                            let symbol = i64::from_be_bytes(s.try_into().unwrap()).to_be_bytes();
                     let mstr = sm.get_bytes(symbol).map(unsafe { |x| std::str::from_utf8_unchecked(x) });
-                    // println!("symbol {symbol:?}, bytes {mstr:?}");
+                            // println!("symbol {symbol:?}, bytes {mstr:?}");
                     unsafe { std::mem::transmute(mstr.expect(format!("failed to look up {:?}", symbol).as_str())) }
-                }
+                        }
                 #[cfg(not(feature="interning"))]
                 unsafe { std::mem::transmute(std::str::from_utf8_unchecked(s)) }
             }, |i, intro| { Expr::VARNAMES[i as usize] });
-            let mut buffer_slice = &mut buffer[..];
-            w.write(&[b'\n']).map_err(|x| x.to_string()).unwrap();
+                let mut buffer_slice = &mut buffer[..];
+                w.write(&[b'\n']).map_err(|x| x.to_string()).unwrap();
 
-            true
+                true
         })
     }
 
     pub fn backup_symbols<out_dir_path : AsRef<std::path::Path>>(&self, path: out_dir_path) -> Result<(), std::io::Error>  {
         #[cfg(feature="interning")]
         {
-        self.sm.serialize(path)
+            self.sm.serialize(path)
         }
         #[cfg(not(feature="interning"))]
         {
-        Ok(())
+            Ok(())
         }
     }
 
     pub fn restore_symbols(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), std::io::Error> {
         #[cfg(feature="interning")]
         {
-        self.sm = SharedMapping::deserialize(path)?;
+            self.sm = SharedMapping::deserialize(path)?;
         }
         Ok(())
     }
@@ -1024,7 +1039,8 @@ impl Space {
         let tree = pathmap::arena_compact::ArenaCompactTree::open_mmap(path)?;
         let mut rz = tree.read_zipper();
         while rz.to_next_val() {
-            self.btm.insert(rz.path(), 1u64);
+            let mut wz = self.btm.write_zipper_at_path(rz.path());
+            wz.set_val_w(1u64);
         }
         Ok(())
     }
@@ -1061,18 +1077,21 @@ impl Space {
 
     #[inline]
     unsafe fn read_handler<'trie, 'path>(btm: *const PathMap<u64>,
-                    mmaps: *mut HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
-                    z3s: *mut HashMap<OwnedSourceItem, Box<Popen>>,
-                    request: ResourceRequest) -> Resource<'trie, 'path> {
+        mmaps: *mut HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
+        z3s: *mut HashMap<OwnedSourceItem, Box<Popen>>,
+        was: *mut WeightedAtomSweep,
+        snapshot_version: u64,
+        request: ResourceRequest,
+    ) -> Resource<'trie, 'path> {
         match request {
             ResourceRequest::BTM(prefix) => {
                 Resource::BTM(btm.as_ref().unwrap().read_zipper_at_path(prefix))
             }
             ResourceRequest::ACT(name) => {
                 let act = mmaps.as_mut().unwrap().entry(OwnedSourceItem::from(name)).or_insert_with(|| {
-                    trace!(target: "query_multi_i", "open new ACT {}", name);
-                    ArenaCompactTree::open_mmap(format!("{ACT_PATH}{name}.act")).unwrap()
-                });
+                        trace!(target: "query_multi_i", "open new ACT {}", name);
+                        ArenaCompactTree::open_mmap(format!("{ACT_PATH}{name}.act")).unwrap()
+                    });
                 trace!(target: "query_multi_i", "taking RZ of {}", name);
                 Resource::ACT(act.read_zipper_u64())
             }
@@ -1107,19 +1126,44 @@ impl Space {
                     Resource::Z3(PathMap::new().into_read_zipper(&[]))
                 }
             }
+            ResourceRequest::WAS(process_id) => {
+                trace!(target: "query_multi_i", "getting WAS candidates for process {:?}", process_id);
+                let was_ref = was.as_mut().unwrap();
+                let btm_ref = btm.as_ref().unwrap();
+
+                // One source execution consumes one candidate event. Keeping
+                // occurrences separate preserves traversal multiplicity while
+                // still presenting ProductZipper with a normal trie factor.
+                let mut temp_map = PathMap::<u64>::new();
+                let selected = was_ref.take_selected_candidate(&process_id);
+                let mut candidates = selected.into_iter().chain(std::iter::from_fn(|| {
+                    was_ref.pop_candidate(&process_id)
+                }));
+                while let Some(candidate) = candidates.next() {
+                    let z = btm_ref.read_zipper_at_path(&candidate.path);
+                    if let Some(&val) = z.val() {
+                        let mut wz = temp_map.write_zipper_at_path(&candidate.path);
+                        wz.set_val_w(val);
+                        break;
+                    }
+                }
+
+                Resource::WAS(temp_map.into_read_zipper(&[]))
+            }
         }
     }
 
     #[inline]
     unsafe fn write_handler<'w, 'a, 'k>(zh_wzs: (*mut ZipperHead<'w, 'a, u64>, *mut Vec<WriteZipperTracked<'a, 'k, u64>>),
-                mmaps: *mut HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
-                z3s: *mut HashMap<OwnedSourceItem, Box<Popen>>,
+        mmaps: *mut HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
+        z3s: *mut HashMap<OwnedSourceItem, Box<Popen>>,
                 request: &WriteResourceRequest) -> WriteResource<'w, 'a, 'k> where 'w : 'a {
         match *request {
             WriteResourceRequest::BTM(p) => {
                 let zh = zh_wzs.0.as_mut().unwrap();
                 let wzs = zh_wzs.1.as_mut::<'w>().unwrap();
-                wzs.push(zh.write_zipper_at_exclusive_path_unchecked(p));
+                debug_assert!(p.is_empty());
+                wzs.push(zh.write_zipper_at_exclusive_root_w().unwrap());
                 WriteResource::BTM(wzs.last_mut().unwrap())
             }
             WriteResourceRequest::ACT(f) => {
@@ -1131,11 +1175,11 @@ impl Space {
                 cfg.stdout = Redirection::Pipe;
                 trace!(target: "transform", "retrieving z3 instance");
                 let instance = z3s.as_mut().unwrap().entry(OwnedSourceItem::from(f)).or_insert_with(|| {
-                    trace!(target: "transform", "creating new z3 popen");
-                    // let bpopen = Box::new(Popen::create(&["python", "resources/fake_cli.py", "-in", "-smt2"], cfg).unwrap());
+                        trace!(target: "transform", "creating new z3 popen");
+                        // let bpopen = Box::new(Popen::create(&["python", "resources/fake_cli.py", "-in", "-smt2"], cfg).unwrap());
                     let bpopen = Box::new(Popen::create(&["z3", "-in", "-smt2"], cfg).expect("z3: command not found"));
-                    trace!(target: "transform", "created new z3 popen");
-                    bpopen
+                        trace!(target: "transform", "created new z3 popen");
+                        bpopen
                 }).as_mut();
                 WriteResource::Z3(instance)
             }
@@ -1143,9 +1187,14 @@ impl Space {
     }
 
     pub fn query_multi_i<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(no_source: bool,
-            mmaps: &mut HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
-            z3s: &mut HashMap<OwnedSourceItem, Box<Popen>>,
-            btm: &PathMap<u64>, pat_expr: Expr, mut effect: F) -> usize {
+        mmaps: &mut HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
+        z3s: &mut HashMap<OwnedSourceItem, Box<Popen>>,
+        was: &mut WeightedAtomSweep,
+        snapshot_version: u64,
+        btm: &PathMap<u64>,
+        pat_expr: Expr,
+        mut effect: F,
+    ) -> usize {
         use crate::sources::{ASource, Resource, ResourceRequest, Source};
 
         let pat_newvars = pat_expr.newvars();
@@ -1164,11 +1213,11 @@ impl Space {
         let mut factors: Vec<_> = Vec::with_capacity(n_factors);
         for e in pat_args[1..].iter() {
             let mut src = if no_source { ASource::compat(e.subsexpr()) } else { ASource::new(e.subsexpr()) };
-            factors.push(src.source(src.request().map(|request| unsafe { Self::read_handler(btm, mmaps, z3s, request) })));
+            factors.push(src.source(src.request().map(|request| unsafe { Self::read_handler(btm, mmaps, z3s, was, snapshot_version, request) })));
             srcs.push(src);
         }
 
-        match factors.remove(0)  {
+        match factors.remove(0) {
             AFactor::CompatSource(primary) => {
                 let mut prz = ProductZipper::new(primary, &mut factors[..]);
                 prz.reserve_buffers(1 << 32, 32);
@@ -1197,7 +1246,7 @@ impl Space {
                 trace!(target: "query_multi_ref", "at {:?}",
                     Expr { ptr: unsafe { prz.origin_path().as_ptr().cast_mut().add(other_i) } });
             }
-            unifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            unsafe { unifications += 1; }
             // if e.variables() != 0 {
 
             let mut pairs = vec![(sources[0], ExprEnv::new(1, e))];
@@ -1222,21 +1271,21 @@ impl Space {
                 }
                 Err(failed) => {
                     match failed {
-                        UnificationFailure::Occurs(v, e) => {
-                            trace!(target: "query_multi", "U {:?} occurs in {}", v, e.show())
-                        }
-                        UnificationFailure::Difference(lhs, rhs) => {
-                            trace!(target: "query_multi", "U {} differs from {}", lhs.show(), rhs.show())
-                        }
-                        UnificationFailure::MaxIter(iter) => {
-                            trace!(target: "query_multi", "U reached max iter {}", iter)
-                        }
+                    UnificationFailure::Occurs(v, e) => {
+                        trace!(target: "query_multi", "U {:?} occurs in {}", v, e.show())
                     }
-                }
+                    UnificationFailure::Difference(lhs, rhs) => {
+                        trace!(target: "query_multi", "U {} differs from {}", lhs.show(), rhs.show())
+                    }
+                    UnificationFailure::MaxIter(iter) => {
+                        trace!(target: "query_multi", "U reached max iter {}", iter)
+                    }
+                    }
+            }
             }
 
         }
-       
+
         candidate
     }
 
@@ -1261,7 +1310,7 @@ impl Space {
                         trace!(target: "query_multi", "at {:?}",
                             Expr { ptr: unsafe { loc.origin_path().as_ptr().cast_mut().add(other_i) } });
                     }
-                    unifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    unsafe { unifications += 1; }
                     // if e.variables() != 0 {
                     if true {
                         let mut pairs = vec![(sources[0], ExprEnv::new(1, e))];
@@ -1352,7 +1401,7 @@ impl Space {
                     }
                 }
             }
-            
+
             out.push(best_idx);
         }
 
@@ -1366,7 +1415,9 @@ impl Space {
         let mut tpl_args = Vec::with_capacity(64);
         ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
         let mut templates: Vec<_> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
-        let mut template_prefixes: Vec<_> = templates.iter().map(|e| unsafe { e.prefix().unwrap_or_else(|x| x).as_ref().unwrap() }).collect();
+        // Compatibility output uses the one live PathMap writer.
+        // Root scope keeps existing atom values navigable and preservable.
+        let mut template_prefixes: Vec<&[u8]> = vec![&[]; templates.len()];
         let mut subsumption = Self::prefix_subsumption(&template_prefixes[..]);
         let mut placements = subsumption.clone();
         let mut read_copy = self.btm.clone();
@@ -1376,7 +1427,8 @@ impl Space {
         template_prefixes.iter().enumerate().for_each(|(i, x)| {
             if subsumption[i] == i {
                 placements[i] = template_wzs.len();
-                template_wzs.push(unsafe { zh.write_zipper_at_exclusive_path_unchecked(x) });
+                debug_assert!(x.is_empty());
+                template_wzs.push(zh.write_zipper_at_exclusive_root_w().unwrap());
             }
         });
         for i in 0..subsumption.len() {
@@ -1388,14 +1440,14 @@ impl Space {
 
         let mut assignments: Vec<(u8, u8)> = vec![];
         let mut trace: Vec<(u8, u8)> = vec![];
-        
+
         let mut ass = Vec::with_capacity(64);
         let mut astack = Vec::with_capacity(64);
 
         let mut any_new = false;
         let touched = Self::query_multi(&read_copy, pat_expr, |refs_bindings, loc| 'query:{
             trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
-            writes.fetch_add(template_prefixes.len(), std::sync::atomic::Ordering::Relaxed);
+            unsafe { writes += template_prefixes.len(); }
             match refs_bindings {
                 Ok(refs) => {
                     unreachable!()
@@ -1407,7 +1459,7 @@ impl Space {
                     let (mut oi, ni, true) = ({
                         let mut void = std::io::sink();
                         mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0,pat_expr,bindings,void,trace,assignments)
-                    }) else {break 'query true;};
+                    }) else {break 'query false;};
 
                     'writes : for (i, template) in templates.iter().enumerate() {
                         let wz = &mut template_wzs[subsumption[i]];
@@ -1422,14 +1474,16 @@ impl Space {
 
                         trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
                         wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
-                        any_new |= wz.set_val(1u64).is_none();
+                        if wz.val().is_none() {
+                            any_new |= wz.set_val_w(1u64).is_none();
+                        }
                     }
                     true
                 }
             }
         });
         for wz in template_wzs {
-            zh.cleanup_write_zipper(wz);
+            zh.cleanup_write_zipper_w(wz);
         }
         (touched, any_new)
     }
@@ -1441,7 +1495,9 @@ impl Space {
         let mut tpl_args = Vec::with_capacity(64);
         ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
         let mut templates: Vec<_> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
-        let mut template_prefixes: Vec<_> = templates.iter().map(|e| unsafe { e.prefix().unwrap_or_else(|x| x).as_ref().unwrap() }).collect();
+        // Input-specialized compatibility output follows the same root-scoped
+        // single-writer rule as `transform_multi_multi_` above.
+        let mut template_prefixes: Vec<&[u8]> = vec![&[]; templates.len()];
         let mut subsumption = Self::prefix_subsumption(&template_prefixes[..]);
         let mut placements = subsumption.clone();
         let mut read_copy = self.btm.clone();
@@ -1451,7 +1507,8 @@ impl Space {
         template_prefixes.iter().enumerate().for_each(|(i, x)| {
             if subsumption[i] == i {
                 placements[i] = template_wzs.len();
-                template_wzs.push(unsafe { zh.write_zipper_at_exclusive_path_unchecked(x) });
+                debug_assert!(x.is_empty());
+                template_wzs.push(zh.write_zipper_at_exclusive_root_w().unwrap());
             }
         });
         for i in 0..subsumption.len() {
@@ -1463,47 +1520,49 @@ impl Space {
 
         let mut assignments: Vec<(u8, u8)> = vec![];
         let mut trace: Vec<(u8, u8)> = vec![];
-        
+
         let mut ass = Vec::with_capacity(64);
         let mut astack = Vec::with_capacity(64);
 
         let mut any_new = false;
-        let touched = Self::query_multi_i(false, &mut self.mmaps, &mut self.z3s, &read_copy, pat_expr, |refs_bindings, _loc| 'query : {
-            // trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
-            writes.fetch_add(template_prefixes.len(), std::sync::atomic::Ordering::Relaxed);
-            match refs_bindings {
-                Ok(refs) => {
-                    unreachable!()
-                }
-                Err((ref bindings)) => {
-                    #[cfg(debug_assertions)]
+        let touched = Self::query_multi_i(false, &mut self.mmaps, &mut self.z3s, &mut self.was, self.snapshot_version, &read_copy, pat_expr, |refs_bindings, _loc| 'query : {
+                // trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
+            unsafe { writes += template_prefixes.len(); }
+                match refs_bindings {
+                    Ok(refs) => {
+                        unreachable!()
+                    }
+                    Err((ref bindings)) => {
+                        #[cfg(debug_assertions)]
                     bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
 
-                    let (mut oi, ni, true) = ({
-                        let mut void = std::io::sink();
+                        let (mut oi, ni, true) = ({
+                            let mut void = std::io::sink();
                         mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0,pat_expr,bindings,void,trace,assignments)
-                    }) else {break 'query true;};
+                    }) else {break 'query false;};
 
                     'writes : for (i, template) in templates.iter().enumerate() {
-                        let wz = &mut template_wzs[subsumption[i]];
+                            let wz = &mut template_wzs[subsumption[i]];
 
-                        trace!(target: "transform", "{i} template {} @ ({oi} {ni})", serialize(unsafe { template.span().as_ref().unwrap()}));
+                            trace!(target: "transform", "{i} template {} @ ({oi} {ni})", serialize(unsafe { template.span().as_ref().unwrap()}));
 
-                        buffer.clear();
+                            buffer.clear();
                         let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue 'writes; };
-                        oi = toi;
+                            oi = toi;
 
 
-                        trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
-                        wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
-                        any_new |= wz.set_val(1u64).is_none();
+                            trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
+                            wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
+                            if wz.val().is_none() {
+                                any_new |= wz.set_val_w(1u64).is_none();
+                            }
+                        }
+                        true
                     }
-                    true
                 }
-            }
         });
         for wz in template_wzs {
-            zh.cleanup_write_zipper(wz);
+            zh.cleanup_write_zipper_w(wz);
         }
         (touched, any_new)
     }
@@ -1532,11 +1591,11 @@ impl Space {
         let acts_ptr = ((&self.mmaps) as *const HashMap<OwnedSourceItem, _>).cast_mut();
         let z3s_ptr = ((&self.z3s) as *const HashMap<OwnedSourceItem, Box<Popen>>).cast_mut();
         template_prefixes.iter().enumerate().for_each(|(i, request)| {
-            if subsumption[i] == i {
-                placements[i] = template_resources.len();
+                if subsumption[i] == i {
+                    placements[i] = template_resources.len();
                 template_resources.push(unsafe { Self::write_handler((zh_ptr, outstanding_wzs_ptr), acts_ptr, z3s_ptr, request) });
-            }
-        });
+                }
+            });
         for i in 0..subsumption.len() {
             subsumption[i] = placements[subsumption[i]]
         }
@@ -1546,14 +1605,14 @@ impl Space {
 
         let mut assignments: Vec<(u8, u8)> = vec![];
         let mut trace: Vec<(u8, u8)> = vec![];
-        
+
         let mut ass = Vec::with_capacity(64);
         let mut astack = Vec::with_capacity(64);
 
         let mut any_new = false;
         let touched = Self::query_multi(&read_copy, pat_expr, |refs_bindings, loc| 'query : {
             trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
-            writes.fetch_add(template_prefixes.len(), std::sync::atomic::Ordering::Relaxed);
+            unsafe { writes += template_prefixes.len(); }
             match refs_bindings {
                 Ok(refs) => {
                     unreachable!()
@@ -1565,7 +1624,7 @@ impl Space {
                     let (mut oi, ni, true) = ({
                         let mut void = std::io::sink();
                         mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0,pat_expr,bindings,void,trace,assignments)
-                    }) else {break 'query true;};
+                    }) else {break 'query false;};
 
                     'writes : for (i, template) in templates.iter().enumerate() {
                         let wz = unsafe { std::ptr::read(&template_resources[subsumption[i]]) };
@@ -1588,8 +1647,10 @@ impl Space {
             let wz = unsafe { std::ptr::read(&template_resources[subsumption[i]]) };
             any_new |= s.finalize(std::iter::once(wz));
         }
-        for wz in outstanding_wzs.iter_mut() {
-            zh.cleanup_write_zipper(wz);
+        // Cleanup must consume the child zipper. Passing `&mut WriteZipperTracked` only
+        // drops the reference, leaving the exclusive child alive while ancestors are updated.
+        for wz in outstanding_wzs {
+            zh.cleanup_write_zipper_w(wz);
         }
 
         (touched, any_new)
@@ -1618,11 +1679,11 @@ impl Space {
         let acts_ptr = ((&self.mmaps) as *const HashMap<OwnedSourceItem, _>).cast_mut();
         let z3s_ptr = ((&self.z3s) as *const HashMap<OwnedSourceItem, Box<Popen>>).cast_mut();
         template_prefixes.iter().enumerate().for_each(|(i, request)| {
-            if subsumption[i] == i {
-                placements[i] = template_resources.len();
+                if subsumption[i] == i {
+                    placements[i] = template_resources.len();
                 template_resources.push(unsafe { Self::write_handler((zh_ptr, outstanding_wzs_ptr), acts_ptr, z3s_ptr, request) });
-            }
-        });
+                }
+            });
         for i in 0..subsumption.len() {
             subsumption[i] = placements[subsumption[i]]
         }
@@ -1637,49 +1698,59 @@ impl Space {
         let mut astack = Vec::with_capacity(64);
 
         let mut any_new = false;
-        let touched = Self::query_multi_i(no_source, &mut self.mmaps, &mut self.z3s, &read_copy, pat_expr, |refs_bindings, loc| 'query : {
-            trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
-            writes.fetch_add(template_prefixes.len(), std::sync::atomic::Ordering::Relaxed);
-            match refs_bindings {
-                Ok(refs) => {
-                    unreachable!()
-                }
-                Err(ref bindings) => {
-                    #[cfg(debug_assertions)]
+        let touched = Self::query_multi_i(
+            no_source,
+            &mut self.mmaps,
+            &mut self.z3s,
+            &mut self.was,
+            self.snapshot_version,
+            &read_copy,
+            pat_expr,
+            |refs_bindings, loc| 'query: {
+                trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
+            unsafe { writes += template_prefixes.len(); }
+                match refs_bindings {
+                    Ok(refs) => {
+                        unreachable!()
+                    }
+                    Err(ref bindings) => {
+                        #[cfg(debug_assertions)]
                     bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
 
-                    let (mut oi, ni, true) = ({
-                        let mut void = std::io::sink();
+                        let (mut oi, ni, true) = ({
+                            let mut void = std::io::sink();
                         mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0,pat_expr,bindings,void,trace,assignments)
-                    }) else {break 'query true;};
+                    }) else {break 'query false;};
 
                     'writes : for (i, template) in templates.iter().enumerate() {
-                        let wz = unsafe { std::ptr::read(&template_resources[subsumption[i]]) };
+                            let wz = unsafe { std::ptr::read(&template_resources[subsumption[i]]) };
 
-                        trace!(target: "transform", "{i} template {} @ ({oi} {ni})", serialize(unsafe { template.span().as_ref().unwrap()}));
+                            trace!(target: "transform", "{i} template {} @ ({oi} {ni})", serialize(unsafe { template.span().as_ref().unwrap()}));
 
-                        buffer.clear();
+                            buffer.clear();
                         let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue 'writes; };
 
-                        trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
-                        sinks[i].sink(std::iter::once(wz), &buffer[..]);
+                            trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
+                            sinks[i].sink(std::iter::once(wz), &buffer[..]);
+                        }
+                        true
                     }
-                    true
                 }
-            }
         });
 
         for (i, s) in sinks.iter_mut().enumerate() {
             let wz = unsafe { std::ptr::read(&template_resources[subsumption[i]]) };
             any_new |= s.finalize(std::iter::once(wz));
         }
-        for wz in outstanding_wzs.iter_mut() {
-            zh.cleanup_write_zipper(wz);
+        // Cleanup must consume the child zipper. Passing `&mut WriteZipperTracked` only
+        // drops the reference, leaving the exclusive child alive while ancestors are updated.
+        for wz in outstanding_wzs {
+            zh.cleanup_write_zipper_w(wz);
         }
 
         (touched, any_new)
     }
-    
+
     // (exec <loc> (, <src1> <src2> <srcn>)
     //             (, <dst1> <dst2> <dstm>))
     pub fn interpret(&mut self, rt: Expr) -> Result<(usize, bool), &'static str> {
@@ -1849,17 +1920,13 @@ impl Space {
 
     pub fn sweep(&mut self) -> String {
         let mut groups: HashMap<String, (String, Vec<(String, Vec<Vec<u8>>)>)> = HashMap::new();
-        // We must collect paths to remove first because the zipper `rz` borrows `self.btm`.
-        // Mutating `self.btm` while the zipper is alive is not allowed by the borrow checker.
-        let mut paths_to_remove: Vec<Vec<u8>> = Vec::new();
 
         {
             let mut rz = self.btm.read_zipper();
             while rz.to_next_val() {
                 let path = rz.path();
                 if let Some((name, etype, ops)) = Self::parse_sweep_atom(path) {
-                    groups.insert(name.clone(), (etype, ops));
-                    paths_to_remove.push(path.to_vec());
+                    groups.insert(name, (etype, ops));
                 }
             }
         }
@@ -1867,101 +1934,147 @@ impl Space {
         if groups.is_empty() { return String::new(); }
 
         let valid_groups: Vec<(String, (String, Vec<(String, Vec<Vec<u8>>)>))> = groups.into_iter().filter(|(_, (et, _))| {
-            if build_strategy(et).is_none() {
-                warn!("unknown engine type '{}', skipping", et);
-                false
-            } else {
-                true
-            }
+                if build_strategy(et).is_none() {
+                    warn!("unknown engine type '{}', skipping", et);
+                    false
+                } else {
+                    true
+                }
         }).collect();
 
         if valid_groups.is_empty() { return String::new(); }
 
-        // Remove the sweep configuration atoms from self.btm so they won't be processed again
-        for path in &paths_to_remove {
-            self.btm.remove(path);
-        }
-
-        self.was.take_trie(std::mem::take(&mut self.btm));
-
         for (engine_name, (engine_type, ops)) in &valid_groups {
-            let process = self.was.add_engine(engine_name, engine_type);
+            let _process = self.was.add_engine(engine_name, engine_type);
+            // TODO (Phase 3): Save operations/sinks mapping and run execution plan for candidates
             for (op_type, op_args) in ops {
-                let args_refs: Vec<&[u8]> = op_args.iter().map(|a| &a[..]).collect();
-                if let Some(op) = build_operation(op_type, &args_refs) {
-                    process.subscribe(op);
-                } else {
-                    warn!("unknown op type '{}' for engine '{}', skipping", op_type, engine_name);
-                }
+                debug!(
+                    "Temporarily ignoring operation '{}' with args count '{}' for engine '{}' during Phase 1",
+                    op_type,
+                    op_args.len(),
+                    engine_name
+                );
             }
         }
-        self.was.spawn()
+        let controller_name = self.was.spawn();
+        self.was
+            .publish_snapshot(self.btm.clone(), self.snapshot_version);
+        controller_name
+    }
+
+    /// Configure and start long-lived read-only WAS traversal workers.
+    pub fn configure_was<'a, I>(&mut self, processes: I) -> Result<Option<String>, String>
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        if !self.was.controllers.is_empty() {
+            return Err("WAS workers are already running".into());
+        }
+
+        let processes: Vec<_> = processes.into_iter().collect();
+        for (process_id, engine) in &processes {
+            if build_strategy(engine).is_none() {
+                return Err(format!("unknown WAS engine for process {process_id}: {engine}"));
+            }
+        }
+        if processes.is_empty() {
+            return Ok(None);
+        }
+
+        for (process_id, engine) in processes {
+            self.was.add_engine(process_id, engine);
+        }
+        let controller = self.was.spawn();
+        self.was.publish_snapshot(self.btm.clone(), self.snapshot_version);
+        Ok(Some(controller))
     }
 
     pub fn metta_calculus(&mut self, steps: usize) -> usize {
         self.metta_calculus_scoped(&[], steps, |_| true)
     }
 
-
-    /// Steps only execs under `(exec <loc_prefix> …)`. `on_step` is called with each
-    /// consumed exec's info; returning `false` stops early (cooperative cancellation).
-    /// Empty `loc_prefix` is byte-for-byte the previous whole-space semantics, including the
-    /// off-by-one where `steps == 0` still runs exactly one exec (the check below only gates
-    /// *continuing* to a next round; an available exec is always consumed first).
-    pub fn metta_calculus_scoped(&mut self, loc_prefix: &[u8], steps: usize,
-                                 mut on_step: impl FnMut(StepInfo) -> bool) -> usize {
-        let was_paused = self.was.map.is_some();
-        if was_paused {
-            self.btm = self.was.pause_all();
-        }
+    /// Step only execs below the encoded location prefix.
+    pub fn metta_calculus_scoped(
+        &mut self,
+        loc_prefix: &[u8],
+        steps: usize,
+        mut on_step: impl FnMut(StepInfo) -> bool,
+    ) -> usize {
         let mut done: usize = 0;
         const PREFIX: [u8; 6] = const { [item_byte(Tag::Arity(4)), item_byte(Tag::SymbolSize(4)), b'e', b'x', b'e', b'c' ] };
-        let mut full_prefix: Vec<u8> = Vec::with_capacity(PREFIX.len() + loc_prefix.len());
-        full_prefix.extend_from_slice(&PREFIX[..]);
-        full_prefix.extend_from_slice(loc_prefix);
+        let mut scoped_prefix = Vec::with_capacity(PREFIX.len() + loc_prefix.len());
+        scoped_prefix.extend_from_slice(&PREFIX);
+        scoped_prefix.extend_from_slice(loc_prefix);
 
         while {
-            let mut rz = self.btm.read_zipper_at_borrowed_path(&full_prefix[..]);
-            if rz.to_next_val() {
-                // cannot be here `rz` conflicts potentially with zippers(rz.path())
-                let mut x: Vec<u8> = rz.into_path(); // should use local buffer
-                self.btm.remove(&x[..]);
-                let mut xe = Expr{ ptr: x.as_mut_ptr() };
-                let start = Instant::now();
-                let (touched, new, error) = match self.interpret(xe) {
-                    Ok((touched, new)) => (touched, new, None),
-                    Err(e) => { debug!(target: "interpret", "not interpreting: {}", e); (0, false, Some(e)) }
-                };
-                if self.timing {
-                    let start_string = start.elapsed().as_nanos().to_string();
-                    let start_str = start_string.as_str();
-                    let done_string = done.to_string();
-                    let done_str = done_string.as_str();
-                    let buf = mork_expr::construct!("timing" xe done_str start_str).unwrap();
-                    self.btm.insert(&buf[..], 1u64);
-                    trace!(target: "interpret", "interpret took {} ns", start_str);
+            let mut rz = self.btm.read_zipper_at_borrowed_path(&scoped_prefix);
+            let mut found_path = None;
+            while rz.to_next_val() {
+                let path = rz.path();
+                let was_pattern = [item_byte(Tag::SymbolSize(3)), b'W', b'A', b'S'];
+                if path.windows(4).any(|w| w == was_pattern) {
+                    continue;
                 }
-                let micros = start.elapsed().as_micros() as u64;
-                let cont = on_step(StepInfo { exec: &x[..], touched, new, micros, error });
-                done < steps && cont
+                let mut full_path = scoped_prefix.clone();
+                full_path.extend_from_slice(path);
+                found_path = Some(full_path);
+                break;
+            }
+
+            if let Some(path) = found_path {
+                let previous = self.btm.remove_val_at_w(&path[..], true);
+                if previous.is_some() {
+                    let mut x = path;
+                    let xe = Expr {
+                        ptr: x.as_mut_ptr(),
+                    };
+                    let start = Instant::now();
+                    let (touched, new, error) = match self.interpret(xe) {
+                        Ok((touched, new)) => (touched, new, None),
+                        Err(e) => {
+                            debug!(target: "interpret", "not interpreting: {}", e);
+                            (0, false, Some(e))
+                        }
+                    };
+                    if self.timing {
+                        let start_string = start.elapsed().as_nanos().to_string();
+                        let start_str = start_string.as_str();
+                        let done_string = done.to_string();
+                        let done_str = done_string.as_str();
+                        let buf = mork_expr::construct!("timing" xe done_str start_str).unwrap();
+                        let mut wz = self.btm.write_zipper_at_path(&buf[..]);
+                        wz.set_val_w(1u64);
+                        trace!(target: "interpret", "interpret took {} ns", start_str);
+                    }
+                    let micros = start.elapsed().as_micros() as u64;
+                    done < steps && on_step(StepInfo {
+                        exec: &x,
+                        touched,
+                        new,
+                        micros,
+                        error,
+                    })
+                } else {
+                    false
+                }
             } else {
                 false
             }
         } { done += 1 }
 
-        if was_paused {
-            let btm = std::mem::take(&mut self.btm);
-            self.was.resume_all(btm);
+        if done > 0 {
+            self.snapshot_version += 1;
+            self.was.publish_snapshot(self.btm.clone(), self.snapshot_version);
         }
 
         done
     }
-    
+
     pub fn token_bfs(&self, token: &[u8], pattern: Expr) -> Vec<(Vec<u8>, Expr)> {
 
         // let mut stack = vec![0; 1];
         // stack[0] = ACTION;
-        // 
+        //
         // let prefix = unsafe { pattern.prefix().unwrap_or_else(|x| pattern.span()).as_ref().unwrap() };
         // let shared = pathmap::utils::find_prefix_overlap(&token[..], prefix);
         // stack.extend_from_slice(&referential_bidirectional_matching_stack_traverse(pattern, prefix.len())[..]);
@@ -1973,18 +2086,18 @@ impl Space {
         rz.reserve_buffers(4096, 64);
 
         rz.descend_until();
-        
+
         let cm = rz.child_mask();
         let mut it = cm.iter();
-        
+
         let mut res = vec![];
-        
-        let mut stack       : Vec<(u8, u8)>           = Vec::new();
-        let mut assignments : Vec<(u8, u8)>           = Vec::new();
-        let mut expr_env    : Vec<(ExprEnv, ExprEnv)> = Vec::new();
+
+        let mut stack: Vec<(u8, u8)> = Vec::new();
+        let mut assignments: Vec<(u8, u8)> = Vec::new();
+        let mut expr_env: Vec<(ExprEnv, ExprEnv)> = Vec::new();
         while let Some(b) = it.next() {
             rz.descend_to_byte(b);
-            
+
             let mut rzc = rz.clone();
             rzc.to_next_val();
             let e = Expr { ptr: rzc.origin_path().to_vec().leak().as_ptr().cast_mut() };
@@ -2016,10 +2129,6 @@ impl Drop for Space {
             // z3.terminate();
             drop(z3.stdin.take())
         }
-        if self.was.map.is_some() {
-            if let Some(btm) = self.was.shutdown_all() {
-                self.btm = btm;
-            }
-        }
+        self.was.shutdown_all();
     }
 }

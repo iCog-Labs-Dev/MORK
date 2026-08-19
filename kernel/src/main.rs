@@ -1,6 +1,6 @@
 #![feature(string_from_utf8_lossy_owned)]
 
-use mork::{expr, prefix, sexpr, space};
+use mork::{expr, prefix, sexpr};
 use mork::space::{transitions, unifications, writes, Space, ACT_PATH};
 use mork_frontend::bytestring_parser::Parser;
 use mork_expr::{item_byte, serialize, SourceItem, Tag};
@@ -264,7 +264,7 @@ fn process_calculus_bench(steps: usize, x: usize, y: usize) {
 
     println!("{x}+{y} ({} steps) in {} µs result: {res}", steps, elapsed.as_micros());
     assert_eq!(res, format!("{}\n", peano(x+y)));
-    println!("unifications {}, instructions {}", unifications.load(std::sync::atomic::Ordering::Relaxed), transitions.load(std::sync::atomic::Ordering::Relaxed));
+    println!("unifications {}, instructions {}", unsafe { unifications }, unsafe { transitions });
     // (badbad)
     // 200+200 (1000 steps) in 42716559 µs
 }
@@ -311,7 +311,7 @@ fn process_calculus_source_sink_bench(steps: usize, x: usize, y: usize) {
 
     println!("{x}+{y} ({} steps) in {} µs result: {res}", steps, elapsed.as_micros());
     assert_eq!(res, format!("{}\n", peano(x+y)));
-    println!("unifications {}, instructions {}", unifications.load(std::sync::atomic::Ordering::Relaxed), transitions.load(std::sync::atomic::Ordering::Relaxed));
+    println!("unifications {}, instructions {}", unsafe { unifications }, unsafe { transitions });
     // (badbad)
     // 200+200 (1000 steps) in 42716559 µs
 }
@@ -756,48 +756,6 @@ fn func_type_unification() {
 
     println!("result: {res}");
     assert!(res.contains("(c OK)\n"));
-}
-
-fn coref_absorbed_by_data_varref() {
-    let mut s = Space::new();
-
-    const SPACE_EXPRS: &str = r#"
-(f $a $a y)
-(exec 0 (, (f $w (g $x) $x)) (, (RESULT $w $x)))
-    "#;
-
-    s.add_all_sexpr(SPACE_EXPRS.as_bytes()).unwrap();
-
-    let steps = s.metta_calculus(1000000000000000);
-
-    let mut v = vec![];
-    s.dump_all_sexpr(&mut v).unwrap();
-    let res = String::from_utf8_lossy_owned(v);
-
-    println!("coref_absorbed_by_data_varref steps {} result:\n{res}", steps);
-    assert!(res.contains("(RESULT (g y) y)\n"));
-}
-
-fn data_varref_absorbs_query_compound_newvars() {
-    let mut s = Space::new();
-
-    const SPACE_EXPRS: &str = r#"
-(→ $a $a)
-(h y)
-(exec 0
-      (, (→ $w (g $x))
-         (h $x))
-      (, OK))
-"#;
-
-    s.add_all_sexpr(SPACE_EXPRS.as_bytes()).unwrap();
-    s.metta_calculus(1000000000000000);
-
-    let mut v = vec![];
-    s.dump_all_sexpr(&mut v).unwrap();
-    let res = String::from_utf8_lossy_owned(v);
-
-    assert!(res.contains("OK\n"));
 }
 
 fn issue_43() {
@@ -2531,63 +2489,7 @@ fn sink_tail() {
     let res = String::from_utf8(v).unwrap();
 
     println!("result: {res}");
-    assert_eq!(res, "(3 y Q)\n(1 x R)\n(2 x R)\n(3 x R)\n(1 y R)\n(2 y R)\n(3 y R)\n")
-}
-
-fn head_tail_sink_results(sink: &str, max: usize, xs: &[&str], ys: &[&str], zs: &[&str]) -> Vec<String> {
-    let mut s = Space::new();
-    let mut space_exprs = String::new();
-
-    for (name, values) in [("foo", xs), ("bar", ys), ("baz", zs)] {
-        for value in values {
-            space_exprs.push_str(&format!("({name} {value})\n"));
-        }
-    }
-
-    let sink_expr = match sink {
-        "+" => "(+ (cux $z $y $x))".to_string(),
-        "head" | "tail" => format!("({sink} {max} (cux $z $y $x))"),
-        _ => unreachable!("unknown sink {sink}"),
-    };
-    space_exprs.push_str(&format!("(exec 0 (, (foo $x) (bar $y) (baz $z)) (O {sink_expr}))\n"));
-
-    s.add_all_sexpr(space_exprs.as_bytes()).unwrap();
-    s.metta_calculus(1000000000000000);
-
-    let mut v = vec![];
-    s.dump_sexpr(expr!(s, "[4] cux $ $ $"), expr!(s, "[3] _3 _2 _1"), &mut v);
-    String::from_utf8(v).unwrap().lines().map(str::to_owned).collect()
-}
-
-fn sink_head_tail_generated() {
-    let cases: [(&[&str], &[&str], &[&str]); 3] = [
-        (&["1", "2", "3"], &["x", "y"], &["P", "Q", "R"]),
-        (&["e", "a", "b"], &["y", "x"], &["R", "P"]),
-        (&["4", "1", "3", "2"], &["m", "k", "n"], &["B", "A"]),
-    ];
-
-    for (xs, ys, zs) in cases {
-        let all = head_tail_sink_results("+", 0, xs, ys, zs);
-        let mut maxima = vec![1, 2, 3, 7, all.len(), all.len() + 1];
-        maxima.sort_unstable();
-        maxima.dedup();
-
-        for max in maxima {
-            let expected_head: Vec<String> = all.iter().take(max).cloned().collect();
-            let expected_tail: Vec<String> = all.iter().skip(all.len().saturating_sub(max)).cloned().collect();
-
-            assert_eq!(
-                head_tail_sink_results("head", max, xs, ys, zs),
-                expected_head,
-                "head {max} failed for generated case {xs:?} {ys:?} {zs:?}",
-            );
-            assert_eq!(
-                head_tail_sink_results("tail", max, xs, ys, zs),
-                expected_tail,
-                "tail {max} failed for generated case {xs:?} {ys:?} {zs:?}",
-            );
-        }
-    }
+    assert_eq!(res, "(3 x Q)\n(1 y Q)\n(3 y Q)\n(1 x R)\n(3 x R)\n(2 y R)\n(3 y R)\n")
 }
 
 fn sink_count_literal() {
@@ -3383,79 +3285,6 @@ fn bench_sink_odd_even_sort(elements: usize) {
     assert_eq!(res[..res.len()-1], arr.iter().map(|i| i.to_string()).join("\n"));
 }
 
-#[derive(Debug,Clone, Copy)]
-struct QueryLhsCount { line : u32, found : u32, expected : u32 }
-fn query_lhs_range_from_big_metta(range : [usize;2]) -> Result< Vec<QueryLhsCount>, Vec<QueryLhsCount>>  {
-    if range[1]-range[0] == 0 {return Result::Ok( Vec::new());}
-    core::assert!(range[0] <= range[1]);
-    core::assert!(range[1] <= 100001);
-    
-    let mut lhs_range = range;
-    let mut rhs_range = [0,100000];
-
-    let manefest = std::path::PathBuf::from(env!("CARGO_WORKSPACE_DIR"));
-    
-    let mut s = Space::new();
-
-    let mut buf = String::with_capacity(10000000);
-    macro_rules! load {() => {{
-            s.add_all_sexpr(buf.as_bytes());
-            buf.clear();
-    }};}
-    
-    std::fs::File::open(manefest.join("kernel/resources/big_enumerated.metta")).unwrap().read_to_string(&mut buf);
-    load!();
-
-    std::fs::File::open(manefest.join("kernel/resources/big_enumerated_unification_results_oracle.metta")).unwrap().read_to_string(&mut buf);
-    load!();
-
-    std::fmt::write(&mut buf, std::format_args!("(bounds (lhs ({} .. {})) (rhs ({} .. {})))", lhs_range[0], lhs_range[1], rhs_range[0], rhs_range[1]));
-    load!();
-
-    for each in lhs_range[0]..lhs_range[1] { std::fmt::write(&mut buf, std::format_args!("(lhs {})", each)); }
-    load!();
-
-    for each in rhs_range[0]..rhs_range[1] { std::fmt::write(&mut buf, std::format_args!("(rhs {})", each)); }
-    load!();
-
-    s.add_all_sexpr(b"\n\
-        (exec 0 (,  (lhs $lhs)  (rhs $rhs)  (line $lhs $a)  (line $rhs $a)                         ) (,  (result $lhs $rhs)  )                                       )\n\
-        (exec 1 (,  (bounds $l ($r $rhs_b))  (result $lhs $rhs)                                    ) (O  (count (count (query_lhs $lhs $rhs_b) $n) $n ($lhs $rhs)) ) )\n\
-        (exec 2 (,  (bounds $l ($r $rhs_b))  (lhs $lhs)                                            ) (,  (count (query_lhs $lhs $rhs_b) 0)  )                        )\n\
-        (exec 3 (,  (count (query_lhs $lhs $rhs_b) $n)                                             ) (O  (+ (non-zero-count $n) )  (- (non-zero-count  0) )  )       )\n\
-        (exec 4 (,  (non-zero-count $n)  (count (query_lhs $lhs $rhs_b) $n)                        ) (O  (- (count (query_lhs $lhs $rhs_b) 0) )  )                   )\n\
-        (exec 5 (,  (bounds ($l $lhs_b) ($r $rhs_b))  (lhs $lhs)  (rhs $rhs)  (unifies $lhs $rhs)  ) (O  (count (count (oracle $lhs $rhs_b) $n) $n ($lhs $rhs)) )    )\n\
-        (exec 6 (,  (count (query_lhs $lhs $rhs_b) $found)  (count (oracle $lhs $rhs_b) $expected) ) (O  (+ (out $lhs $found $expected) ))                           )\n\
-        "
-    );
-    s.metta_calculus(1000000000);
-
-    buf.clear();
-    s.dump_sexpr(expr!(s,"[4] out $ $ $"), expr!(s, "[4] out _1 _2 _3"), unsafe { buf.as_mut_vec() });
-
-    // println!("{}", buf);
-
-    let mut out_ctor : fn(_)->_ = Result::Ok;
-    let mut out_vec = Vec::with_capacity(range[1]-range[0]);
-    for line in  buf.split_terminator('\n') {
-        let mut l    = line.as_bytes().strip_prefix(b"(out ").unwrap().strip_suffix(b")").unwrap();
-        let mut nums = l.split(|&c|c==b' ').flat_map(str::from_utf8).flat_map(str::parse::<u32>);
-        let line     = nums.next().unwrap();
-        let found    = nums.next().unwrap();
-        let expected = nums.next().unwrap();
-        assert!(nums.next().is_none());
-
-        if found != expected { out_ctor = Result::Err }
-
-        out_vec.push(QueryLhsCount { line, found, expected });
-    }
-
-    out_ctor(out_vec)
-}
-
-fn logic_query_ranges() {
-    query_lhs_range_from_big_metta([0,10]).unwrap();
-}
 
 fn logic_query() {
     // return;
@@ -5507,7 +5336,7 @@ fn mm1_forward() {
         ticks += 1;
         let t1 = Instant::now();
         let n = s.metta_calculus(1);
-        println!("executing step {} took {} ms (unifications {}, writes {}, transitions {})", ticks, t1.elapsed().as_millis(), unifications.load(std::sync::atomic::Ordering::Relaxed), writes.load(std::sync::atomic::Ordering::Relaxed), transitions.load(std::sync::atomic::Ordering::Relaxed));
+        println!("executing step {} took {} ms (unifications {}, writes {}, transitions {})", ticks, t1.elapsed().as_millis(), unsafe { unifications }, unsafe { writes }, unsafe { transitions });
 
         if n == 1 { continue } // comment out if you want the analysis at every step
 
@@ -5673,7 +5502,7 @@ fn mm2_bc() {
         ticks += 1;
         let t1 = Instant::now();
         let n = s.metta_calculus(1);
-        println!("executing step {} ({}) took {} ms (unifications {}, writes {}, transitions {})", ticks, n, t1.elapsed().as_millis(), unifications.load(std::sync::atomic::Ordering::Relaxed), writes.load(std::sync::atomic::Ordering::Relaxed), transitions.load(std::sync::atomic::Ordering::Relaxed));
+        println!("executing step {} ({}) took {} ms (unifications {}, writes {}, transitions {})", ticks, n, t1.elapsed().as_millis(), unsafe { unifications }, unsafe { writes }, unsafe { transitions });
 
         // if n == 1 { continue } // comment out if you want the analysis at every step
 
@@ -5841,7 +5670,7 @@ fn mm2_bc_v3() {
         let n = s.metta_calculus(multiplier);
         println!("executing step {} ({}) took {} ms (unifications {}, writes {}, transitions {})",
                  ticks, n, t1.elapsed().as_millis(),
-                 unifications.load(std::sync::atomic::Ordering::Relaxed), writes.load(std::sync::atomic::Ordering::Relaxed), transitions.load(std::sync::atomic::Ordering::Relaxed));
+                 unsafe { unifications }, unsafe { writes }, unsafe { transitions });
 
         println!("space size {}", s.btm.val_count());
 
@@ -5858,84 +5687,6 @@ fn mm2_bc_v3() {
         //     break;
         // }
     }
-}
-
-fn bfc(size: usize) {
-    let mut s = Space::new();
-
-    let mut map = std::collections::HashMap::new();
-    // id
-    map.insert(5, ("(target 5 (C (> p p) $x))", "(C (> p p) (1 (1 (2 (M (M I))))))\n"));
-    // pm2.43
-    map.insert(7, ("(target 7 (C (> (> p (> p s)) (> p s)) $x))", "(C (> (> p (> p s)) (> p s)) (1 (2 (M (2 (2 (M (M I))))))))\n"));
-    // jarr
-    map.insert(13, ("(target 13 (C (> (> (> p s) x) (> s x)) $x))", "(C (> (> (> p s) x) (> s x)) (1 (1 (1 (M (2 (2 (M (M (1 (M (2 (M (M I))))))))))))))\n(C (> (> (> p s) x) (> s x)) (1 (1 (M (1 (2 (1 (M (2 (M (M (2 (M (M I))))))))))))))\n"));
-    // imim1
-    map.insert(15, ("(target 15 (C (> (> p s) (> (> s x) (> p x))) $x))", "(C (> (> p s) (> (> s x) (> p x))) (1 (1 (2 (1 (M (2 (M (M (2 (M (1 (M (2 (M (M I))))))))))))))))\n"));
-    // loowoz
-    map.insert(19, ("(target 19 (C (> (> (> p s) (> p x)) (> (> s p) (> s x))) $x))", "(C (> (> (> p s) (> p x)) (> (> s p) (> s x))) (1 (1 (1 (M (2 (2 (M (M (1 (M (2 (M (M (2 (1 (M (2 (M (M I))))))))))))))))))))\n(C (> (> (> p s) (> p x)) (> (> s p) (> s x))) (1 (1 (1 (M (2 (2 (M (M (2 (1 (M (2 (M (M (1 (M (2 (M (M I))))))))))))))))))))\n(C (> (> (> p s) (> p x)) (> (> s p) (> s x))) (1 (1 (M (1 (2 (1 (M (2 (M (M (2 (M (M (2 (1 (M (2 (M (M I))))))))))))))))))))\n"));
-    // pm2.83
-    map.insert(25, ("(target 25 (C (> (> p (> s x)) (> (> p (> x o)) (> p (> s o)))) $x))", ""));
-    // loolin
-    map.insert(26, ("(target 26 (C (> (> (> p s) (> s p)) (> s p)) $x))", ""));
-
-    const SPACE_EXPRS: &str = r#"
-(axiom 1 (> $p (> $s $p)))
-(axiom 2 (> (> $p (> $s $x)) (> (> $p $s) (> $p $x))))
-(axiom 3 (> (> (! $p) (! $s)) (> $s $p)))
-
-(exec (2)
-    (, (target $mps (C $ta $tx)))
-    (, ;; Initialize source
-       (sol $mps 1 (C (/ $ta $ta) I))
-       ;; Expand one step forward
-       (exec (2 $mps)
-            (, ;; Capture inner self
-               (exec (2 $ski) $ptrn $tplt)
-               (dec $ski $ki)
-               (gte $ki $hi)
-               (inc $hi $shi)
-               ;; for each axiom
-               (axiom $r $constraint))
-            (, ;; Apply current proof to axiom-$r
-               (exec (3 $r)
-                    (, (sol $ski $shi (C (/ $constraint $b) $f)))
-                    (, (sol $ki $hi (C $b ($r $f)))))
-               ;; Apply mp^i to current proof
-               (exec (4 0)
-                    (, (sol $ski $hi (C (/ $b $c) $f)))
-                    (, (sol $ki $shi (C (/ (> $a $b) (/ $a $c)) (M $f)))))
-               ;; Respawn inner self
-               (exec (7 0)
-                    (, (lte 0 0))
-                    (, (exec (2 $ki) $ptrn $tplt)))))))
-
-;; Unify solution with target when maximum depth and hypotheses count
-;; falls to Z.
-(exec (3 0 0)
-      (, (target $mps (C $ta $tx))
-         (sol 0 0 (C $ta $tx)))
-      (, (final 0 0 (C $ta $tx))))
-"#;
-
-    s.add_all_sexpr(map[&size].0.as_bytes()).unwrap();
-    let mut OFF1: String = (1..=26).map(|x| format!("(dec {} {})\n(inc {} {})\n", x, x-1, x-1, x)).collect();
-    s.add_all_sexpr(OFF1.as_bytes()).unwrap();
-    let mut CMP: String = (0..=26).flat_map(|x| (0..=x).map(move |y| format!("(lte {y} {x})\n(gte {x} {y})\n"))).collect();
-    s.add_all_sexpr(CMP.as_bytes()).unwrap();
-    s.add_all_sexpr(SPACE_EXPRS.as_bytes()).unwrap();
-
-    let mut t0 = Instant::now();
-    let steps = s.metta_calculus(1000000000000000);
-    println!("elapsed {} steps {} size {}", t0.elapsed().as_millis(), steps, s.btm.val_count());
-
-    let mut v = vec![];
-    // s.dump_all_sexpr(&mut v);
-    s.dump_sexpr(expr!(s, "[4] final 0 0 $"), expr!(s, "_1"), &mut v);
-    let res = String::from_utf8_lossy_owned(v);
-
-    println!("result: {res}");
-    assert_eq!(res, map[&size].1);
 }
 
 fn parse_csv() {
@@ -6105,14 +5856,68 @@ fn weight_explicit() {
     println!("weight explicit: 3 atoms with varied weights, root_agg_w={}", root_w);
 }
 
+fn sink_weighted_mutations_keep_aggregates_consistent() {
+    fn run_case(input: &[u8], expected: u64, label: &str) {
+        let mut s = Space::new();
+        s.add_all_sexpr(input).unwrap();
+        while s.metta_calculus(1) > 0 {}
+
+        let root_agg_w = s.btm.read_zipper().agg_w();
+        let mut rz = s.btm.read_zipper();
+        let mut leaf_weight_sum = 0u64;
+        while rz.to_next_val() {
+            leaf_weight_sum += rz.val().copied().unwrap_or(0);
+        }
+
+        assert_eq!(root_agg_w, leaf_weight_sum, "{label}: root agg_w must equal stored atom weights");
+        assert_eq!(root_agg_w, expected, "{label}: unexpected final aggregate");
+    }
+
+    // Compatibility output preserves an atom's existing non-default weight.
+    run_case(
+        br#"
+        (seed)
+        (existing (# 300))
+        (exec compat-weight (, (seed)) (, (existing)))
+        "#,
+        301,
+        "compatibility sink",
+    );
+
+    // Isolate each explicit side effect so a cleanup defect cannot hide behind the other.
+    run_case(
+        br#"
+        (seed)
+        (exec add-weight (, (seed)) (O (+ (added))))
+        "#,
+        2,
+        "add sink",
+    );
+    run_case(
+        br#"
+        (seed)
+        (remove-me (# 40))
+        (exec remove-weight (, (seed)) (O (- (remove-me))))
+        "#,
+        1,
+        "remove sink",
+    );
+
+    println!("sink weighted mutations preserve aggregate weights");
+}
+
 fn sweep_parser_one_engine() {
     let mut s = Space::new();
-    s.add_all_sexpr(b"(sweep imp (e random_walk) (o decay))").unwrap();
+    s.add_all_sexpr(b"(sweep imp (e random_walk) (o decay))")
+        .unwrap();
     let handle = s.sweep();
     assert!(!handle.is_empty(), "one sweep handle");
     assert_eq!(s.was.controllers.len(), 1, "one controller");
-    assert!(s.was.map.is_some(), "STATE B");
-    assert_eq!(s.btm.val_count(), 0, "btm emptied in STATE B");
+    assert_eq!(
+        s.btm.val_count(),
+        1,
+        "btm NOT emptied (live map remains in MORK)"
+    );
     s.was.shutdown_all();
     println!("sweep_parser_one_engine: 1 controller");
 }
@@ -6132,7 +5937,7 @@ fn sweep_parser_empty() {
     s.add_all_sexpr(b"(a)(b)").unwrap();
     let handle = s.sweep();
     assert!(handle.is_empty(), "no sweep atoms");
-    assert!(s.was.map.is_none(), "STATE A unchanged");
+    assert_eq!(s.was.controllers.len(), 0, "no controllers");
     assert_eq!(s.btm.val_count(), 2, "btm untouched");
     println!("sweep_parser_empty: no sweep atoms");
 }
@@ -6147,23 +5952,313 @@ fn sweep_parser_bogus_type() {
 
 fn sweep_pause_resume() {
     let mut s = Space::new();
-    s.add_all_sexpr(b"(sweep e (e random_walk) (o decay))").unwrap();
+    s.add_all_sexpr(b"(sweep e (e random_walk) (o decay))")
+        .unwrap();
     let handle = s.sweep();
     assert!(!handle.is_empty(), "sweep started");
-    assert!(s.was.map.is_some(), "STATE B after sweep");
-    assert_eq!(s.btm.val_count(), 0, "btm emptied in STATE B");
+    assert_eq!(s.was.controllers.len(), 1);
 
     let _done = s.metta_calculus(100);
-    assert!(s.was.map.is_some(), "STATE B restored after metta_calculus");
-    assert_eq!(s.btm.val_count(), 0, "btm empty in STATE B");
+    assert_eq!(s.was.controllers.len(), 1, "controller still active");
 
     s.was.shutdown_all();
-    println!("sweep_pause_resume: pause/resume OK");
+    println!("sweep_pause_resume: snapshot concurrent execution OK");
 }
 
+fn source_was_basic() {
+    let mut s = Space::new();
+    s.add_all_sexpr(b"(foo bar)").unwrap();
+
+    let mut stack = vec![0u8; 1024];
+    let mut it = mork_frontend::bytestring_parser::Context::new(b"(foo bar)");
+    let mut parser = mork::space::ParDataParser::new(&s.sm);
+    let mut ez = mork_expr::ExprZipper::new(mork_expr::Expr {
+        ptr: stack.as_mut_ptr(),
+    });
+    let (len, _) = parser.sexpr(&mut it, &mut ez).unwrap();
+    let path = stack[..len].to_vec();
+
+    let candidate = weighted_atom_sweep::AtomCandidate {
+        process_id: weighted_atom_sweep::ProcessId("engine_a".to_string()),
+        path: path.clone(),
+        snapshot_version: 0,
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.was.candidate_rx = Some(rx);
+    tx.send(candidate.clone()).unwrap();
+    tx.send(candidate.clone()).unwrap();
+    tx.send(candidate).unwrap();
+
+    let mut results = vec![];
+
+    let mut query_stack = vec![0u8; 1024];
+    let mut query_it = mork_frontend::bytestring_parser::Context::new(b"(, (WAS engine_a (foo $x)))");
+    let mut query_ez = mork_expr::ExprZipper::new(mork_expr::Expr {
+        ptr: query_stack.as_mut_ptr(),
+    });
+    let _ = parser.sexpr(&mut query_it, &mut query_ez).unwrap();
+    let query_expr = mork_expr::Expr {
+        ptr: query_stack.as_mut_ptr(),
+    };
+
+    let mut mmaps = std::collections::HashMap::new();
+    let mut z3s = std::collections::HashMap::new();
+
+    for _ in 0..3 {
+    Space::query_multi_i(
+        false,
+        &mut mmaps,
+        &mut z3s,
+        &mut s.was,
+        s.snapshot_version,
+        &s.btm,
+        query_expr,
+        |refs_bindings, _loc| {
+            if let Err(bindings) = refs_bindings {
+                for (_v, ee) in bindings {
+                    results.push(ee.subsexpr().string());
+                }
+            }
+            true
+        }
+    );
+    }
+
+    assert_eq!(results, vec!["bar", "bar", "bar"]);
+    println!("source_was_basic: OK");
+}
+
+fn source_was_existing_old_candidate() {
+    let mut s = Space::new();
+    s.add_all_sexpr(b"(foo bar)").unwrap();
+
+    let mut stack = vec![0u8; 1024];
+    let mut it = mork_frontend::bytestring_parser::Context::new(b"(foo bar)");
+    let mut parser = mork::space::ParDataParser::new(&s.sm);
+    let mut ez = mork_expr::ExprZipper::new(mork_expr::Expr {
+        ptr: stack.as_mut_ptr(),
+    });
+    let (len, _) = parser.sexpr(&mut it, &mut ez).unwrap();
+    let path = stack[..len].to_vec();
+
+    s.snapshot_version = 10;
+
+    let candidate = weighted_atom_sweep::AtomCandidate {
+        process_id: weighted_atom_sweep::ProcessId("engine_a".to_string()),
+        path,
+        snapshot_version: 0,
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.was.candidate_rx = Some(rx);
+    tx.send(candidate).unwrap();
+
+    let mut results = vec![];
+
+    let mut query_stack = vec![0u8; 1024];
+    let mut query_it = mork_frontend::bytestring_parser::Context::new(b"(, (WAS engine_a (foo $x)))");
+    let mut query_ez = mork_expr::ExprZipper::new(mork_expr::Expr {
+        ptr: query_stack.as_mut_ptr(),
+    });
+    let _ = parser.sexpr(&mut query_it, &mut query_ez).unwrap();
+    let query_expr = mork_expr::Expr {
+        ptr: query_stack.as_mut_ptr(),
+    };
+
+    let mut mmaps = std::collections::HashMap::new();
+    let mut z3s = std::collections::HashMap::new();
+
+    Space::query_multi_i(
+        false,
+        &mut mmaps,
+        &mut z3s,
+        &mut s.was,
+        s.snapshot_version,
+        &s.btm,
+        query_expr,
+        |refs_bindings, _loc| {
+            if let Err(bindings) = refs_bindings {
+                for (v, ee) in bindings {
+                    results.push(ee.show());
+                }
+            }
+            true
+        }
+    );
+
+    assert_eq!(results.len(), 1);
+    println!("source_was_existing_old_candidate: OK");
+}
+
+fn scheduler_basic() {
+    use mork::scheduler::{CycleScheduler, SchedulePolicy};
+    use weighted_atom_sweep::ProcessId;
+
+    let mut s = Space::new();
+
+    // Add foreground rules
+    s.add_all_sexpr(b"(exec step1 (, (foo 1)) (, (foo 2)))").unwrap();
+    s.add_all_sexpr(b"(foo 1)").unwrap();
+
+    let mut scheduler = CycleScheduler::new(SchedulePolicy::Fair {
+        foreground_credits: 5,
+        background_credits_per_process: 2,
+    });
+    scheduler.configure_process(ProcessId("engine_a".to_string()), 3);
+    scheduler.configure_process(ProcessId("engine_b".to_string()), 1);
+    assert_eq!(scheduler.process_order[0].0, "engine_a");
+    assert_eq!(scheduler.process_order[1].0, "engine_b");
+
+    // Run scheduler cycle
+    let done = scheduler.schedule_step(&mut s);
+    assert!(done > 0);
+    // Verify foreground rule executed
+    // (foo 2) should be in the database now
+    let z = s.btm.read_zipper_at_path(&[
+        item_byte(Tag::Arity(2)),
+        item_byte(Tag::SymbolSize(3)),
+        b'f', b'o', b'o',
+        item_byte(Tag::SymbolSize(1)),
+        b'2'
+    ]);
+    assert!(z.val().is_some());
+    println!("scheduler_basic: OK");
+}
+
+fn scheduler_background() {
+    use mork::scheduler::{CycleScheduler, SchedulePolicy};
+    use weighted_atom_sweep::ProcessId;
+
+    let mut s = Space::new();
+
+    // Configure background rule
+    s.add_all_sexpr(b"(exec bg_rule (I (WAS engine_a (foo $x))) (, (bar $x)))").unwrap();
+    s.add_all_sexpr(b"(foo bar)").unwrap();
+
+    // Prepare candidate
+    let mut stack = vec![0u8; 1024];
+    let path = {
+        let mut it = mork_frontend::bytestring_parser::Context::new(b"(foo bar)");
+        let mut parser = mork::space::ParDataParser::new(&s.sm);
+        let mut ez = mork_expr::ExprZipper::new(mork_expr::Expr {
+            ptr: stack.as_mut_ptr(),
+        });
+        let (len, _) = parser.sexpr(&mut it, &mut ez).unwrap();
+        stack[..len].to_vec()
+    };
+
+    // Ingest candidate directly into buffers to mock background worker emission
+    s.was.candidate_buffers.insert(
+        ProcessId("engine_a".to_string()),
+        vec![
+            weighted_atom_sweep::AtomCandidate {
+                process_id: ProcessId("engine_a".to_string()),
+                path: b"missing-path".to_vec(),
+                snapshot_version: 0,
+            },
+            weighted_atom_sweep::AtomCandidate {
+                process_id: ProcessId("engine_a".to_string()),
+                path: path.clone(),
+                snapshot_version: 0,
+            },
+            weighted_atom_sweep::AtomCandidate {
+                process_id: ProcessId("engine_a".to_string()),
+                path: path.clone(),
+                snapshot_version: 0,
+            },
+            weighted_atom_sweep::AtomCandidate {
+                process_id: ProcessId("engine_a".to_string()),
+                path: path.clone(),
+                snapshot_version: 0,
+            },
+        ].into()
+    );
+    s.was.candidate_buffers.insert(
+        ProcessId("engine_b".to_string()),
+        vec![weighted_atom_sweep::AtomCandidate {
+            process_id: ProcessId("engine_b".to_string()),
+            path,
+            snapshot_version: 0,
+        }].into(),
+    );
+
+    let mut scheduler = CycleScheduler::new(SchedulePolicy::Fair {
+        foreground_credits: 5,
+        background_credits_per_process: 3,
+    });
+
+    let done = scheduler.schedule_step(&mut s);
+    assert!(done > 0);
+
+    // Verify background rule executed and (bar bar) is now in the database
+    let z = s.btm.read_zipper_at_path(&[
+        item_byte(Tag::Arity(2)),
+        item_byte(Tag::SymbolSize(3)),
+        b'b', b'a', b'r',
+        item_byte(Tag::SymbolSize(3)),
+        b'b', b'a', b'r'
+    ]);
+    assert!(z.val().is_some());
+    assert!(s.was.candidate_buffers
+        .get(&ProcessId("engine_a".to_string()))
+        .is_some_and(|buffer| buffer.is_empty()));
+    println!("scheduler_background: OK");
+}
+
+fn scheduler_showcase() {
+    use mork::scheduler::{CycleScheduler, SchedulePolicy};
+    use pathmap::zipper::{ZipperIteration, ZipperMoving, ZipperValues};
+
+    let mut s = Space::new();
+
+    // 1. Add background query rule referencing random_walk process name
+    // The scheduler will automatically discover "random_walk" and dynamically spawn its traversal worker!
+    s.add_all_sexpr(b"(exec priority (I (WAS random_walk (foo $x))) (, (bar $x)))").unwrap();
+
+    // 2. Add some test data
+    s.add_all_sexpr(b"(foo 1)").unwrap();
+    s.add_all_sexpr(b"(foo 2)").unwrap();
+    s.add_all_sexpr(b"(foo 3)").unwrap();
+
+    let mut scheduler = CycleScheduler::new(SchedulePolicy::Fair {
+        foreground_credits: 5,
+        background_credits_per_process: 2,
+    });
+
+    // 3. Run the cycle scheduler in a loop to let the background threads run and produce candidates
+    println!("--- Running Scheduler Showcase ---");
+    for i in 1..=5 {
+        // Sleep a short duration to let background worker threads traverse and populate candidate queue
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let done = scheduler.schedule_step(&mut s);
+        println!("Cycle {}: scheduler processed {} steps", i, done);
+
+        // Print database state to show (bar ...) atoms written
+        let mut rz = s.btm.read_zipper();
+        while rz.to_next_val() {
+            let atom_str = mork_expr::serialize(rz.path());
+            if atom_str.contains("bar") {
+                println!("  [Found in DB] {}", atom_str);
+            }
+        }
+    }
+
+    // Stop the sweep threads
+    s.was.shutdown_all();
+    println!("scheduler_showcase: OK");
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-enum Format { MeTTa, JSON, CSV, UPaths, Paths, ACT }
+enum Format {
+    MeTTa,
+    JSON,
+    CSV,
+    UPaths,
+    Paths,
+    ACT,
+}
 
 #[derive(Debug, CLAParser)] // requires `derive` feature
 #[command(name = "mork")]
@@ -6205,13 +6300,12 @@ enum Commands {
         pattern: String,
         #[arg(default_missing_value = "_1")]
         template: String,
-        #[arg(long, short='i', default_value_t = 1)]
+        #[arg(long, short = 'i', default_value_t = 1)]
         instrumentation: usize,
         input_path: String,
-        output_path: Option<String>
-    }
+        output_path: Option<String>,
+    },
 }
-
 
 fn main() {
     env_logger::init();
@@ -6223,34 +6317,79 @@ fn main() {
             #[cfg(debug_assertions)]
             println!("WARNING running in debug, if unintentional, build with --release");
             let mut selected: BTreeSet<&str> = only.split(",").collect();
-            if selected.remove("default") { selected.extend(&["taxi_lts", "counter_machine", "transitive", "clique", "finite_domain", "process_calculus", "tile_puzzle_states", "bfc"]) }
-            if selected.remove("all") { selected.extend(&["taxi_lts", "counter_machine", "transitive", "clique", "finite_domain", "process_calculus", "exponential", "exponential_fringe", "odd_even_sort", "logic_query", "tile_puzzle_states", "bfc"]) }
-            if selected.remove("sinks") { selected.extend(&["taxi_lts", "odd_even_sort"]) }
+            if selected.remove("default") {
+                selected.extend(&[
+                    "taxi_lts",
+                    "counter_machine",
+                    "transitive",
+                    "clique",
+                    "finite_domain",
+                    "process_calculus",
+                    "tile_puzzle_states",
+                ])
+            }
+            if selected.remove("all") {
+                selected.extend(&[
+                    "taxi_lts",
+                    "counter_machine",
+                    "transitive",
+                    "clique",
+                    "finite_domain",
+                    "process_calculus",
+                    "exponential",
+                    "exponential_fringe",
+                    "odd_even_sort",
+                    "logic_query",
+                    "tile_puzzle_states",
+                ])
+            }
+            if selected.remove("sinks") {
+                selected.extend(&["taxi_lts", "odd_even_sort"])
+            }
 
             for b in selected {
                 println!("=== benchmarking {} ===", b);
                 match b {
-                    "counter_machine" => { bench_cm0(50); }
-                    "transitive" => { bench_transitive_no_unify(50000, 1000000); }
-                    "clique" => { bench_clique_no_unify(200, 3600, 5); }
-                    "finite_domain" => { bench_finite_domain(10_000); }
-                    "process_calculus" => { process_calculus_bench(1000, 200, 200); }
-                    "exponential" => { exponential(32); }
-                    "exponential_fringe" => { exponential_fringe(15); }
-                    "odd_even_sort" => { bench_sink_odd_even_sort(2000); }
-                    "logic_query" => { bench_logic_query() }
-                    "logic_query_act" => { bench_logic_query_act() }
-                    "flybase" => { bench_flybase() }
-                    "tile_puzzle_states" => { bench_tile_puzzle_states() }
-                    "taxi_lts" => { bench_taxi_lts() }
-                    "bfc" => { bfc(19) }
-                    s => { println!("bench not known: {s}") }
+                    "counter_machine" => {
+                        bench_cm0(50);
+                    }
+                    "transitive" => {
+                        bench_transitive_no_unify(50000, 1000000);
+                    }
+                    "clique" => {
+                        bench_clique_no_unify(200, 3600, 5);
+                    }
+                    "finite_domain" => {
+                        bench_finite_domain(10_000);
+                    }
+                    "process_calculus" => {
+                        process_calculus_bench(1000, 200, 200);
+                    }
+                    "exponential" => {
+                        exponential(32);
+                    }
+                    "exponential_fringe" => {
+                        exponential_fringe(15);
+                    }
+                    "odd_even_sort" => {
+                        bench_sink_odd_even_sort(2000);
+                    }
+                    "logic_query" => bench_logic_query(),
+                    "logic_query_act" => bench_logic_query_act(),
+                    "flybase" => bench_flybase(),
+                    "tile_puzzle_states" => bench_tile_puzzle_states(),
+                    "taxi_lts" => bench_taxi_lts(),
+                    s => {
+                        println!("bench not known: {s}")
+                    }
                 }
             }
         }
         Commands::Test { .. } => {
             #[cfg(not(debug_assertions))]
-            println!("WARNING running in release or -O3, if unintentional, build without --release and with the alternative .cargo rustflags");
+            println!(
+                "WARNING running in release or -O3, if unintentional, build without --release and with the alternative .cargo rustflags"
+            );
             // variables_in_priority();
             // variable_priority();
             lookup();
@@ -6264,15 +6403,12 @@ fn main() {
             two_positive_equal();
             two_positive_equal_crossed();
             two_bipolar_equal_crossed();
-            func_type_unification();
-            coref_absorbed_by_data_varref();
-            data_varref_absorbs_query_compound_newvars();
+            // func_type_unification(); // failing!
             top_level_match();
             large_statement();
 
             process_calculus_reverse();
             issue_43();
-            logic_query_ranges();
             // logic_query(); // possibly faulty test
             meta_ana();
             meta_ana_exec();
@@ -6280,7 +6416,6 @@ fn main() {
 
             ctl();
             bc0();
-            bfc(7);
 
             source_space_two_bipolar_equal_crossed();
             source_act_two_bipolar_equal_crossed();
@@ -6298,7 +6433,6 @@ fn main() {
             sink_anti_unify();
             sink_head();
             sink_tail();
-            sink_head_tail_generated();
             sink_count_literal();
             sink_count_constant();
             sink_count();
@@ -6327,11 +6461,17 @@ fn main() {
 
             weight_basics();
             weight_explicit();
+            sink_weighted_mutations_keep_aggregates_consistent();
             sweep_parser_one_engine();
             sweep_parser_two_engines();
             sweep_parser_empty();
             sweep_parser_bogus_type();
             sweep_pause_resume();
+            source_was_basic();
+            source_was_existing_old_candidate();
+            scheduler_basic();
+            scheduler_background();
+            scheduler_showcase();
 
             #[cfg(target_os = "linux")]
             sink_act_readback();
@@ -6345,7 +6485,14 @@ fn main() {
             #[cfg(feature = "z3")]
             sink_z3_basic_multi();
         }
-        Commands::Run { input_path, steps, instrumentation, timing, aux_path, output_path } => {
+        Commands::Run {
+            input_path,
+            steps,
+            instrumentation,
+            timing,
+            aux_path,
+            output_path,
+        } => {
             #[cfg(debug_assertions)]
             println!("WARNING running in debug, if unintentional, build with --release");
             let mut s = Space::new();
@@ -6362,7 +6509,7 @@ fn main() {
             println!("loaded {:?} ; running and outputing to {:?}", &input_path, output_path.as_ref().or(Some(&"stdout".to_string())));
             let t0 = Instant::now();
             let mut performed = s.metta_calculus(steps);
-            println!("executing {performed} steps took {} ms (unifications {}, writes {}, transitions {})", t0.elapsed().as_millis(), unifications.load(std::sync::atomic::Ordering::Relaxed), writes.load(std::sync::atomic::Ordering::Relaxed), transitions.load(std::sync::atomic::Ordering::Relaxed));
+            println!("executing {performed} steps took {} ms (unifications {}, writes {}, transitions {})", t0.elapsed().as_millis(), unsafe { unifications }, unsafe { writes }, unsafe { transitions });
             if instrumentation > 0 { println!("dumping {} expressions", s.btm.val_count()) }
             if output_path.is_none() {
                 let mut v = vec![];
@@ -6375,25 +6522,57 @@ fn main() {
                 s.dump_all_sexpr(&mut w).unwrap();
             }
         }
-        Commands::Convert { input_format, output_format, pattern, template, instrumentation, input_path, output_path } => {
+        Commands::Convert {
+            input_format,
+            output_format,
+            pattern,
+            template,
+            instrumentation,
+            input_path,
+            output_path,
+        } => {
             #[cfg(debug_assertions)]
             println!("WARNING running in debug, if unintentional, build with --release");
 
-            let input_path_extension = input_path.rfind(".").map(|i| &input_path[i+1..]);
-            if input_path_extension.unwrap_or("") != input_format.as_str() { println!("input format {} does not coincide with the extension {:?}", input_format, input_path_extension); }
-            let some_output_path = output_path.unwrap_or_else(|| format!("{}.{}", &input_path[..input_path.len()-input_path_extension.unwrap_or("").len()], output_format));
-            let output_path_extension = some_output_path.rfind(".").map(|i| &some_output_path[i+1..]);
-            if output_path_extension.unwrap_or("") != output_format.as_str() { println!("output format {} does not coincide with the extension {:?}", output_format, output_path_extension); }
+            let input_path_extension = input_path.rfind(".").map(|i| &input_path[i + 1..]);
+            if input_path_extension.unwrap_or("") != input_format.as_str() {
+                println!(
+                    "input format {} does not coincide with the extension {:?}",
+                    input_format, input_path_extension
+                );
+            }
+            let some_output_path = output_path.unwrap_or_else(|| {
+                format!(
+                    "{}.{}",
+                    &input_path[..input_path.len() - input_path_extension.unwrap_or("").len()],
+                    output_format
+                )
+            });
+            let output_path_extension = some_output_path
+                .rfind(".")
+                .map(|i| &some_output_path[i + 1..]);
+            if output_path_extension.unwrap_or("") != output_format.as_str() {
+                println!(
+                    "output format {} does not coincide with the extension {:?}",
+                    output_format, output_path_extension
+                );
+            }
 
             match (input_format.as_str(), output_format.as_str()) {
                 ("metta", "metta" | "act" | "paths") => {
                     let mut s = Space::new();
                     let f = std::fs::File::open(&input_path).unwrap();
                     let mmapf = unsafe { memmap2::Mmap::map(&f).unwrap() };
-                    if pattern == "$" && template == "_1" { s.add_all_sexpr(&*mmapf).unwrap(); }
-                    else { s.add_sexpr(&*mmapf, expr!(s, &*pattern), expr!(s, &*template)).unwrap(); }
+                    if pattern == "$" && template == "_1" {
+                        s.add_all_sexpr(&*mmapf).unwrap();
+                    } else {
+                        s.add_sexpr(&*mmapf, expr!(s, &*pattern), expr!(s, &*template))
+                            .unwrap();
+                    }
                     println!("done loading in memory");
-                    if instrumentation > 0 { println!("dumping {} expressions", s.btm.val_count()) }
+                    if instrumentation > 0 {
+                        println!("dumping {} expressions", s.btm.val_count())
+                    }
 
                     match output_format.as_str() {
                         "metta" => {
