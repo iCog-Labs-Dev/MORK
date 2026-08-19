@@ -1,3 +1,6 @@
+use pathmap::PathMap;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 use weighted_atom_sweep::{WeightedAtomSweep, WeightedAtomSweepSettings};
 
 fn make_sweep() -> WeightedAtomSweep {
@@ -69,6 +72,32 @@ fn get_process_mut_returns_registered_process() {
     sweep.add_engine("test_engine", "random_walk");
     let p = sweep.get_process_mut("test_engine");
     assert!(p.is_some());
-    assert_eq!(p.unwrap().operation_count(), 0);
+    assert_eq!(p.unwrap().id.0, "test_engine");
     assert!(sweep.get_process_mut("nonexistent").is_none());
+}
+
+#[test]
+fn repeated_spawn_keeps_one_candidate_channel() {
+    let mut sweep = WeightedAtomSweep::new(WeightedAtomSweepSettings::default());
+    sweep.add_engine("first", "random_walk");
+    sweep.spawn();
+    sweep.add_engine("second", "random_walk");
+    sweep.spawn();
+
+    let mut map = PathMap::<u64>::new();
+    map.write_zipper_at_path(b"atom").set_val_w(1);
+    sweep.publish_snapshot(map, 1);
+
+    let rx = sweep.candidate_rx.take().expect("no candidate receiver");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut processes = HashSet::new();
+    while Instant::now() < deadline && processes.len() < 2 {
+        if let Ok(candidate) = rx.recv_timeout(Duration::from_millis(20)) {
+            processes.insert(candidate.process_id.0);
+        }
+    }
+
+    assert!(processes.contains("first"));
+    assert!(processes.contains("second"));
+    sweep.shutdown_all();
 }

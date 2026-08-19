@@ -1,17 +1,16 @@
-use crate::map::WeightedMap;
-use crate::operation::{OperationObserver, TransformOp};
 use crate::traversal::TraversalEngine;
-use crate::new_eng_op::build_strategy;
-use pathmap::zipper::{ZipperCreation, ZipperHeadOwned, ZipperMoving};
+use crate::traversal_factory::build_strategy;
 use pathmap::PathMap;
-use std::collections::HashMap;
+use pathmap::zipper::ZipperValues;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-    mpsc, Arc, RwLock,
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
-use tracing::{debug, instrument, span, trace, Level};
+use std::time::Duration;
+use tracing::{Level, debug, instrument, span};
 
 /// The path of an atom in the trie, represented as a byte vector.
 pub type AtomPosition = Vec<u8>;
@@ -20,83 +19,40 @@ pub type AtomPosition = Vec<u8>;
 #[derive(Default)]
 pub struct WeightedAtomSweepSettings {}
 
-/// A single traversal process: an engine paired with a set of operations.
+/// Strongly typed process identifier.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct ProcessId(pub String);
+
+/// Candidate atom sampled from a sweep traversal engine.
+#[derive(Clone, Debug)]
+pub struct AtomCandidate {
+    pub process_id: ProcessId,
+    pub path: Vec<u8>,
+    pub snapshot_version: u64,
+}
+
+/// A single traversal process: an engine with its identifier.
 pub struct SweepProcess {
+    pub id: ProcessId,
     pub engine: Box<dyn TraversalEngine>,
-    pub operations: Vec<Box<dyn TransformOp>>,
 }
 
 impl SweepProcess {
     /// Create a new process with the given traversal engine.
-    pub fn new(engine: Box<dyn TraversalEngine>) -> Self {
-        Self {
-            engine,
-            operations: Vec::new(),
-        }
-    }
-
-    /// Get the number of operations subscribed to this process.
-    pub fn operation_count(&self) -> usize {
-        self.operations.len()
-    }
-}
-
-impl OperationObserver for SweepProcess {
-    #[instrument(skip_all, name = "process.subscribe")]
-    fn subscribe(&mut self, operation: Box<dyn TransformOp>) {
-        let name = operation.name().to_string();
-        let total_operations = self.operations.len() + 1;
-        debug!(
-            operation_name = %name,
-            total_operations, "subscribing operation to process"
-        );
-        self.operations.push(operation);
-    }
-
-    #[instrument(skip_all, name = "process.unsubscribe_by_name")]
-    fn unsubscribe_by_name(&mut self, name: &str) {
-        let total_operations = self.operations.len() - 1;
-        debug!(
-            operation_name = %name,
-            total_operations, "unsubscribing operation from process"
-        );
-        self.operations.retain(|op| op.name() != name);
+    pub fn new(id: ProcessId, engine: Box<dyn TraversalEngine>) -> Self {
+        Self { id, engine }
     }
 }
 
 /// Controls the background WeightedAtomSweep.
-///
-/// ### Channel Preservation
-/// The internal mpsc channels and operations buffer are fully preserved and survive
-/// pause/resume cycles. Atoms queued during traversal remain in the queue and are
-/// processed immediately when the sweep is resumed, guaranteeing zero atom loss.
 pub struct SweepController {
-    /// The shared container holding the active trie map.
-    /// Threads clone the Arc briefly on each iteration, releasing it immediately
-    /// to minimize lock contention and allow the trie to be reclaimed.
-    pub map: Arc<RwLock<Option<Arc<ZipperHeadOwned<u64>>>>>,
+    /// Replaceable latest-snapshot slots for the worker threads.
+    snapshot_slots: Vec<Arc<Mutex<Option<Arc<(PathMap<u64>, u64)>>>>>,
     handles: Vec<JoinHandle<()>>,
     shutdown_signal: Arc<AtomicBool>,
-    paused_signal: Arc<AtomicBool>,
-    parked_count: Arc<AtomicUsize>,
 }
 
 impl SweepController {
-    /// Check if the controller is active and running (not paused and threads are alive).
-    pub fn is_available(&self) -> bool {
-        !self.paused_signal.load(Ordering::Acquire) && !self.shutdown_signal.load(Ordering::Acquire)
-    }
-
-    /// Check if the controller is currently paused.
-    pub fn is_paused(&self) -> bool {
-        self.paused_signal.load(Ordering::Acquire)
-    }
-
-    /// Retrieve the current count of parked threads.
-    pub fn parked_count(&self) -> usize {
-        self.parked_count.load(Ordering::Acquire)
-    }
-
     /// Retrieve the total number of managed threads.
     pub fn thread_count(&self) -> usize {
         self.handles.len()
@@ -116,92 +72,23 @@ impl SweepController {
     pub fn shutdown(mut self) -> Result<(), Box<dyn std::error::Error>> {
         debug!("initiating sweep shutdown");
         self.shutdown_signal.store(true, Ordering::SeqCst);
-        self.paused_signal.store(false, Ordering::SeqCst); // Unpark any parked threads
 
         for handle in self.handles.drain(..) {
-            handle.join().map_err(|_| "thread panicked during shutdown")?;
-        }
-
-        // Clear the map holder to release the trie
-        if let Ok(mut guard) = self.map.write() {
-            *guard = None;
+            handle
+                .join()
+                .map_err(|_| "thread panicked during shutdown")?;
         }
 
         debug!("sweep shutdown complete");
         Ok(())
     }
 
-    /// Pause all background threads, wait for them to park, and reclaim exclusive ownership
-    /// of the trie, returning it as a PathMap for foreground access.
-    pub fn pause(&self) -> PathMap<u64> {
-        debug!("starting sweep pause sequence");
-
-        let total_threads = self.handles.len();
-        if total_threads == 0 {
-            panic!("no threads are currently active in this sweep");
+    /// Publish a new snapshot specifically to this controller.
+    pub fn publish(&self, snapshot: Arc<(PathMap<u64>, u64)>) {
+        for slot in &self.snapshot_slots {
+            let mut latest = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *latest = Some(snapshot.clone());
         }
-
-        if self.paused_signal.load(Ordering::Acquire) {
-            panic!("sweep is already paused");
-        }
-
-        self.paused_signal.store(true, Ordering::SeqCst);
-
-        let pause_deadline = Instant::now() + Duration::from_secs(30);
-        while self.parked_count.load(Ordering::SeqCst) < total_threads {
-            if self.shutdown_signal.load(Ordering::Acquire) {
-                break;
-            }
-            if Instant::now() > pause_deadline {
-                panic!(
-                    "pause() timed out after 30s waiting for {}/{} threads to park",
-                    self.parked_count.load(Ordering::SeqCst),
-                    total_threads
-                );
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-
-        debug!("all sweep threads parked and quiescent");
-
-        let map_arc = {
-            let mut guard = self.map.write().expect("failed to acquire write lock");
-            guard.take().expect("map was already leased or is missing")
-        };
-
-        debug_assert_eq!(
-            Arc::strong_count(&map_arc),
-            1,
-            "Invariant violated: Arc strong count must be exactly 1 when threads are parked"
-        );
-
-        let zipper_head = Arc::try_unwrap(map_arc)
-            .expect("failed to reclaim leased trie: references still held");
-
-        let path_map = zipper_head.into_map();
-
-        debug!("sweep pause sequence completed successfully");
-        path_map
-    }
-
-    /// Return an updated trie back to the background sweep and resume thread execution.
-    pub fn resume(&self, new_map: PathMap<u64>) {
-        debug!("starting sweep resume sequence");
-
-        if new_map.val_count() == 0 {
-            debug!("warning: incoming PathMap for resume is empty");
-        }
-
-        let head = Arc::new(new_map.into_zipper_head([]));
-
-        {
-            let mut guard = self.map.write().expect("failed to acquire write lock");
-            *guard = Some(head);
-        }
-
-        self.paused_signal.store(false, Ordering::SeqCst);
-
-        debug!("sweep resume sequence completed successfully");
     }
 }
 
@@ -210,73 +97,69 @@ impl Drop for SweepController {
         debug!("dropping SweepController, performing resource cleanup");
 
         self.shutdown_signal.store(true, Ordering::SeqCst);
-        self.paused_signal.store(false, Ordering::SeqCst);
 
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
 
-        // Do NOT null `self.map` here: it is the shared lease slot cloned across every
-        // controller of this WAS. Nulling it on a non-last drop would pull the trie out
-        // from under the still-running sweeps. The WAS-level pause_all/shutdown own the
-        // slot's lifecycle and reclaim the trie explicitly.
         debug!("SweepController dropped cleanly");
     }
 }
 
 /// Long-lived registry for sweep processes and controllers.
-///
-/// Manages multiple [`SweepProcess`] instances and their spawned [`SweepController`]s.
-/// Supports pause/resume/shutdown lifecycle for all controllers.
 pub struct WeightedAtomSweep {
     pub processes: HashMap<String, SweepProcess>,
     pub settings: WeightedAtomSweepSettings,
-    pub map: Option<WeightedMap>,
     pub controllers: HashMap<String, SweepController>,
     next_id: usize,
+    candidate_tx: mpsc::SyncSender<AtomCandidate>,
+    pub candidate_rx: Option<mpsc::Receiver<AtomCandidate>>,
+    worker_candidate_txs: HashMap<ProcessId, mpsc::SyncSender<AtomCandidate>>,
+    worker_candidate_rxs: HashMap<ProcessId, mpsc::Receiver<AtomCandidate>>,
+    pub candidate_buffers: HashMap<ProcessId, VecDeque<AtomCandidate>>,
+    selected_candidates: HashMap<ProcessId, AtomCandidate>,
 }
 
+pub const CANDIDATE_BUFFER_CAPACITY: usize = 1000;
+
 impl WeightedAtomSweep {
-    /// this will automatically instantiate a weighted map if sweep is called before any foreground metta calculus task
-    pub fn init_map(&mut self) {
-        if self.map.is_none() {
-            self.map = Some(WeightedMap {
-                inner: Arc::new(PathMap::<u64>::new().into_zipper_head([])),
-            });
-        }
-    }
-
-    /// Transfer a PathMap into the sweep as its weighted map (STATE B).
-    /// Used by Space::sweep() to give its btm to the sweep threads.
-    pub fn take_trie(&mut self, btm: PathMap<u64>) {
-        self.map = Some(WeightedMap {
-            inner: Arc::new(btm.into_zipper_head([])),
-        });
-    }
-
     #[instrument(skip_all, name = "sweep.new")]
     pub fn new(settings: WeightedAtomSweepSettings) -> Self {
         debug!("initializing WeightedAtomSweep");
+        let (candidate_tx, candidate_rx) =
+            mpsc::sync_channel::<AtomCandidate>(CANDIDATE_BUFFER_CAPACITY);
         let result = Self {
             processes: HashMap::new(),
             settings,
-            map: None,
             controllers: HashMap::new(),
             next_id: 0,
+            candidate_tx,
+            candidate_rx: Some(candidate_rx),
+            worker_candidate_txs: HashMap::new(),
+            worker_candidate_rxs: HashMap::new(),
+            candidate_buffers: HashMap::new(),
+            selected_candidates: HashMap::new(),
         };
         debug!("WeightedAtomSweep initialization complete");
         result
     }
 
     /// Add a traversal engine by strategy key, returning a mutable reference
-    /// to the new process for operation subscription.
+    /// to the new process.
     #[instrument(skip_all, name = "sweep.add_engine")]
     pub fn add_engine(&mut self, name: &str, strategy_key: &str) -> &mut SweepProcess {
         debug!("adding new traversal engine to sweep");
         let engine = build_strategy(strategy_key)
             .unwrap_or_else(|| panic!("unknown traversal strategy '{strategy_key}'"));
 
-        let process = SweepProcess::new(engine);
+        let process_id = ProcessId(name.to_string());
+        let (candidate_tx, candidate_rx) =
+            mpsc::sync_channel::<AtomCandidate>(CANDIDATE_BUFFER_CAPACITY);
+        self.worker_candidate_txs
+            .insert(process_id.clone(), candidate_tx);
+        self.worker_candidate_rxs
+            .insert(process_id.clone(), candidate_rx);
+        let process = SweepProcess::new(process_id, engine);
         self.processes.insert(name.to_string(), process);
 
         let process_count = self.processes.len();
@@ -295,14 +178,58 @@ impl WeightedAtomSweep {
         self.processes.get_mut(name)
     }
 
+    /// Move available worker events into bounded per-process FIFO buffers.
+    pub fn buffer_candidates(&mut self) {
+        let mut received = Vec::new();
+        if self.worker_candidate_rxs.is_empty() {
+            if let Some(rx) = self.candidate_rx.as_ref() {
+                while let Ok(candidate) = rx.try_recv() {
+                    received.push(candidate);
+                }
+            }
+        }
+        for rx in self.worker_candidate_rxs.values() {
+            while let Ok(candidate) = rx.try_recv() {
+                received.push(candidate);
+            }
+        }
+        for candidate in received {
+            let buffer = self.candidate_buffers
+                .entry(candidate.process_id.clone())
+                .or_default();
+            if buffer.len() == CANDIDATE_BUFFER_CAPACITY {
+                buffer.pop_front();
+            }
+            buffer.push_back(candidate);
+        }
+    }
+
+    pub fn pop_candidate(&mut self, process_id: &ProcessId) -> Option<AtomCandidate> {
+        self.buffer_candidates();
+        self.candidate_buffers.get_mut(process_id)?.pop_front()
+    }
+
+    /// Reserve the next candidate whose path still exists in the current live map.
+    pub fn select_existing_candidate(
+        &mut self,
+        process_id: &ProcessId,
+        live_map: &PathMap<u64>,
+    ) -> bool {
+        while let Some(candidate) = self.pop_candidate(process_id) {
+            let exists = live_map.read_zipper_at_path(&candidate.path).val().is_some();
+            if exists {
+                self.selected_candidates.insert(process_id.clone(), candidate);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn take_selected_candidate(&mut self, process_id: &ProcessId) -> Option<AtomCandidate> {
+        self.selected_candidates.remove(process_id)
+    }
+
     /// Spawn all registered processes into background threads.
-    ///
-    /// Takes the pending processes (draining them), creates a shared
-    /// `Arc<RwLock<Option<Arc<ZipperHeadOwned>>>>` for all spawned controllers,
-    /// and returns a unique handle name.
-    ///
-    /// The caller must ensure `self.map.is_some()` before calling spawn.
-    /// Space is responsible for setting `was.map` during the A→B transition.
     #[instrument(skip_all, name = "sweep.spawn")]
     pub fn spawn(&mut self) -> String {
         let processes = std::mem::take(&mut self.processes);
@@ -313,100 +240,84 @@ impl WeightedAtomSweep {
             debug!("warning: no processes added, sweep will do nothing");
         }
 
-        self.init_map();
-        // Every controller spawned by this WAS shares ONE lease slot. Reuse the slot
-        // an existing controller already holds; only the first spawn mints it. This is
-        // what lets pause_all/shutdown drop the leased head to strong_count 1 and
-        // reclaim the trie no matter how many sweeps are running — the previous code
-        // minted a fresh slot per spawn, so N sweeps left N live clones and reclaim
-        // panicked in the multi-sweep case.
-        let map_lock = match self.controllers.values().next() {
-            Some(ctrl) => ctrl.map.clone(),
-            None => Arc::new(RwLock::new(Some(self.map.as_ref().unwrap().inner.clone()))),
-        };
         let shutdown = Arc::new(AtomicBool::new(false));
-        let paused = Arc::new(AtomicBool::new(false));
-        let parked_count = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
+        let mut snapshot_slots = Vec::new();
 
         for (name, process) in processes.into_iter() {
             let engine = process.engine;
-            let operations = process.operations;
+            let process_id = process.id;
 
-            let map_lock_t = map_lock.clone();
-            let map_lock_o = map_lock.clone();
+            let snapshot_slot: Arc<Mutex<Option<Arc<(PathMap<u64>, u64)>>>> =
+                Arc::new(Mutex::new(None));
+            snapshot_slots.push(snapshot_slot.clone());
+
             let shutdown_traversal = shutdown.clone();
-            let shutdown_operations = shutdown.clone();
-            let pause_flag = Arc::new(AtomicBool::new(false));
-            let pause_for_traversal = pause_flag.clone();
-            let pause_for_operations = pause_flag.clone();
-
-            let paused_t = paused.clone();
-            let paused_o = paused.clone();
-            let parked_t = parked_count.clone();
-            let parked_o = parked_count.clone();
-
-            let (atom_sender, atom_receiver) = mpsc::channel::<AtomPosition>();
-
+            let tx = self.worker_candidate_txs.remove(&process_id)
+                .expect("missing candidate channel for WAS process");
+            let legacy_tx = self.candidate_tx.clone();
             let name_t = name.clone();
-            let name_o = name.clone();
 
             let traversal_handle = std::thread::spawn(move || {
                 let _span = span!(Level::DEBUG, "traversal_thread", engine = %name_t).entered();
                 debug!("traversal thread started - entering sampling loop");
-                loop {
-                    if paused_t.load(Ordering::Acquire) {
-                        parked_t.fetch_add(1, Ordering::SeqCst);
-                        while paused_t.load(Ordering::Acquire) {
-                            if shutdown_traversal.load(Ordering::Acquire) { break; }
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        parked_t.fetch_sub(1, Ordering::SeqCst);
-                    }
+                let mut current_snapshot: Option<Arc<(PathMap<u64>, u64)>> = None;
+                let mut current_version = None;
 
+                loop {
                     if shutdown_traversal.load(Ordering::Acquire) {
                         debug!("shutdown signal received, exiting traversal loop");
                         break;
                     }
 
-                    while pause_for_traversal.load(Ordering::Acquire) {
-                        if paused_t.load(Ordering::Acquire) { break; }
-                        if shutdown_traversal.load(Ordering::Acquire) { break; }
-                        std::thread::yield_now();
+                    let latest = snapshot_slot
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if let Some(latest) = latest {
+                        if current_version != Some(latest.1) {
+                            engine.snapshot_changed();
+                            current_version = Some(latest.1);
+                        }
+                        current_snapshot = Some(latest);
                     }
 
-                    if shutdown_traversal.load(Ordering::Acquire) {
-                        break;
-                    }
+                    if let Some(ref snapshot_arc) = current_snapshot {
+                        let (map, version) = &**snapshot_arc;
 
-                    let mut sampled = false;
-                    {
-                        let local_map_opt = {
-                            if let Ok(guard) = map_lock_t.read() {
-                                guard.clone()
-                            } else {
-                                None
-                            }
-                        };
-
-                        if let Some(map_arc) = local_map_opt {
-                            if let Ok(traverse_zp) = (*map_arc).read_zipper_at_borrowed_path(&[]) {
-                                match engine.next_atom(traverse_zp) {
-                                    Ok(atom_path) => {
-                                        if atom_sender.send(atom_path).is_ok() {
-                                            sampled = true;
-                                        } else {
+                        match engine.next_atom(map) {
+                            Ok(atom_path) => {
+                                let candidate = AtomCandidate {
+                                    process_id: process_id.clone(),
+                                    path: atom_path,
+                                    snapshot_version: *version,
+                                };
+                                let mut sent = false;
+                                while !sent {
+                                    if shutdown_traversal.load(Ordering::Acquire) {
+                                        break;
+                                    }
+                                    match tx.try_send(candidate.clone()) {
+                                        Ok(_) => {
+                                            let _ = legacy_tx.try_send(candidate.clone());
+                                            sent = true;
+                                        }
+                                        Err(mpsc::TrySendError::Full(_)) => {
+                                            std::thread::sleep(Duration::from_millis(5));
+                                        }
+                                        Err(mpsc::TrySendError::Disconnected(_)) => {
                                             break;
                                         }
                                     }
-                                    Err(_) => {}
                                 }
                             }
+                            Err(_) => {
+                                // backoff if sampling fails
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
                         }
-                    }
-
-                    if !sampled {
-                        // Backoff to avoid spinning 100% CPU when sampling fails
+                    } else {
+                        // wait for a snapshot to be published
                         std::thread::sleep(Duration::from_millis(10));
                     }
                 }
@@ -414,110 +325,7 @@ impl WeightedAtomSweep {
             });
 
             handles.push(traversal_handle);
-
-            let operations_handle = std::thread::spawn(move || {
-                let _span = span!(Level::DEBUG, "operations_thread", engine = %name_o).entered();
-                let mut buffer: Vec<AtomPosition> = Vec::new();
-
-                loop {
-                    if paused_o.load(Ordering::Acquire) {
-                        parked_o.fetch_add(1, Ordering::SeqCst);
-                        while paused_o.load(Ordering::Acquire) {
-                            if shutdown_operations.load(Ordering::Acquire) { break; }
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        parked_o.fetch_sub(1, Ordering::SeqCst);
-                    }
-
-                    if shutdown_operations.load(Ordering::Acquire) {
-                        debug!("operations thread: shutdown detected, exiting");
-                        break;
-                    }
-
-                    if let Ok(atom_path) = atom_receiver.try_recv() {
-                        buffer.push(atom_path);
-                    }
-
-                    let mut made_progress = false;
-                    if !buffer.is_empty() {
-                        let local_map_opt = {
-                            if let Ok(guard) = map_lock_o.read() {
-                                guard.clone()
-                            } else {
-                                None
-                            }
-                        };
-
-                        if let Some(map_arc) = local_map_opt {
-                            let mut i = 0;
-                            while i < buffer.len() {
-                                let atom_path = &buffer[i];
-                                let write_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    map_arc.write_zipper_at_exclusive_path(&atom_path[..])
-                                }));
-                                let wz_result: Result<_, _> = match write_result {
-                                    Ok(Ok(wz)) => Ok(wz),
-                                    Ok(Err(e)) => Err(e),
-                                    Err(panic_payload) => {
-                                        let msg = panic_payload.downcast_ref::<&str>().unwrap_or(&"unknown");
-                                        debug!(
-                                            "operations thread: write_zipper panicked ({}), skipping atom",
-                                            msg
-                                        );
-                                        pause_for_operations.store(true, Ordering::Release);
-                                        i += 1;
-                                        continue;
-                                    }
-                                };
-                                match wz_result {
-                                    Ok(mut wz) => {
-                                        for op in operations.iter() {
-                                            let _result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                                op.apply(&mut wz, atom_path);
-                                            }));
-                                            wz.reset();
-                                        }
-                                        map_arc.cleanup_write_zipper_w(wz);
-                                        buffer.remove(i);
-                                        made_progress = true;
-                                    }
-                                    Err(_) => {
-                                        pause_for_operations.store(true, Ordering::Release);
-                                        i += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if buffer.is_empty() {
-                        pause_for_operations.store(false, Ordering::Release);
-                    }
-
-                    if !made_progress && !buffer.is_empty() {
-                        std::thread::yield_now();
-                    }
-
-                    if buffer.is_empty() {
-                        match atom_receiver.try_recv() {
-                            Ok(atom_path) => {
-                                buffer.push(atom_path);
-                            }
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                break;
-                            }
-                            Err(mpsc::TryRecvError::Empty) => {
-                                std::thread::sleep(Duration::from_millis(5));
-                            }
-                        }
-                    }
-                }
-                debug!("operations thread completed");
-                shutdown_operations.store(true, Ordering::Release);
-            });
-            handles.push(operations_handle);
-
-            debug!(engine = %name, "spawned thread pair for process");
+            debug!(engine = %name, "spawned traversal worker thread for process");
         }
 
         let name = format!("sweep-{}", self.next_id);
@@ -525,11 +333,9 @@ impl WeightedAtomSweep {
         let total_threads = handles.len();
 
         let controller = SweepController {
-            map: map_lock,
+            snapshot_slots,
             handles,
             shutdown_signal: shutdown,
-            paused_signal: paused,
-            parked_count,
         };
 
         debug!(
@@ -542,133 +348,28 @@ impl WeightedAtomSweep {
         name
     }
 
-    /// Pause all controllers and reclaim the trie.
-    ///
-    /// Sets the paused signal on all controllers, waits for all threads to park,
-    /// then reclaims the trie from the shared map slot. All controllers share the
-    /// same `Arc<RwLock<Option<Arc<ZipperHeadOwned>>>>` so pausing/reclaiming once
-    /// on any controller suffices for the shared slot — but we must wait for ALL
-    /// threads (across all controllers) to park before reclaiming.
-    pub fn pause_all(&mut self) -> PathMap<u64> {
-        debug!("pausing all sweep controllers");
-
-        if self.controllers.is_empty() {
-            panic!("no controllers to pause");
-        }
-
-        // Signal pause to all controllers
+    /// Publish a snapshot of the PathMap to all controllers.
+    pub fn publish_snapshot(&self, snapshot: PathMap<u64>, version: u64) {
+        let arc_snapshot = Arc::new((snapshot, version));
         for ctrl in self.controllers.values() {
-            ctrl.paused_signal.store(true, Ordering::SeqCst);
-        }
-
-        // Wait for ALL threads across all controllers to park
-        let pause_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            let total_parked: usize = self.controllers.values().map(|c| c.parked_count.load(Ordering::SeqCst)).sum();
-            let total_threads: usize = self.controllers.values().map(|c| c.handles.len()).sum();
-            if total_parked >= total_threads {
-                break;
-            }
-            if std::time::Instant::now() > pause_deadline {
-                panic!(
-                    "pause_all() timed out after 30s waiting for {}/{} threads to park",
-                    total_parked, total_threads
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-
-        debug!("all sweep threads parked and quiescent");
-
-        // Reclaim the trie from the first controller's shared slot
-        // (all controllers share the same Arc<RwLock<...>>)
-        let first_ctrl = self.controllers.values().next().unwrap();
-        let map_arc = {
-            let mut guard = first_ctrl.map.write().expect("failed to acquire write lock");
-            guard.take().expect("map was already leased or is missing")
-        };
-
-        // Clear self.map reference so that the Arc strong count drops to 1 for unwrap
-        self.map = None;
-
-        debug_assert_eq!(
-            Arc::strong_count(&map_arc),
-            1,
-            "Invariant violated: Arc strong count must be exactly 1 when threads are parked"
-        );
-
-        let zipper_head = Arc::try_unwrap(map_arc)
-            .expect("failed to reclaim leased trie: references still held");
-
-        let path_map = zipper_head.into_map();
-
-        debug!("sweep pause_all completed successfully");
-        path_map
-    }
-
-    /// Resume all controllers with an updated trie.
-    pub fn resume_all(&mut self, map: PathMap<u64>) {
-        debug!("resuming all sweep controllers");
-        let head = Arc::new(map.into_zipper_head([]));
-        let weighted = WeightedMap { inner: head.clone() };
-        self.map = Some(weighted);
-        for ctrl in self.controllers.values() {
-            // Put the head into the shared slot
-            if let Ok(mut guard) = ctrl.map.write() {
-                *guard = Some(head.clone());
-            }
-        }
-        // Clear paused signal for all
-        for ctrl in self.controllers.values() {
-            ctrl.paused_signal.store(false, Ordering::SeqCst);
+            ctrl.publish(arc_snapshot.clone());
         }
     }
 
-    /// Shutdown all controllers and reclaim the trie.
-    pub fn shutdown_all(&mut self) -> Option<PathMap<u64>> {
+    /// Shutdown all controllers.
+    pub fn shutdown_all(&mut self) {
         debug!("shutting down all sweep controllers");
         let names: Vec<String> = self.controllers.keys().cloned().collect();
-        let mut result = None;
         for name in names {
-            if let Some(map) = self.shutdown(&name) {
-                result = Some(map);
-            }
+            self.shutdown(&name);
         }
-        result
     }
 
-    /// Shutdown a specific controller by name and reclaim its trie.
-    pub fn shutdown(&mut self, name: &str) -> Option<PathMap<u64>> {
-        if let Some(mut ctrl) = self.controllers.remove(name) {
+    /// Shutdown a specific controller by name.
+    pub fn shutdown(&mut self, name: &str) {
+        if let Some(ctrl) = self.controllers.remove(name) {
             debug!(name, "shutting down sweep controller");
-            let is_last = self.controllers.is_empty();
-
-            let mut map_arc = None;
-            if is_last {
-                // Take Arc and clear self.map before joining threads to allow try_unwrap to succeed
-                self.map = None;
-                if let Ok(mut guard) = ctrl.map.write() {
-                    map_arc = guard.take();
-                }
-            }
-
-            // Signal shutdown and join all threads to ensure references are released
-            ctrl.shutdown_signal.store(true, Ordering::SeqCst);
-            ctrl.paused_signal.store(false, Ordering::SeqCst);
-            for handle in ctrl.handles.drain(..) {
-                let _ = handle.join();
-            }
-
-            if let Some(arc) = map_arc {
-                if let Ok(head) = Arc::try_unwrap(arc) {
-                    let map = head.into_map();
-                    self.map = Some(WeightedMap {
-                        inner: Arc::new(PathMap::<u64>::new().into_zipper_head([])),
-                    });
-                    return Some(map);
-                }
-            }
+            let _ = ctrl.shutdown();
         }
-        None
     }
 }
