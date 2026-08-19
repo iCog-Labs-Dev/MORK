@@ -1,9 +1,12 @@
 use crate::sweep::AtomPosition;
-use crate::traversal::{TraversalError, TraversalEngine};
-use pathmap::zipper::{ReadZipperTracked, ReadZipperUntracked, ZipperIteration, ZipperForking, ZipperAbsolutePath};
-use std::sync::{Arc, Mutex};
-use std::collections::BinaryHeap;
+use crate::traversal::{TraversalEngine, TraversalError};
+use pathmap::zipper::{
+    ReadZipperTracked, ReadZipperUntracked, Zipper, ZipperAbsolutePath, ZipperForking,
+    ZipperIteration, ZipperMoving, ZipperValues,
+};
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::sync::{Arc, Mutex};
 
 /// A chunk with a path and an aggregate-weight score.
 #[derive(Clone, Debug)]
@@ -83,6 +86,42 @@ impl ChunkedPQTraverse {
             }
         }
     }
+
+    /// Select a complete weighted atom below a ranked chunk. A chunk path is
+    /// only a trie prefix and may end in the middle of an encoded expression;
+    /// it must never escape as an AtomCandidate by itself.
+    fn select_atom_in_chunk(
+        &self,
+        map: &pathmap::PathMap<u64>,
+        chunk: &AtomChunk,
+    ) -> Option<AtomPosition> {
+        let mut z = map.read_zipper_at_path(&chunk.path);
+        let mut offset = rand::random_range(0..chunk.score);
+
+        loop {
+            if let Some(weight) = z.val().copied() {
+                if offset < weight {
+                    return Some(z.origin_path().to_vec());
+                }
+                offset -= weight;
+            }
+
+            let mut descended = false;
+            for byte in z.child_mask().iter() {
+                z.descend_to_byte(byte);
+                let child_weight = z.agg_w();
+                if offset < child_weight {
+                    descended = true;
+                    break;
+                }
+                offset -= child_weight;
+                z.ascend_byte();
+            }
+            if !descended {
+                return None;
+            }
+        }
+    }
 }
 
 impl TraversalEngine for ChunkedPQTraverse {
@@ -90,24 +129,29 @@ impl TraversalEngine for ChunkedPQTraverse {
         "pq"
     }
 
-    fn next_atom(&self, z: ReadZipperTracked<u64>) -> Result<AtomPosition, TraversalError> {
+    fn snapshot_changed(&self) {
+        self.heap.lock().unwrap().clear();
+    }
+
+    fn next_atom(&self, map: &pathmap::PathMap<u64>) -> Result<AtomPosition, TraversalError> {
         {
             let h = self.heap.lock().unwrap();
             if h.is_empty() {
                 drop(h);
-                let read_root = z.fork_read_zipper();
+                let read_root = map.read_zipper();
                 self.collect_atoms_at_depth(read_root, self.depth, &self.heap);
             }
         }
 
-        let mut h = self.heap.lock().unwrap();
-        match h.pop() {
-            Some(chunk) => Ok(chunk.path),
-            None => {
-                // Return error on empty trie to avoid returning root path and causing lock contention.
-                Err(TraversalError {
-                    message: "Trie is empty or has no atoms at specified depth".to_string(),
-                })
+        loop {
+            let chunk = self.heap.lock().unwrap().pop().ok_or_else(|| TraversalError {
+                message: "Trie is empty or has no atoms at specified depth".to_string(),
+            })?;
+            if chunk.score == 0 {
+                continue;
+            }
+            if let Some(atom) = self.select_atom_in_chunk(map, &chunk) {
+                return Ok(atom);
             }
         }
     }

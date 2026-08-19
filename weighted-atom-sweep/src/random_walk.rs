@@ -1,6 +1,6 @@
 use crate::sweep::AtomPosition;
-use crate::traversal::{TraversalError, TraversalEngine};
-use pathmap::zipper::{ReadZipperTracked, ZipperMoving, Zipper, ZipperValues, ZipperAbsolutePath};
+use crate::traversal::{TraversalEngine, TraversalError};
+use pathmap::zipper::{Zipper, ZipperAbsolutePath, ZipperMoving, ZipperValues};
 
 /// A weighted random walk traversal engine.
 ///
@@ -14,7 +14,8 @@ impl TraversalEngine for RandomWalk {
         "random_walk"
     }
 
-    fn next_atom(&self, mut z: ReadZipperTracked<u64>) -> Result<AtomPosition, TraversalError> {
+    fn next_atom(&self, map: &pathmap::PathMap<u64>) -> Result<AtomPosition, TraversalError> {
+        let mut z = map.read_zipper();
         let total_w: u64 = z.agg_w();
 
         if total_w == 0 {

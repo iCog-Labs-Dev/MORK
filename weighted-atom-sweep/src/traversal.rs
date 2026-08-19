@@ -1,8 +1,8 @@
 use crate::sweep::AtomPosition;
-use pathmap::zipper::ReadZipperTracked;
+use core::convert::Infallible;
+use pathmap::PathMap;
 use pathmap::morphisms::Catamorphism;
 use std::error::Error;
-use core::convert::Infallible;
 
 /// Error returned when traversal fails.
 #[derive(Debug)]
@@ -25,8 +25,10 @@ impl Error for TraversalError {}
 pub trait TraversalEngine: Send + Sync + 'static {
     /// Returns the name of this traversal engine, used for tracing and identification.
     fn name(&self) -> &str;
+    /// Reset snapshot-specific traversal state before reading a newer snapshot.
+    fn snapshot_changed(&self) {}
     /// Sample the next atom from the trie and return its path.
-    fn next_atom(&self, z: ReadZipperTracked<u64>) -> Result<AtomPosition, TraversalError>;
+    fn next_atom(&self, map: &PathMap<u64>) -> Result<AtomPosition, TraversalError>;
 }
 
 /// Full catamorphism over the subtrie — O(subtree size).
@@ -41,10 +43,9 @@ pub trait TraversalEngine: Send + Sync + 'static {
 /// `node_agg_w(z)` MUST equal `z.agg_w()` at every position. The
 /// `agg_w_parity` test enforces this invariant.
 pub fn node_agg_w<Z: Catamorphism<u64>>(path: Z) -> Result<u64, TraversalError> {
-    node_agg_w_fallible(path)
-        .map_err(|_| TraversalError {
-            message: "aggregation failed".to_string(),
-        })
+    node_agg_w_fallible(path).map_err(|_| TraversalError {
+        message: "aggregation failed".to_string(),
+    })
 }
 
 /// Infallible variant of `node_agg_w`. Returns `Ok(u64)` always.
