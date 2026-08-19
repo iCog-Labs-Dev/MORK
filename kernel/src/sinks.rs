@@ -33,7 +33,7 @@ use crate::{expr, pure};
 use crate::space::ACT_PATH;
 
 #[derive(Eq, PartialEq, Debug)]
-pub enum WriteResourceRequest {
+pub(crate) enum WriteResourceRequest {
     BTM(&'static [u8]),
     ACT(&'static str),
     Z3(&'static str),
@@ -96,6 +96,27 @@ pub(crate) enum WriteResource<'w, 'a, 'k> {
     Z3(&'w mut subprocess::Popen)
 }
 
+/// Use one root-scoped live write resource. Exact-path exclusive zippers hide
+/// the existing root value, while shortening an encoded MM2 path by an
+/// arbitrary byte can split a symbol. Root scope preserves values and matches
+/// the runtime's intentional single-writer model.
+const LIVE_BTM_ROOT: &[u8] = &[];
+
+/// Insert a default-weight value into MORK's live database without changing the
+/// weight of an atom that already exists at the current zipper position.
+///
+/// Live BTM writes must use the aggregate-aware API so every ancestor's cached
+/// `agg_w` remains consistent for subsequent weighted traversals. Temporary
+/// maps used internally by sinks do not need this helper.
+fn insert_default_weight(wz: &mut WriteZipperTracked<'_, '_, u64>) -> bool {
+    if wz.val().is_some() {
+        false
+    } else {
+        debug_assert!(wz.set_val_w(1u64).is_none());
+        true
+    }
+}
+
 // trait JoinLattice  {
 //     fn join(x: Self, y: Self) -> Self;
 // }
@@ -138,7 +159,7 @@ impl Sink for CompatSink {
     fn request(&self) -> impl Iterator<Item=WriteResourceRequest> {
         let p = &unsafe { self.e.prefix().unwrap_or_else(|x| self.e.span()).as_ref().unwrap() }[..];
         trace!(target: "sink", "+ (compat) requesting {}", serialize(p));
-        std::iter::once(WriteResourceRequest::BTM(p))
+        std::iter::once(WriteResourceRequest::BTM(LIVE_BTM_ROOT))
     }
     fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It, path: &[u8]) where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
@@ -146,7 +167,7 @@ impl Sink for CompatSink {
         trace!(target: "sink", "+ (compat) at '{}' sinking raw '{}'", serialize(wz.root_prefix_path()), serialize(path));
         trace!(target: "sink", "+ (compat) sinking '{}'", serialize(mpath));
         wz.move_to_path(mpath);
-        self.changed |= wz.set_val(1u64).is_none();
+        self.changed |= insert_default_weight(wz);
     }
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, it: It) -> bool where 'a : 'w, 'k : 'w {
         trace!(target: "sink", "+ (compat) finalizing");
@@ -160,7 +181,7 @@ impl Sink for AddSink {
     fn request(&self) -> impl Iterator<Item=WriteResourceRequest> {
         let p = &unsafe { self.e.prefix().unwrap_or_else(|x| self.e.span()).as_ref().unwrap() }[3..];
         trace!(target: "sink", "+ requesting {}", serialize(p));
-        std::iter::once(WriteResourceRequest::BTM(p))
+        std::iter::once(WriteResourceRequest::BTM(LIVE_BTM_ROOT))
     }
     fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It, path: &[u8]) where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
@@ -168,7 +189,7 @@ impl Sink for AddSink {
         trace!(target: "sink", "+ at '{}' sinking raw '{}'", serialize(wz.root_prefix_path()), serialize(path));
         trace!(target: "sink", "+ sinking '{}'", serialize(mpath));
         wz.move_to_path(mpath);
-        self.changed |= wz.set_val(1u64).is_none();
+        self.changed |= insert_default_weight(wz);
     }
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, it: It) -> bool where 'a : 'w, 'k : 'w {
         trace!(target: "sink", "+ finalizing");
@@ -204,7 +225,7 @@ impl Sink for USink {
     fn request(&self) -> impl Iterator<Item=WriteResourceRequest> {
         let p = &unsafe { self.e.prefix().unwrap_or_else(|x| self.e.span()).as_ref().unwrap() }[3..];
         trace!(target: "sink", "U requesting {}", serialize(p));
-        std::iter::once(WriteResourceRequest::BTM(p))
+        std::iter::once(WriteResourceRequest::BTM(LIVE_BTM_ROOT))
     }
     fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It, path: &[u8]) where 'a : 'w, 'k : 'w {
         // we could be way more parsimonious not unifying the prefix over and over again
@@ -258,8 +279,7 @@ impl Sink for USink {
                 trace!(target: "sink", "U unified expression '{}'", serialize(buf_slice));
                 let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
                 wz.move_to_path(&buf_slice[wz.root_prefix_path().len()..]);
-                wz.set_val(1u64);
-                true
+                insert_default_weight(wz)
             }
         }
     }
@@ -274,7 +294,7 @@ impl Sink for AUSink {
     fn request(&self) -> impl Iterator<Item=WriteResourceRequest> {
         let p = &unsafe { self.e.prefix().unwrap_or_else(|x| self.e.span()).as_ref().unwrap() }[4..];
         trace!(target: "sink", "AU requesting {}", serialize(p));
-        std::iter::once(WriteResourceRequest::BTM(p))
+        std::iter::once(WriteResourceRequest::BTM(LIVE_BTM_ROOT))
     }
     fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It, path: &[u8]) where 'a : 'w, 'k : 'w {
         // we could be way more parsimonious not anti-unifying the prefix over and over again
@@ -303,8 +323,7 @@ impl Sink for AUSink {
                 trace!(target: "sink", "AU anti-unified expression '{}'", serialize(&buf[..self.last]));
                 let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
                 wz.move_to_path(&buf[wz.root_prefix_path().len()..self.last]);
-                wz.set_val(1u64);
-                true
+                insert_default_weight(wz)
             }
         }
     }
@@ -342,7 +361,7 @@ impl Sink for RemoveSink {
         // !! we're never grabbing the full expression path, because then we don't have the ability to remove the root value
         let p = &unsafe { self.e.prefix().unwrap_or_else(|x| { let s = self.e.span(); slice_from_raw_parts(self.e.ptr, s.len() - 1) }).as_ref().unwrap() }[3..];
         trace!(target: "sink", "- requesting {}", serialize(p));
-        std::iter::once(WriteResourceRequest::BTM(p))
+        std::iter::once(WriteResourceRequest::BTM(LIVE_BTM_ROOT))
     }
     fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It, path: &[u8]) where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
@@ -355,19 +374,17 @@ impl Sink for RemoveSink {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
         wz.reset();
         trace!(target: "sink", "- finalizing by subtracting {} at '{}'", self.remove.val_count(), serialize(wz.origin_path()));
-        // match self.remove.remove(&[]) {
-        //     None => {}
-        //     Some(s) => {
-        //         println!("has root");
-        //         wz.remove_val(true);
-        //         println!("val not removed");
-        //     }
-        // }
-        match wz.subtract_into(&self.remove.read_zipper(), true) {
-            AlgebraicStatus::Element => { true }
-            AlgebraicStatus::Identity => { false }
-            AlgebraicStatus::None => { true } // GOAT maybe not?
+        // `subtract_into` mutates the live trie without maintaining cached
+        // aggregate weights. Remove each selected value through the weighted
+        // API instead; `self.remove` is only a temporary set of relative paths.
+        let mut changed = false;
+        let mut rz = self.remove.read_zipper();
+        while rz.to_next_val() {
+            wz.reset();
+            wz.move_to_path(rz.path());
+            changed |= wz.remove_val_w(true).is_some();
         }
+        changed
     }
 }
 
@@ -383,7 +400,7 @@ impl <const head: bool> Sink for HeadTailSink<head> {
     fn request(&self) ->  impl Iterator<Item=WriteResourceRequest> {
         let p = &unsafe { self.e.prefix().unwrap_or_else(|x| { let s = self.e.span(); slice_from_raw_parts(self.e.ptr, s.len() - 1) }).as_ref().unwrap() }[self.skip..];
         trace!(target: "sink", "head/tail requesting {}", serialize(p));
-        std::iter::once(WriteResourceRequest::BTM(p))
+        std::iter::once(WriteResourceRequest::BTM(LIVE_BTM_ROOT))
     }
     fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It, path: &[u8]) where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
@@ -404,29 +421,36 @@ impl <const head: bool> Sink for HeadTailSink<head> {
                 self.extremum.extend_from_slice(rz.path()); // yikes, throwing away our needless allocation
             }
         } else {
-            if self.extrema.insert(mpath, 1u64).is_none() {
-                trace!(target: "sink", "head/tail adding '{}'", serialize(mpath));
-                self.count += 1;
-                let update = self.extremum.is_empty()
-                    || if head { &self.extremum[..] < mpath } else { mpath < &self.extremum[..] };
-                if update {
+            if &self.extremum[..] <= mpath {
+                if self.extrema.insert(mpath, 1u64).is_none() {
+                    trace!(target: "sink", "head/tail adding new top at '{}'", serialize(mpath));
                     self.extremum.clear();
                     self.extremum.extend_from_slice(mpath);
+                    self.count += 1;
+                }
+            } else {
+                if self.extrema.insert(mpath, 1u64).is_none() {
+                    trace!(target: "sink", "head/tail adding '{}'", serialize(mpath));
+                    self.count += 1;
                 }
             }
         }
     }
-
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It) -> bool where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
         wz.reset();
         trace!(target: "sink", "head/tail finalizing by joining {} at '{}'", self.count, serialize(wz.origin_path()));
 
-        match wz.join_into(&self.extrema.read_zipper()) {
-            AlgebraicStatus::Element => { true }
-            AlgebraicStatus::Identity => { false }
-            AlgebraicStatus::None => { true } // GOAT maybe not?
+        // As with removal, bulk `join_into` bypasses aggregate propagation.
+        // Insert each selected path through the live-map helper instead.
+        let mut changed = false;
+        let mut rz = self.extrema.read_zipper();
+        while rz.to_next_val() {
+            wz.reset();
+            wz.move_to_path(rz.path());
+            changed |= insert_default_weight(wz);
         }
+        changed
     }
 }
 
@@ -527,7 +551,7 @@ impl Sink for WASMSink {
                 let ospan = unsafe { Expr{ ptr: omem.as_ptr().cast_mut() }.span().as_ref().unwrap() };
                 trace!(target: "sink", "wasm output '{}'", serialize(ospan));
                 wz.move_to_path(ospan);
-                self.changed |= wz.set_val(1u64).is_none();
+                self.changed |= insert_default_weight(wz);
             }
             Err(e) => {
                 trace!(target: "sink", "wasm error {:?}", e);
@@ -553,7 +577,7 @@ impl Sink for CountSink {
     fn request(&self) ->  impl Iterator<Item=WriteResourceRequest> {
         let p = &unsafe { self.e.prefix().unwrap_or_else(|x| { let s = self.e.span(); slice_from_raw_parts(self.e.ptr, s.len() - 1) }).as_ref().unwrap() }[7..];
         trace!(target: "sink", "count requesting {}", serialize(p));
-        std::iter::once(WriteResourceRequest::BTM(p))
+        std::iter::once(WriteResourceRequest::BTM(LIVE_BTM_ROOT))
     }
     fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It, path: &[u8]) where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
@@ -588,8 +612,7 @@ impl Sink for CountSink {
                     let fixed = &prz.path()[..prz.path().len()-(1+cnt_str.len())];
                     trace!(target: "sink", "fixed guard {}", serialize(fixed));
                     wz.move_to_path(fixed);
-                    wz.set_val(1u64);
-                    changed |= true;
+                    changed |= insert_default_weight(wz);
                 }
                 prz.ascend(descended + 1);
             }
@@ -597,8 +620,7 @@ impl Sink for CountSink {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(1u64);
-                changed |= true;
+                changed |= insert_default_weight(wz);
                 prz.ascend_byte();
             } 
             if prz.descend_first_byte() {
@@ -613,8 +635,7 @@ impl Sink for CountSink {
                     unsafe { buffer.set_len(oz.loc) }
                     trace!(target: "sink", "ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                     wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                    wz.set_val(1u64);
-                    changed |= true
+                    changed |= insert_default_weight(wz)
                 }
                 prz.ascend_byte();
             }
@@ -632,7 +653,7 @@ impl Sink for HashSink {
     fn request(&self) ->  impl Iterator<Item=WriteResourceRequest> {
         let p = &unsafe { self.e.prefix().unwrap_or_else(|x| { let s = self.e.span(); slice_from_raw_parts(self.e.ptr, s.len() - 1) }).as_ref().unwrap() }[6..];
         trace!(target: "sink", "hash requesting {}", serialize(p));
-        std::iter::once(WriteResourceRequest::BTM(p))
+        std::iter::once(WriteResourceRequest::BTM(LIVE_BTM_ROOT))
     }
     fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It, path: &[u8]) where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
@@ -677,8 +698,7 @@ impl Sink for HashSink {
                         let fixed = &prz.origin_path()[..prz.origin_path().len()-(1+size as usize)];
                         trace!(target: "sink", "fixed payload {}", serialize(fixed));
                         wz.move_to_path(fixed);
-                        wz.set_val(1u64);
-                        changed |= true;
+                        changed |= insert_default_weight(wz);
                     }
 
                     if !prz.to_next_k_path(size as _) { break }
@@ -690,8 +710,7 @@ impl Sink for HashSink {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(1u64);
-                changed |= true;
+                changed |= insert_default_weight(wz);
                 prz.ascend_byte();
             }
             if prz.descend_first_byte() {
@@ -709,8 +728,7 @@ impl Sink for HashSink {
                     unsafe { buffer.set_len(oz.loc) }
                     trace!(target: "sink", "hash ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                     wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                    wz.set_val(1u64);
-                    changed |= true
+                    changed |= insert_default_weight(wz)
                 }
                 prz.ascend_byte();
             }
@@ -729,7 +747,7 @@ impl Sink for AndSink {
     fn request(&self) ->  impl Iterator<Item=WriteResourceRequest> {
         let p = &unsafe { self.e.prefix().unwrap_or_else(|x| { let s = self.e.span(); slice_from_raw_parts(self.e.ptr, s.len() - 1) }).as_ref().unwrap() }[5..];
         trace!(target: "sink", "and requesting {}", serialize(p));
-        std::iter::once(WriteResourceRequest::BTM(p))
+        std::iter::once(WriteResourceRequest::BTM(LIVE_BTM_ROOT))
     }
     fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It, path: &[u8]) where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
@@ -780,8 +798,7 @@ impl Sink for AndSink {
                         let fixed = &prz.origin_path()[..prz.origin_path().len()-(1+size as usize)];
                         trace!(target: "sink", "fixed payload {}", serialize(fixed));
                         wz.move_to_path(fixed);
-                        wz.set_val(1u64);
-                        changed |= true;
+                        changed |= insert_default_weight(wz);
                     }
 
                     if !prz.to_next_k_path(size as _) { break }
@@ -793,8 +810,7 @@ impl Sink for AndSink {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(1u64);
-                changed |= true;
+                changed |= insert_default_weight(wz);
                 prz.ascend_byte();
             }
             if prz.descend_first_byte() {
@@ -820,8 +836,7 @@ impl Sink for AndSink {
                     unsafe { buffer.set_len(oz.loc) }
                     trace!(target: "sink", "and ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                     wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                    wz.set_val(1u64);
-                    changed |= true
+                    changed |= insert_default_weight(wz)
                 }
                 prz.ascend_byte();
             }
@@ -839,7 +854,7 @@ impl Sink for SumSink {
     fn request(&self) ->  impl Iterator<Item=WriteResourceRequest> {
         let p = &unsafe { self.e.prefix().unwrap_or_else(|x| { let s = self.e.span(); slice_from_raw_parts(self.e.ptr, s.len() - 1) }).as_ref().unwrap() }[5..];
         trace!(target: "sink", "sum requesting {}", serialize(p));
-        std::iter::once(WriteResourceRequest::BTM(p))
+        std::iter::once(WriteResourceRequest::BTM(LIVE_BTM_ROOT))
     }
     fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It, path: &[u8]) where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
@@ -889,8 +904,7 @@ impl Sink for SumSink {
                         let fixed = &prz.origin_path()[..prz.origin_path().len()-(1+size as usize)];
                         trace!(target: "sink", "fixed payload {}", serialize(fixed));
                         wz.move_to_path(fixed);
-                        wz.set_val(1u64);
-                        changed |= true;
+                        changed |= insert_default_weight(wz);
                     }
 
                     if !prz.to_next_k_path(size as _) { break }
@@ -902,8 +916,7 @@ impl Sink for SumSink {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(1u64);
-                changed |= true;
+                changed |= insert_default_weight(wz);
                 prz.ascend_byte();
             }
             if prz.descend_first_byte() {
@@ -929,8 +942,7 @@ impl Sink for SumSink {
                     unsafe { buffer.set_len(oz.loc) }
                     trace!(target: "sink", "ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                     wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                    wz.set_val(1u64);
-                    changed |= true
+                    changed |= insert_default_weight(wz)
                 }
                 prz.ascend_byte();
             }
@@ -981,7 +993,7 @@ impl<Reduction : FloatReduction> Sink for FloatReductionSink<Reduction> {
     fn request(&self) ->  impl Iterator<Item=WriteResourceRequest> {
         let p = &unsafe { self.e.prefix().unwrap_or_else(|x| { let s = self.e.span(); slice_from_raw_parts(self.e.ptr, s.len() - 1) }).as_ref().unwrap() }[2+Reduction::NAME.len()..];
         trace!(target: "sink", "{} requesting {}", Reduction::NAME, serialize(p));
-        std::iter::once(WriteResourceRequest::BTM(p))
+        std::iter::once(WriteResourceRequest::BTM(LIVE_BTM_ROOT))
     }
     fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It, path: &[u8]) where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
@@ -1031,8 +1043,7 @@ impl<Reduction : FloatReduction> Sink for FloatReductionSink<Reduction> {
                         let fixed = &prz.origin_path()[..prz.origin_path().len()-(1+size as usize)];
                         trace!(target: "sink", "fixed payload {}", serialize(fixed));
                         wz.move_to_path(fixed);
-                        wz.set_val(1u64);
-                        changed |= true;
+                        changed |= insert_default_weight(wz);
                     }
 
                     if !prz.to_next_k_path(size as _) { break }
@@ -1044,8 +1055,7 @@ impl<Reduction : FloatReduction> Sink for FloatReductionSink<Reduction> {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(1u64);
-                changed |= true;
+                changed |= insert_default_weight(wz);
                 prz.ascend_byte();
             }
             if prz.descend_first_byte() {
@@ -1071,8 +1081,7 @@ impl<Reduction : FloatReduction> Sink for FloatReductionSink<Reduction> {
                     unsafe { buffer.set_len(oz.loc) }
                     trace!(target: "sink", "ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                     wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                    wz.set_val(1u64);
-                    changed |= true
+                    changed |= insert_default_weight(wz)
                 }
                 prz.ascend_byte();
             }
@@ -1095,7 +1104,7 @@ impl Sink for PureSink {
     fn request(&self) ->  impl Iterator<Item=WriteResourceRequest> {
         let p = &unsafe { self.e.prefix().unwrap_or_else(|x| { let s = self.e.span(); slice_from_raw_parts(self.e.ptr, s.len() - 1) }).as_ref().unwrap() }[6..];
         trace!(target: "sink", "count requesting {}", serialize(p));
-        std::iter::once(WriteResourceRequest::BTM(p))
+        std::iter::once(WriteResourceRequest::BTM(LIVE_BTM_ROOT))
     }
     fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It, path: &[u8]) where 'a : 'w, 'k : 'w {
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
@@ -1150,8 +1159,7 @@ impl Sink for PureSink {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(1u64);
-                changed |= true;
+                changed |= insert_default_weight(wz);
                 prz.ascend_byte();
             }
             if prz.descend_first_byte() {
@@ -1178,8 +1186,7 @@ impl Sink for PureSink {
                         unsafe { buffer.set_len(oz.loc) }
                         trace!(target: "sink", "ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                         wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                        wz.set_val(1u64);
-                        changed |= true;
+                        changed |= insert_default_weight(wz);
                         self.scope.return_alloc(res);
                     }
                 }
