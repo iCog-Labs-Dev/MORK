@@ -60,9 +60,11 @@ struct Args {
     /// transactions; 0 disables (the log grows unbounded).
     #[arg(long, default_value_t = 1024)]
     checkpoint_every: u64,
-    /// Number of transactions that may execute concurrently. 1 = the previous
-    /// sequential engine, exactly. Capped by the symbol table's writer-thread limit.
-    #[arg(long, default_value_t = 1)]
+    /// Number of transactions that may execute concurrently. Defaults to the machine's
+    /// core count, capped by the symbol table's writer-thread limit; 1 = the previous
+    /// sequential engine, exactly.
+    #[arg(long, default_value_t = std::thread::available_parallelism()
+        .map(|n| n.get().min(mork_interning::MAX_WRITER_THREADS)).unwrap_or(1))]
     workers: usize,
 }
 
@@ -78,6 +80,7 @@ fn main() {
     let (events, _keep) = broadcast::channel(args.events_buffer);
     let active = Arc::new(Mutex::new(HashSet::new()));
     let tx_counter = Arc::new(AtomicU64::new(0));
+    let history_len = Arc::new(AtomicUsize::new(0));
     let cfg = engine::EngineConfig {
         step_budget: args.step_budget,
         budget_action: args.budget_action,
@@ -85,6 +88,7 @@ fn main() {
         fsync: args.fsync,
         checkpoint_every: args.checkpoint_every,
         tx_counter: tx_counter.clone(),
+        history_len: history_len.clone(),
         // Checked non-zero just above; NonZeroUsize downstream makes "0 workers" (which
         // would block run()'s loop forever on a pool with nobody in it) unrepresentable
         // rather than a case every reader has to remember is excluded.
@@ -102,6 +106,7 @@ fn main() {
         events: events.clone(),
         tx_counter,
         active,
+        history_len,
         delta_subs: Arc::new(AtomicUsize::new(0)),
     });
 

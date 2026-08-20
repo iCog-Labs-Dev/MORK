@@ -1,4 +1,5 @@
-//! HTTP surface: `POST /run` (submit = run), `GET /events` (SSE), `GET /export`.
+//! HTTP surface: `POST /run` (submit = run), `GET /events` (SSE), `GET /export`,
+//! `GET /stats`.
 //! Everything else the old-style servers exposed (`/count`, `/clear`, `/status`, a separate
 //! load step) is expressible as a transaction or already on the stream.
 
@@ -30,6 +31,7 @@ pub async fn handle(req: Request<Incoming>, state: Arc<ServerState>) -> Result<R
             query.get("deltas").map(|v| v == "true" || v == "1").unwrap_or(false),
         ),
         (Method::GET, "/export") => export(&state, &query),
+        (Method::GET, "/stats") => json_response(StatusCode::OK, stats(&state)),
         _ => json_response(StatusCode::NOT_FOUND, json!({"ok": false, "error": "not found"})),
     };
     Ok(resp)
@@ -88,6 +90,33 @@ fn export(state: &Arc<ServerState>, query: &HashMap<String, String>) -> Response
     }
 }
 
+/// Engine gauges, for load tests and operators.
+///
+/// `version` is the published snapshot's, the same number `/export` returns in
+/// `x-mork-version`. `in_flight` is how many transactions are executing right now, and
+/// `history_len` is how many committed writesets the committer is still retaining so
+/// those in-flight transactions can validate against them — the retention number that
+/// grows when a long transaction pins an old base snapshot.
+///
+/// `make_unique_calls` and `cow_clones` appear **only** in a `--features counters`
+/// build. The keys are absent, not zero, in a normal build: a zero would read as "this
+/// workload has no copy-on-write amplification" rather than "nobody measured".
+fn stats(state: &Arc<ServerState>) -> serde_json::Value {
+    #[cfg_attr(not(feature = "counters"), allow(unused_mut))]
+    let mut v = json!({
+        "version": state.snapshot.borrow().version,
+        "in_flight": state.active.lock().unwrap().len(),
+        "history_len": state.history_len.load(Relaxed),
+    });
+    #[cfg(feature = "counters")]
+    {
+        let c = pathmap::counters::cow_counters();
+        v["make_unique_calls"] = c.make_unique_calls.into();
+        v["cow_clones"] = c.cow_clones.into();
+    }
+    v
+}
+
 fn json_response(status: StatusCode, value: serde_json::Value) -> Response<Body> {
     Response::builder()
         .status(status)
@@ -121,4 +150,51 @@ fn percent_decode(s: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transaction::ReadSnapshot;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+    use std::sync::Mutex;
+
+    /// A `ServerState` wired to nothing: `/stats` only reads the shared handles, so the
+    /// channels never need an engine on the other end.
+    fn detached_state(version: u64, in_flight: &[&str], history_len: usize) -> Arc<ServerState> {
+        let (tx_send, _rx) = tokio::sync::mpsc::channel(1);
+        // `borrow()` still returns the last published value after the sender drops, so
+        // the state needs no live engine behind it.
+        let snapshot = tokio::sync::watch::channel(Arc::new(ReadSnapshot {
+            version,
+            ..ReadSnapshot::empty()
+        })).1;
+        Arc::new(ServerState {
+            tx_send,
+            snapshot,
+            events: tokio::sync::broadcast::channel(1).0,
+            tx_counter: Arc::new(AtomicU64::new(0)),
+            active: Arc::new(Mutex::new(in_flight.iter().map(|s| s.to_string()).collect::<HashSet<_>>())),
+            history_len: Arc::new(AtomicUsize::new(history_len)),
+            delta_subs: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    #[test]
+    fn stats_reports_the_three_always_present_gauges() {
+        let v = stats(&detached_state(42, &["tx1_aaaaaaaa", "tx2_bbbbbbbb"], 4));
+        assert_eq!(v["version"], 42);
+        assert_eq!(v["in_flight"], 2);
+        assert_eq!(v["history_len"], 4);
+    }
+
+    /// The COW keys are build-gated, and their ABSENCE in a default build is the
+    /// contract — a zero would be read as "no amplification measured here".
+    #[test]
+    fn cow_keys_are_present_only_under_the_counters_feature() {
+        let v = stats(&detached_state(0, &[], 0));
+        assert_eq!(v.get("cow_clones").is_some(), cfg!(feature = "counters"));
+        assert_eq!(v.get("make_unique_calls").is_some(), cfg!(feature = "counters"));
+    }
 }

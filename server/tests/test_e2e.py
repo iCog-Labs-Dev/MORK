@@ -181,13 +181,20 @@ def test_exec_namespaces_are_isolated(server: MorkClient) -> None:
     assert "(b-out 1)" in out
 
 
+@pytest.mark.parametrize("server", [["--workers", "1"]], indirect=True)
 def test_concurrent_submissions_drain_sequentially(server: MorkClient) -> None:
     """8 adders submitted concurrently on distinct result channels: every racing
-    submission is queued and computes 2+2, and with the default single worker the
-    committer never runs two transactions at once — each tx's `tx` event is
-    immediately followed by its own `quiescent`, with no other tx's events between
-    them. (Per-step events are gone under concurrent execution, so this checks
-    non-interleaving at the transaction granularity instead of the step granularity.)"""
+    submission is queued and computes 2+2, and at `--workers 1` the committer never
+    runs two transactions at once — each tx's `tx` event is immediately followed by its
+    own `quiescent`, with no other tx's events between them. (Per-step events are gone
+    under concurrent execution, so this checks non-interleaving at the transaction
+    granularity instead of the step granularity.)
+
+    `--workers 1` is pinned deliberately, not inherited: the default is now the
+    machine's core count, under which transactions DO interleave by design. This is the
+    sequential configuration's own property — that asking for one worker really gets
+    you one — so the assertions stay exactly as strict as they were when it was the
+    default."""
     base = (EXAMPLES_DIR / "adder.metta").read_text()
     sources = [base.replace("result", f"result{i}") for i in range(8)]
     with server.events() as stream:

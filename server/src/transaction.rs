@@ -115,6 +115,10 @@ pub struct ServerState {
     pub tx_counter: Arc<AtomicU64>,
     /// Transactions with pending execs (kept by the engine; read by `hello`).
     pub active: Arc<Mutex<HashSet<TxId>>>,
+    /// Length of the committer's version history, republished after every commit. A
+    /// gauge for `/stats`, never a decision input — it is read with `Relaxed`, so it can
+    /// lag the committer by a commit or two, and nothing depends on it being exact.
+    pub history_len: Arc<AtomicUsize>,
     /// Number of connected `?deltas=true` subscribers; the delta task skips work at 0.
     pub delta_subs: Arc<AtomicUsize>,
 }

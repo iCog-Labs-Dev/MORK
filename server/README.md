@@ -23,7 +23,7 @@ cargo +nightly run --release -p mork-server -- --addr 127.0.0.1:8081
 | `--events-buffer` | `4096` | Per-subscriber event buffer; slower clients get `lagged` events instead of back-pressuring the engine |
 | `--step-budget` | `1000000` | Max VM steps one transaction may run; bounds how long a transaction can pin its base snapshot, and so how much version history the committer has to retain for it to validate against |
 | `--budget-action` | `commit` | On budget exhaustion: `commit` keeps partial progress and parks pending execs as `(paused …)` data; `abort` rolls the whole transaction back |
-| `--workers` | `1` | Number of transactions that may execute concurrently; `1` = the previous sequential engine, exactly. Capped at the symbol table's writer-thread limit (`MAX_WRITER_THREADS`) |
+| `--workers` | *(core count)* | Number of transactions that may execute concurrently. Defaults to `available_parallelism()` — the machine's core count, or its cgroup/affinity share of one — capped at the symbol table's writer-thread limit (`MAX_WRITER_THREADS` = 128). `1` = the previous sequential engine, exactly |
 | `--data-dir` | *(absent)* | Enable persistence: write-ahead log plus checkpoints rooted at this directory, replayed at startup before the listener binds. Absent = pure in-memory (nothing is written, nothing is recovered) |
 | `--fsync` | `everysec` | When the log is fsynced, i.e. what POST /run's 200 means: `always` = every batch of commit records is fsynced as it is written and the 200 waits for that fsync, so it means "on disk" · `everysec` = the 200 is sent as soon as the record is handed to the writer thread and the log is fsynced on a ~1 s timer (Redis-style), so the 200 means "durable within ~1 s" and the loss window covers process crash and power failure · `no` = same immediate 200, and the page cache decides when it reaches the disk (see Durability below) |
 | `--checkpoint-every` | `1024` | Snapshot the space and delete pre-checkpoint log segments every N finished transactions; `0` disables (the log grows unbounded, recovery replays it in full). A due checkpoint is deferred while any transaction is in flight, and stays due until one succeeds |
@@ -62,21 +62,26 @@ curl 'http://127.0.0.1:8081/export?pattern=%5B2%5D%20petri%20%5B3%5D%20%21%20res
   wrapper is stripped from everything you see (events, exports); you never observe it.
 - **Concurrent execution.** Up to `--workers` transactions run at once, each on its own
   worker thread against its own consistent snapshot of the space — `--workers` is a
-  ceiling, not a promise (see *Head-of-line dispatch* below). **Commit order is not
-  submission order**: a short transaction submitted later can commit first, and its
-  `version` will be the lower one. *Within* your transaction, execs run in plain trie
-  order over your locs — your program's own inference control is untouched. One
-  transaction runs for at most `--step-budget` steps (see the flags table).
-- **Head-of-line dispatch** *(known limitation)*. The committer only looks for newly
-  arrived requests at the moment it dispatches or commits something; while anything is in
-  flight it blocks on the *results* channel, so a request that arrives mid-flight waits
-  for the next commit however many workers are idle. Measured at `--workers 8` with one
-  307 ms transaction running and seven workers free: a trivial `(tiny 1)` submitted
-  151 ms in waited 158 ms — the remainder of the long transaction, reproducible to the
-  millisecond across trials. A steady stream of submissions keeps the pool busy, a
-  trickle does not: four ~310 ms transactions submitted together took 1231 ms at
-  `--workers 1` and 683 ms at `--workers 8` — 1.8x faster for 8x the workers, not 4x.
-  Nothing is lost or reordered; it is purely latency.
+  ceiling, not a promise (see *Dispatch latency* below). It **defaults to the core
+  count**, so everything described here — concurrent commit, aborts and all — is what an
+  out-of-the-box server does; `--workers 1` is now the opt-in, not the default.
+  **Commit order is not submission order**: a short transaction submitted later can
+  commit first, and its `version` will be the lower one. *Within* your transaction,
+  execs run in plain trie order over your locs — your program's own inference control is
+  untouched. One transaction runs for at most `--step-budget` steps (see the flags
+  table).
+- **Dispatch latency.** A request arriving while other transactions are in flight is
+  picked up within 1 ms as long as a worker is free: the committer waits on the results
+  channel with a 1 ms timeout and loops back to re-check arrivals, and blocks outright only
+  when every worker is busy — where a result really is the only thing that can make
+  progress. This used to be a head-of-line stall (a trivial transaction submitted 151 ms
+  into a 307 ms one, with seven workers idle, waited the whole 158 ms remainder); fixing it
+  took that to ~4 ms and took four ~310 ms transactions at `--workers 8` from 1.9x to 3.7x
+  faster than serial. The poll costs 0.3-0.6% of one core and only while the pool is
+  partially loaded: nothing at `--workers 1`, nothing when idle, nothing when saturated.
+  One consequence worth expecting: transactions that used to serialize now genuinely
+  overlap, so clients that write the *same* paths see materially more `422` conflicts than
+  they did.
 - **Concurrent writes, serialized commit.** Workers mutate only their private snapshots,
   in parallel. A single committer thread then validates and installs each finished
   transaction one at a time, which is what makes commit order a total order and gives
@@ -230,6 +235,28 @@ curl -s 'localhost:8081/export?pattern=%5B2%5D%20petri%20%5B3%5D%20%21%20result%
 a slightly stale but always consistent view. To coordinate, compare the `version` on your
 `/run` reply or `tx`/`quiescent` events with the `x-mork-version` header.
 
+## `GET /stats`
+
+Engine gauges, for load tests and operators. JSON, no parameters.
+
+```json
+{"version": 42, "in_flight": 3, "history_len": 17}
+```
+
+| Field | Meaning |
+|---|---|
+| `version` | The published snapshot's version — the same number `/export` returns in `x-mork-version` |
+| `in_flight` | Transactions executing right now |
+| `history_len` | Committed writesets the committer is still retaining so in-flight transactions can validate against them. This is the number that grows when a long transaction pins an old base snapshot: it is bounded by how many commits land while the longest transaction runs, so it reads 0 at `--workers 1` and ran to a peak of ~1200 under the load test's long/short mix |
+
+Two more fields, `make_unique_calls` and `cow_clones`, appear **only** in a
+`--features counters` build. They are copy-on-write amplification counters, and the keys
+are *absent* rather than zero in a normal build — a zero would read as "this workload has
+no amplification" instead of "nobody measured". The feature is off by default on purpose:
+PathMap's counters bump two process-wide atomics on every structural write, so a build
+with them on is not the build whose throughput you want to report. Measure amplification
+in its own run (`server/benches/concurrency.md` does).
+
 ---
 
 ## Operational notes
@@ -247,11 +274,11 @@ a slightly stale but always consistent view. To coordinate, compare the `version
 - **Runaway programs**: a program whose continuations never stop is bounded, not
   harmless — after `--step-budget` steps it is either quiesced by force (`commit`:
   results kept, continuations parked as `(paused …)` data) or rolled back (`abort`).
-  While it runs it *does* hold up the queue, because dispatch is head-of-line (see
-  Concurrency above): requests arriving mid-flight wait for it even with workers idle.
-  Size the budget to your workload — it is the upper bound both on how long one
-  transaction can occupy a worker and on how long a newly arrived request can sit
-  unread.
+  While it runs it occupies a worker for the whole budget, and everything queued behind it
+  waits once the pool is full — the load test measures exactly this: a workload where 5% of
+  transactions are long runs at 41 tx/s with one worker and 1239 tx/s with four
+  (`benches/concurrency.md`). Size the budget to your workload; it is the upper bound on
+  how long one transaction can occupy a worker.
 - **Durability** (`--data-dir`): a logical command log — one record per *committed*
   transaction, holding its source text and the version it ran against — with the engine
   never touching a file (a dedicated writer thread owns all I/O and fsync timing).
@@ -315,20 +342,42 @@ detection started approximating by prefix instead of by path. `test_recovery.py`
 Regression cases are golden files: drop `<name>.metta` + `<name>.check` (JSON with
 `pattern`, `template`, `expected` lines) into `examples/` and pytest picks them up.
 
-Load testing (locust) targets a manually started server:
+Load testing (locust) targets a manually started server. There are **two** scenarios in
+`locustfile.py` and they are not meant to run together, so name the classes you want:
 
 ```sh
 cargo +nightly run --release -p mork-server &
 cd server/tests
-uv run locust --headless -u 50 -r 10 -t 60s --host http://127.0.0.1:8081
+
+# mixed randomized workload
+uv run locust --headless -u 50 -r 10 -t 60s --host http://127.0.0.1:8081 \
+    ComputeUser IngestUser JoinUser AnalystUser WatcherUser
+
+# short/long: 95% single-fact writes, 5% long generative programs
+uv run locust --headless --processes 8 -u 41 -r 41 -t 60s --host http://127.0.0.1:8081 \
+    ShortWriteUser LongWriteUser WatcherUser
+
 uv run locust --host http://127.0.0.1:8081        # or: web UI at :8089
 ```
 
-Scenarios (each submitter subscribes to `/events` before acting and waits for its own
-`quiescent`, reported as a per-workload `quiesce [...]` stat): compute users mixing cheap
-one-step relays with multi-step petri-calculus adders on random operands (results verified
-via `/export` after quiescent), bulk telemetry ingesters, equi-join users that check the
-joined row count, analysts picking `/export` queries at random against the COW snapshots,
-and a watcher that reports `lagged` events as failures (backpressure signal). The space
-grows monotonically under load (no isolation/GC yet), so RSS growth is by design — watch
-it, don't assert on it.
+The mixed workload (each submitter subscribes to `/events` before acting and waits for its
+own `quiescent`, reported as a per-workload `quiesce [...]` stat): compute users mixing
+cheap one-step relays with multi-step petri-calculus adders on random operands (results
+verified via `/export` after quiescent), bulk telemetry ingesters, equi-join users that
+check the joined row count, analysts picking `/export` queries at random against the COW
+snapshots. The short/long scenario saturates instead of pausing between submissions, and
+keeps every path disjoint, so it isolates one thing: what a long transaction does to the
+latency of the cheap ones beside it. Both include exactly one `WatcherUser`, which holds a
+long-lived stream, reports `lagged` as a failure (backpressure signal) and tallies `abort`
+frames as `abort [conflict]` / `abort [phantom]`.
+
+The space grows monotonically under load (no isolation/GC yet), so RSS growth is by design
+— watch it, don't assert on it.
+
+**[`benches/concurrency.md`](benches/concurrency.md)** is the runbook and the results:
+throughput, short-vs-long latency, abort rate and `history_len` per `--workers`, plus a
+separate `--features counters` run for copy-on-write amplification. Short version — this
+workload goes from 41 tx/s at one worker to 1239 tx/s at four, because the 5% of
+transactions that are long monopolize a small pool; no configuration produced a single
+abort; and beyond four workers the measurement is bounded by the HTTP/SSE front end and
+then by the load generator, not by the engine.

@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use mork::space::Space;
@@ -57,6 +57,10 @@ pub struct EngineConfig {
     pub checkpoint_every: u64,
     /// Shared with the HTTP layer; recovery restores it before `ready` fires.
     pub tx_counter: Arc<AtomicU64>,
+    /// Published to `/stats` after every commit: how many `CommitRecord`s the committer
+    /// is still holding for in-flight transactions to validate against. Written only
+    /// here, read only by the HTTP layer, `Relaxed` both ways — it is a gauge.
+    pub history_len: Arc<AtomicUsize>,
     /// Number of concurrent worker threads. 1 = the previous sequential engine.
     /// Non-zero by construction: a pool of 0 workers would leave `run`'s loop blocked
     /// forever on `res_rx.recv()` with nothing that could ever send to it.
@@ -147,6 +151,7 @@ fn run(
         match res_rx.try_recv() {
             Ok(r) => {
                 commit(&mut committed, &mut bases, r, &sm, &snap_tx, &events, &active, wal);
+                cfg.history_len.store(committed.history.len(), Ordering::Relaxed);
                 in_flight -= 1;
                 finished += 1;
                 maybe_checkpoint(&committed, finished, &cfg, wal, &mut next_checkpoint);
@@ -203,6 +208,7 @@ fn run(
                 }
             };
             commit(&mut committed, &mut bases, r, &sm, &snap_tx, &events, &active, wal);
+            cfg.history_len.store(committed.history.len(), Ordering::Relaxed);
             in_flight -= 1;
             finished += 1;
             maybe_checkpoint(&committed, finished, &cfg, wal, &mut next_checkpoint);
@@ -666,6 +672,7 @@ mod tests {
             fsync: FsyncPolicy::Always,
             checkpoint_every,
             tx_counter: Arc::new(AtomicU64::new(0)),
+            history_len: Arc::new(AtomicUsize::new(0)),
             workers: std::num::NonZeroUsize::new(1).unwrap(),
         }
     }

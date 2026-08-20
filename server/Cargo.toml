@@ -3,6 +3,13 @@ name = "mork-server"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Adds `make_unique_calls` / `cow_clones` to `GET /stats`, for measuring copy-on-write
+# write amplification. Off by default and deliberately so: PathMap's counters bump two
+# process-wide atomics on EVERY structural write, so a build with this on is not the
+# build whose throughput you want to report. Measure amplification in its own run.
+counters = ["pathmap/counters"]
+
 [dependencies]
 mork = { workspace = true }
 mork-expr = { workspace = true }
