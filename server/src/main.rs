@@ -12,10 +12,6 @@ mod http;
 mod mvcc;
 mod read;
 mod transaction;
-// `engine::recover` and `commit` drive the append/checkpoint/replay paths; `Ack` and
-// `Wal::poisoned` have no caller yet outside wal.rs's own tests (nothing acks writes or
-// checks poisoning before accepting new transactions), hence the blanket allow.
-#[allow(dead_code)]
 mod wal;
 mod worker;
 mod wrap;

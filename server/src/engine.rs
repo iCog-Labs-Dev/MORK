@@ -368,6 +368,32 @@ fn commit(
         return;
     }
 
+    // A poisoned log cannot record what we are about to commit, so installing would
+    // acknowledge work that recovery will never replay. Refuse instead: "unavailable:"
+    // gets the client a 503 telling it to retry rather than a 200 it cannot trust.
+    // Terminal by design — nothing clears the flag, so an operator has to fix the disk
+    // and restart.
+    //
+    // How much this leaves behind depends on the fsync policy. The flag is only set
+    // *after* a write fails, and `append` only queues, so by the time we see it the space
+    // is already ahead of the last durable version by whatever sat in the 4096-deep queue
+    // unwritten. Under `always` those transactions were never acked — their replies were
+    // handed to the writer below and it answers them with the failure — so nothing
+    // acknowledged is missing on restart. Under `everysec`/`no` the committer answered
+    // them itself, so they were acked 200 and are lost: a one-shot window bounded by the
+    // queue depth, widest exactly when the device hangs and the committer runs ahead
+    // until backpressure stops it.
+    if wal.is_some_and(Wal::poisoned) {
+        let reason = "unavailable: the write-ahead log is poisoned by an earlier disk error; \
+                      the server cannot durably record new transactions until it is restarted"
+            .to_string();
+        let _ = events.send(Event::Abort { tx: id.clone(), reason: reason.clone(), version: committed.version });
+        let _ = reply.send(Err(reason));
+        active.lock().unwrap().remove(&id);
+        committed.end(base_version);
+        return;
+    }
+
     let ws = mvcc::writeset(&base, &btm);
     if let Err(c) = mvcc::validate(&ws, &remove_prefixes, base_version, &committed.history) {
         let reason = c.reason().to_string();
@@ -379,10 +405,32 @@ fn commit(
     }
 
     let version = committed.install(ws, remove_prefixes);
-    if let Some(w) = wal {
-        w.append(Rec::Commit { id: &id, base_version, source: &source, steps, version }, None);
-    }
+    let ok = TxOk { tx: id.clone(), count, version };
+    // Under `--fsync always` the 200 is supposed to mean "on disk", so the reply travels
+    // with the record and the writer thread fires it after the batch fsync. The committer
+    // still never touches a disk: `append` only queues, and redo logging needs
+    // durable-before-ACK, not durable-before-apply. Under the other policies — which
+    // promise no such thing — waiting would buy nothing, so we answer here as before.
+    // A poisoned or disconnected log answers the handed-over reply with an `Err` rather
+    // than dropping it, so the client is never left hanging either way.
+    let deferred_reply = match wal {
+        Some(w) if w.acks_mean_durable() => {
+            w.append(
+                Rec::Commit { id: &id, base_version, source: &source, steps, version },
+                Some(wal::Ack { reply, ok }),
+            );
+            None
+        }
+        w => {
+            if let Some(w) = w {
+                w.append(Rec::Commit { id: &id, base_version, source: &source, steps, version }, None);
+            }
+            Some((reply, ok))
+        }
+    };
     publish(snap_tx, committed, sm);
+    // Stream events, not the client's 200: they report what the committer did and are not
+    // gated on durability, so they still fire here under every policy.
     let _ = events.send(Event::Tx { tx: id.clone(), count, version });
     match outcome {
         worker::WorkerOutcome::Budget => {
@@ -392,7 +440,9 @@ fn commit(
             let _ = events.send(Event::Quiescent { tx: id.clone(), version });
         }
     }
-    let _ = reply.send(Ok(TxOk { tx: id.clone(), count, version }));
+    if let Some((reply, ok)) = deferred_reply {
+        let _ = reply.send(Ok(ok));
+    }
     active.lock().unwrap().remove(&id);
     committed.end(base_version);
 }
@@ -636,6 +686,198 @@ mod tests {
             "the checkpoint must proceed once nothing is in flight"
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Regression for silent data loss: once a disk error poisons the WAL, every `append`
+    /// is dropped on the floor, so a transaction that installs anyway is acknowledged to
+    /// the client and then gone at the next restart — the space drifts ahead of the log
+    /// and recovery, seeing a well-formed but short log, never complains. `commit` must
+    /// refuse instead: version unchanged, an `Abort` event, and a reply carrying the
+    /// `unavailable:` prefix `http.rs` turns into a 503 (retry) rather than a 422.
+    ///
+    /// The healthy half of the loop is the honest negative — a gate that refused every
+    /// commit would satisfy the poisoned half on its own.
+    #[test]
+    fn commit_refuses_a_poisoned_wal_and_still_installs_on_a_healthy_one() {
+        for poisoned in [true, false] {
+            let dir = tmpdir("poisoned");
+            let wal = Wal::open(&dir, FsyncPolicy::Always).unwrap();
+            if poisoned {
+                wal.poison_for_test();
+            }
+
+            let sm = mork_interning::SharedMapping::new();
+            let mut committed = mvcc::Committed::new(PathMap::new(), 7);
+            let base_version = committed.begin();
+            let base = committed.btm.clone();
+            let mut btm = base.clone();
+            btm.insert(b"\x01a", ()); // one added path, so the writeset is not empty
+
+            let id: TxId = "tx1_poison".to_string();
+            let mut bases = HashMap::new();
+            bases.insert(id.clone(), base);
+            let active: Arc<Mutex<HashSet<TxId>>> = Arc::new(Mutex::new(HashSet::new()));
+            active.lock().unwrap().insert(id.clone());
+            let (snap_tx, _snap_rx) = watch::channel(Arc::new(ReadSnapshot::empty()));
+            let (events, mut ev_rx) = broadcast::channel(8);
+            let (reply, reply_rx) = tokio::sync::oneshot::channel();
+
+            commit(
+                &mut committed,
+                &mut bases,
+                worker::TxResult {
+                    id: id.clone(),
+                    base_version,
+                    source: "(a)".into(),
+                    btm,
+                    remove_prefixes: Vec::new(),
+                    count: 1,
+                    steps: 1,
+                    outcome: worker::WorkerOutcome::Quiesced,
+                    reply,
+                },
+                &sm,
+                &snap_tx,
+                &events,
+                &active,
+                Some(&wal),
+            );
+
+            // `blocking_recv`, not `try_recv`: on the healthy half the reply now travels
+            // with the record and is fired by the writer thread after its fsync.
+            let got = reply_rx.blocking_recv().expect("commit always answers the client");
+            if poisoned {
+                assert_eq!(committed.version, 7, "a poisoned log must not install anything");
+                let Err(err) = got else {
+                    panic!("a poisoned log must not be acknowledged as committed");
+                };
+                assert!(err.starts_with("unavailable:"), "must map to a 503, got: {err}");
+                match ev_rx.try_recv() {
+                    Ok(Event::Abort { tx, reason, version }) => {
+                        assert_eq!(tx, id);
+                        assert_eq!(reason, err);
+                        assert_eq!(version, 7);
+                    }
+                    other => panic!("expected an Abort event, got {other:?}"),
+                }
+            } else {
+                assert_eq!(committed.version, 8, "a healthy log must still install");
+                assert!(got.is_ok(), "a healthy log must still commit");
+            }
+            assert!(bases.is_empty(), "the retained base must be released on every path");
+            assert!(active.lock().unwrap().is_empty(), "the tx must leave `active` on every path");
+            assert!(
+                committed.active_bases.is_empty(),
+                "every path must end the transaction's lifetime, or the GC watermark stalls"
+            );
+            drop(wal);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// `--fsync always` exists so an operator can make POST /run's 200 mean "on disk".
+    /// That only holds if the client's reply is fired by the WAL writer *after* its
+    /// fsync; if the committer answers as soon as the record is queued, the 200 promises
+    /// a durability the log has not yet given, and a crash between the two loses an
+    /// acknowledged transaction.
+    ///
+    /// The `everysec` half is the honest negative: that policy does not promise
+    /// durable-before-ACK, so the committer must keep replying directly there — a change
+    /// that simply waited on every fsync would satisfy the `always` half on its own while
+    /// serializing every commit behind the disk.
+    ///
+    /// Both halves ask "who sent the reply", which is a race unless the writer is
+    /// provably still busy when we look. Hence the ballast record queued first: several
+    /// megabytes take the writer milliseconds to write, against the microseconds this
+    /// thread needs to return from `commit` and look — so a reply that is already waiting
+    /// came from the committer, and one that is not came from the writer.
+    #[test]
+    fn only_always_hands_the_client_reply_to_the_wal_to_fire_after_its_fsync() {
+        for policy in [FsyncPolicy::Always, FsyncPolicy::Everysec] {
+            let dir = tmpdir("fsync-ack");
+            let wal = Wal::open(&dir, policy).unwrap();
+            let ballast = "b".repeat(8 << 20);
+            wal.append(
+                Rec::Commit { id: "tx0_ballast", base_version: 0, source: &ballast, steps: 0, version: 7 },
+                None,
+            );
+
+            let sm = mork_interning::SharedMapping::new();
+            let mut committed = mvcc::Committed::new(PathMap::new(), 7);
+            let base_version = committed.begin();
+            let base = committed.btm.clone();
+            let mut btm = base.clone();
+            btm.insert(b"\x01a", ()); // one added path, so the writeset is not empty
+
+            let id: TxId = "tx1_fsyncack".to_string();
+            let mut bases = HashMap::new();
+            bases.insert(id.clone(), base);
+            let active: Arc<Mutex<HashSet<TxId>>> = Arc::new(Mutex::new(HashSet::new()));
+            active.lock().unwrap().insert(id.clone());
+            let (snap_tx, _snap_rx) = watch::channel(Arc::new(ReadSnapshot::empty()));
+            let (events, _ev_rx) = broadcast::channel(8);
+            let (reply, mut reply_rx) = tokio::sync::oneshot::channel();
+
+            commit(
+                &mut committed,
+                &mut bases,
+                worker::TxResult {
+                    id: id.clone(),
+                    base_version,
+                    source: "(a)".into(),
+                    btm,
+                    remove_prefixes: Vec::new(),
+                    count: 1,
+                    steps: 1,
+                    outcome: worker::WorkerOutcome::Quiesced,
+                    reply,
+                },
+                &sm,
+                &snap_tx,
+                &events,
+                &active,
+                Some(&wal),
+            );
+
+            assert_eq!(committed.version, 8, "the transaction installs under either policy");
+            let pending = reply_rx.try_recv();
+            let ok = match policy {
+                FsyncPolicy::Always => {
+                    assert!(
+                        matches!(pending, Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+                        "under `always` the committer must hand the reply to the wal, not send it \
+                         itself while the record is still queued behind an unwritten batch"
+                    );
+                    let ok = reply_rx
+                        .blocking_recv()
+                        .expect("the wal must fire the ack it was handed")
+                        .expect("a healthy log must commit");
+                    // The ack fires only after the batch fsync, so by now the record —
+                    // and everything queued ahead of it — is readable back off the disk.
+                    assert_eq!(
+                        wal::read_segments(&dir, 0).unwrap().len(),
+                        2,
+                        "under `always` the 200 must not arrive before the record is durable"
+                    );
+                    ok
+                }
+                _ => pending
+                    .expect("under `everysec` the committer must reply directly, not wait on the disk")
+                    .expect("a healthy log must commit"),
+            };
+            assert_eq!(ok.tx, id);
+            assert_eq!(ok.count, 1);
+            assert_eq!(ok.version, 8);
+
+            assert!(bases.is_empty(), "the retained base must be released on every path");
+            assert!(active.lock().unwrap().is_empty(), "the tx must leave `active` on every path");
+            assert!(
+                committed.active_bases.is_empty(),
+                "handing the reply to the wal must still end the transaction's lifetime"
+            );
+            drop(wal);
+            fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     /// Without the due-flag, a deferred checkpoint would only be retried on the next

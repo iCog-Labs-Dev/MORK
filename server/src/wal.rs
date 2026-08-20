@@ -130,6 +130,19 @@ pub struct Ack {
     pub ok: TxOk,
 }
 
+/// What a failed [`Ack`] tells the client. Carries the `unavailable:` prefix so
+/// `http.rs` answers 503 rather than 422 — the request was fine, the disk was not.
+///
+/// Deliberately says "may be visible": under `always` the reply is only handed over
+/// *after* `commit` installed and published, so a transaction that fails here is live
+/// in the space until a restart replays the log without it. That is the redo-log
+/// trade — the alternative is holding every commit until its fsync lands, which would
+/// serialize the whole engine behind the disk.
+pub const NOT_DURABLE: &str =
+    "unavailable: the write-ahead log could not durably record this transaction; it may be \
+     visible to readers until the server is restarted, but it is not durable — treat it as \
+     lost and retry once the disk is healthy";
+
 // ---------------------------------------------------------------------------
 // Record encoding
 
@@ -439,6 +452,7 @@ struct CkptJob {
 /// ```
 pub struct Wal {
     send: Option<mpsc::SyncSender<Cmd>>,
+    policy: FsyncPolicy,
     poisoned: Arc<AtomicBool>,
     /// One checkpoint in flight at a time; `checkpoint()` skips (returns false) while set.
     ckpt_busy: Arc<AtomicBool>,
@@ -488,11 +502,19 @@ impl Wal {
         })?;
         Ok(Wal {
             send: Some(send),
+            policy,
             poisoned,
             ckpt_busy,
             writer: Some(writer),
             checkpointer: Some(checkpointer),
         })
+    }
+
+    /// Whether an [`Ack`] from this log means "fsynced". Only [`FsyncPolicy::Always`]
+    /// promises it, so this is what tells a caller whether handing over the client's
+    /// reply buys durable-before-ACK or just delays it for nothing.
+    pub fn acks_mean_durable(&self) -> bool {
+        self.policy == FsyncPolicy::Always
     }
 
     /// Queue one record. Non-blocking unless the writer queue is full (the backpressure
@@ -502,7 +524,7 @@ impl Wal {
             if let Some(a) = ack {
                 let _ = a
                     .reply
-                    .send(Err("wal is poisoned (earlier write error)".into()));
+                    .send(Err(NOT_DURABLE.into()));
             }
             return;
         }
@@ -516,7 +538,7 @@ impl Wal {
             .expect("wal used after shutdown")
             .send(cmd)
         {
-            let _ = a.reply.send(Err("wal writer thread is gone".into()));
+            let _ = a.reply.send(Err(NOT_DURABLE.into()));
         }
     }
 
@@ -524,6 +546,13 @@ impl Wal {
     /// promised. The engine should refuse new transactions while this is set.
     pub fn poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Relaxed)
+    }
+
+    /// Force the poisoned flag, so tests can exercise the engine's refusal path without
+    /// having to induce a real disk error.
+    #[cfg(test)]
+    pub fn poison_for_test(&self) {
+        self.poisoned.store(true, Ordering::Relaxed);
     }
 
     /// **What**: rotate to a fresh segment and install a checkpoint, asynchronously.
@@ -599,7 +628,7 @@ fn writer_loop(
         log::error!("wal: write error, poisoning the log: {e}");
         poisoned.store(true, Ordering::Relaxed);
         for a in acks.drain(..) {
-            let _ = a.reply.send(Err(format!("wal write failed: {e}")));
+            let _ = a.reply.send(Err(format!("{NOT_DURABLE}: {e}")));
         }
     };
 
@@ -627,7 +656,7 @@ fn writer_loop(
             if poisoned.load(Ordering::Relaxed) {
                 match cmd {
                     Cmd::Append { ack: Some(a), .. } => {
-                        let _ = a.reply.send(Err("wal is poisoned".into()));
+                        let _ = a.reply.send(Err(NOT_DURABLE.into()));
                     }
                     Cmd::Append { .. } => {}
                     Cmd::Checkpoint { .. } => ckpt_busy.store(false, Ordering::Release),

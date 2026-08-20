@@ -63,9 +63,10 @@ async fn run_transaction(body: Incoming, state: &Arc<ServerState>) -> Response<B
             StatusCode::OK,
             json!({"ok": true, "tx": ok.tx, "count": ok.count, "version": ok.version}),
         ),
-        // "unavailable:" is the engine's marker for transient refusals (e.g. the WAL is
-        // poisoned by a disk error): the transaction was NOT applied and retrying later
-        // may succeed — 503, not 422.
+        // "unavailable:" is the engine's marker for "not your fault" — 503, not 422. It
+        // covers a refused commit (the log is poisoned, nothing was applied) and a failed
+        // durability ack (the transaction installed but the disk would not take it). Both
+        // need an operator, so no Retry-After is offered.
         Ok(Err(e)) if e.starts_with("unavailable:") => {
             json_response(StatusCode::SERVICE_UNAVAILABLE, json!({"ok": false, "error": e}))
         }

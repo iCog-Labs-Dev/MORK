@@ -25,7 +25,7 @@ cargo +nightly run --release -p mork-server -- --addr 127.0.0.1:8081
 | `--budget-action` | `commit` | On budget exhaustion: `commit` keeps partial progress and parks pending execs as `(paused …)` data; `abort` rolls the whole transaction back |
 | `--workers` | `1` | Number of transactions that may execute concurrently; `1` = the previous sequential engine, exactly. Capped at the symbol table's writer-thread limit (`MAX_WRITER_THREADS`) |
 | `--data-dir` | *(absent)* | Enable persistence: write-ahead log plus checkpoints rooted at this directory, replayed at startup before the listener binds. Absent = pure in-memory (nothing is written, nothing is recovered) |
-| `--fsync` | `everysec` | When the log is fsynced: `always` = every batch of commit records is fsynced as it is written · `everysec` = durable within ~1 s (Redis-style; the loss window covers process crash and power failure) · `no` = page cache decides. Note that the 200 does not currently wait on the fsync under any policy (see Durability below) |
+| `--fsync` | `everysec` | When the log is fsynced, i.e. what POST /run's 200 means: `always` = every batch of commit records is fsynced as it is written and the 200 waits for that fsync, so it means "on disk" · `everysec` = the 200 is sent as soon as the record is handed to the writer thread and the log is fsynced on a ~1 s timer (Redis-style), so the 200 means "durable within ~1 s" and the loss window covers process crash and power failure · `no` = same immediate 200, and the page cache decides when it reaches the disk (see Durability below) |
 | `--checkpoint-every` | `1024` | Snapshot the space and delete pre-checkpoint log segments every N finished transactions; `0` disables (the log grows unbounded, recovery replays it in full). A due checkpoint is deferred while any transaction is in flight, and stays due until one succeeds |
 
 Logging via `env_logger`: `RUST_LOG=info cargo +nightly run -p mork-server`.
@@ -264,14 +264,28 @@ a slightly stale but always consistent view. To coordinate, compare the `version
   time: the engine's cost is an O(1) copy-on-write clone; a background thread serializes
   it (compressed `.paths`), installs it atomically (temp + fsync + rename), and deletes
   the log segments it supersedes — recovery then restores the snapshot and replays only
-  the tail. Requires the default non-`interning` build. Two rough edges to know about:
-  the 200 is sent as soon as the record is handed to the writer thread, so it does not
-  imply "fsynced" even under `--fsync always`; and a disk-write error poisons the log
-  (further records are dropped rather than written) without yet being surfaced to
-  clients — the server keeps committing in memory.
+  the tail. Requires the default non-`interning` build. What the 200 promises follows
+  `--fsync`: under `always` the reply travels with the record and the writer thread fires
+  it after the batch fsync, so the 200 means "on disk"; under `everysec`/`no` the 200 is
+  sent as soon as the record is handed to the writer, so it does not imply "fsynced".
+  Either way the committer never waits on an fsync — handing the reply over is not the
+  same as blocking on it, and redo logging needs durable-before-ACK, not
+  durable-before-apply. (It can still block on the writer's 4096-deep queue if the disk
+  falls that far behind; that is the backpressure valve, not per-commit fsync.) One
+  consequence worth knowing under `always`: the space is updated and published *before*
+  the ack, so `/export` and `/events` can show a transaction whose author later gets an
+  error for it — the 200 means "on disk", but a read does not.
+  A disk-write error poisons the log, and the engine then refuses to commit onto it —
+  writes get a 503 (`unavailable: …`) instead of a 200 that recovery could not honour, and
+  `/export` and `/events` keep serving. The condition is terminal: nothing clears it, so an
+  operator has to fix the disk and restart the server. Under `always` that leaves nothing
+  behind: a record queued when the error surfaces is answered with the failure rather than
+  a 200, so nothing acknowledged is missing on restart. Under `everysec`/`no` it bounds
+  the loss rather than eliminating it — the transactions already queued for the writer
+  when the error surfaced were acked 200 and are gone on restart, so the space freezes
+  slightly ahead of what is durable.
 - **Roadmap** (not yet implemented): parallel execution of write-disjoint execs *within*
-  one transaction; durable-before-ACK and a 503 on a poisoned log (the WAL's ack path
-  exists but the committer does not use it).
+  one transaction.
 
 ## Testing
 
