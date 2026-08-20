@@ -92,3 +92,53 @@ def test_disjoint_writers_all_commit(server: MorkClient) -> None:
 def test_siblings_under_a_shared_prefix_do_not_commit_conflict(server: MorkClient) -> None:
     """Path granularity, not prefix granularity: eight overlapping writers under `(edge a …)`."""
     _commit_overlapping(server, [f"(edge a n{i})" for i in range(8)])
+
+
+@pytest.mark.parametrize(
+    "server", [["--workers", "8", "--step-budget", STEP_BUDGET]], indirect=True
+)
+def test_arrival_is_not_blocked_by_a_transaction_in_flight(server: MorkClient) -> None:
+    """A transaction submitted while a long one is running must not wait for it.
+
+    With eight workers and one transaction in flight, seven workers are idle, so a
+    trivial transaction arriving mid-flight has nothing legitimate to wait for. If the
+    committer only wakes on finished work it never reads the request channel, and the
+    trivial one sits there for exactly the remainder of the long one — a scheduling
+    bug that would otherwise be measured as MVCC overhead.
+
+    Both latencies are calibrated on this machine rather than hardcoded: the probe is
+    fired halfway through the long transaction and must return in less than half of
+    what is left of it.
+    """
+    start = time.perf_counter()
+    server.run(_padded("(calibration long)", "hol_cal"))
+    long_solo = time.perf_counter() - start
+
+    start = time.perf_counter()
+    server.run("(calibration trivial)")
+    trivial_solo = time.perf_counter() - start
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        long_tx = pool.submit(server.run, _padded("(hol long)", "hol"))
+        time.sleep(long_solo / 2)
+        start = time.perf_counter()
+        probe = server.run("(probe arrived)")
+        waited = time.perf_counter() - start
+        long_result = long_tx.result()
+
+    remaining = long_solo / 2
+    assert waited < remaining / 2, (
+        f"a trivial transaction submitted {remaining:.3f} s before the in-flight one "
+        f"was due to finish took {waited:.3f} s (it takes {trivial_solo:.3f} s alone): "
+        f"it was held behind the long transaction instead of running on an idle worker"
+    )
+    # The server's own commit order, not the client's view of it. `long_tx.done()` would
+    # be the obvious check and is worthless here: it flips when the requests thread parses
+    # the response, which lags the actual commit by an unbounded amount, so it reports
+    # "still running" for a transaction the server finished with long ago. Versions come
+    # from the committer, so this cannot lie about which landed first.
+    assert probe.version < long_result.version, (
+        f"the probe committed at version {probe.version}, after the long transaction at "
+        f"{long_result.version} — the long one had already finished, so this run measured "
+        f"nothing about overlap (long solo was {long_solo:.3f} s)"
+    )

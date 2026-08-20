@@ -351,7 +351,10 @@ def test_concurrent_conflict_one_transaction_aborts(server: MorkClient) -> None:
     validates against a version newer than its base and aborts. Each round gets its own
     `edge{round}` facts and its own `a{round}` padding namespace, so nothing leaks
     between rounds and the padding never invents a conflict of its own. Measured over
-    200 rounds at `--step-budget 50`: 34% of rounds conflict, at 0.06 s per round.
+    200 rounds at `--step-budget 50`: 80% of rounds conflict, at 0.06 s per round.
+    (This rate is machine-sensitive and moves with the committer's dispatch behaviour:
+    the same harness measured 34% and 52% on other hosts, and 52% on this one before
+    head-of-line dispatch was fixed. The cap below is sized off the pessimistic end.)
     (Padding used to be off the table because it killed the server — that turned out to
     be undefined behaviour in PathMap, `LineListNode::pjoin_dyn` calling
     `as_dense_unchecked()` on a `CellByteNode`, trapping as SIGILL. It is fixed.)
@@ -360,7 +363,8 @@ def test_concurrent_conflict_one_transaction_aborts(server: MorkClient) -> None:
     front-loaded into the cold-start rounds and the rate decays as the process warms —
     so a binomial confidence interval over the sample would be the wrong model and is
     deliberately not quoted. Compounding a pessimistic 25% floor instead:
-    `0.75^40 ≈ 1e-5`. Over 65 trials of this loop — 40 in a standalone harness plus 25
+    `0.75^40 ≈ 1e-5` — a floor chosen to stay valid on a slower host, not a reading of
+    the 80% measured here. Over 65 trials of this loop — 40 in a standalone harness plus 25
     full runs of this test — the first conflict landed on round 0 in 24 of them, with a
     median of round 1 and a worst case of round 13; none came close to the cap. Cost
     follows the same shape: ~0.12 s in the median, ~2.4 s if the cap is ever spent. If it does exhaust, the test fails loudly rather
@@ -392,7 +396,7 @@ def test_concurrent_conflict_one_transaction_aborts(server: MorkClient) -> None:
     else:
         pytest.fail(
             f"no conflict observed in {CONFLICT_ROUNDS} rounds — either the race genuinely "
-            "never overlapped (~1e-5 at the measured padded rate of ~34% per round) or "
+            "never overlapped (~1e-5 even at a pessimistic 25% per-round rate) or "
             "commit's wiring regressed; investigate before assuming bad luck"
         )
 

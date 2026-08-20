@@ -28,6 +28,12 @@ use crate::transaction::{Event, ReadSnapshot, Transaction, TxId, TxOk};
 use crate::wal::{self, CkptMeta, FsyncPolicy, OwnedRec, Rec, Wal};
 use crate::{worker, wrap};
 
+/// How long the committer waits on finished work before looping back to look for newly
+/// submitted transactions, whenever a worker slot is free. See `run`'s loop for why it
+/// exists; 1 ms was measured as invisible against both head-of-line latency (which it
+/// bounds) and the committer thread's own CPU use.
+const DISPATCH_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// What happens when a transaction exhausts its step budget.
 #[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
 pub enum BudgetAction {
@@ -149,7 +155,8 @@ fn run(
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
-        if in_flight < cfg.workers.get() {
+        let has_free_slot = in_flight < cfg.workers.get();
+        if has_free_slot {
             match rx.try_recv() {
                 Ok(t) => {
                     dispatch(&mut committed, &mut bases, t, &job_tx, &active);
@@ -171,16 +178,34 @@ fn run(
                 None => break,
             }
         } else {
-            // Workers are busy; block until one reports rather than spinning.
-            match res_rx.recv() {
-                Ok(r) => {
-                    commit(&mut committed, &mut bases, r, &sm, &snap_tx, &events, &active, wal);
-                    in_flight -= 1;
-                    finished += 1;
-                    maybe_checkpoint(&committed, finished, &cfg, wal, &mut next_checkpoint);
+            // Workers are busy, so wait for one to report rather than spinning — but how
+            // long to wait depends on whether a result is the only thing that could help.
+            // With a slot still free, a request arriving right now could start
+            // immediately, and nothing but a result would wake us from `recv()`; time out
+            // instead and loop, which re-checks `rx`. With every worker busy, a result
+            // genuinely is the only thing that can make progress, so block for it.
+            //
+            // `DISPATCH_POLL` is therefore the worst-case delay before an arriving request
+            // is dispatched. It costs two `try_recv`s per tick and only ticks while the
+            // pool is partially loaded. Upgrade path if it ever shows up in a profile:
+            // make the result channel carry an enum and have the HTTP handler push a
+            // `Submitted` wake onto it, so one `recv()` serves both and nothing polls.
+            let r = if has_free_slot {
+                match res_rx.recv_timeout(DISPATCH_POLL) {
+                    Ok(r) => r,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                Err(_) => break,
-            }
+            } else {
+                match res_rx.recv() {
+                    Ok(r) => r,
+                    Err(_) => break,
+                }
+            };
+            commit(&mut committed, &mut bases, r, &sm, &snap_tx, &events, &active, wal);
+            in_flight -= 1;
+            finished += 1;
+            maybe_checkpoint(&committed, finished, &cfg, wal, &mut next_checkpoint);
         }
     }
     log::info!("engine: transaction channel closed, shutting down");
