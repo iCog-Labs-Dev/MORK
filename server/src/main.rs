@@ -1,9 +1,10 @@
 //! mork-server: expose `Space::metta_calculus` to concurrent network clients.
 //!
-//! Architecture (see the plan): a single engine thread owns the `Space` and serializes all
-//! mutation; readers get lock-free O(1) COW snapshots; an SSE stream carries every
-//! execution event. One submission verb: `POST /run` — submitting a transaction (data +
-//! execs) IS running it.
+//! Architecture (see the plan): a pool of worker threads runs transactions concurrently,
+//! each against its own snapshot, and one committer thread validates and installs their
+//! results in a total order; readers get lock-free O(1) COW snapshots; an SSE stream
+//! carries every execution event. One submission verb: `POST /run` — submitting a
+//! transaction (data + execs) IS running it.
 
 mod engine;
 mod events;
@@ -44,8 +45,8 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     events_buffer: usize,
     /// Max VM steps a single transaction may run before `--budget-action` applies
-    /// (scheduling is sequential, so this bounds how long one transaction can hold the
-    /// engine).
+    /// (this bounds how long a transaction can pin its base snapshot, and so how much
+    /// version history the committer must retain).
     #[arg(long, default_value_t = 1_000_000)]
     step_budget: u64,
     /// On budget exhaustion: `commit` keeps partial progress and parks pending execs as

@@ -21,12 +21,12 @@ cargo +nightly run --release -p mork-server -- --addr 127.0.0.1:8081
 |---|---|---|
 | `--addr` | `127.0.0.1:8081` | Listen address |
 | `--events-buffer` | `4096` | Per-subscriber event buffer; slower clients get `lagged` events instead of back-pressuring the engine |
-| `--step-budget` | `1000000` | Max VM steps one transaction may run; bounds how long a transaction can hold the (sequential) engine |
+| `--step-budget` | `1000000` | Max VM steps one transaction may run; bounds how long a transaction can pin its base snapshot, and so how much version history the committer has to retain for it to validate against |
 | `--budget-action` | `commit` | On budget exhaustion: `commit` keeps partial progress and parks pending execs as `(paused …)` data; `abort` rolls the whole transaction back |
 | `--workers` | `1` | Number of transactions that may execute concurrently; `1` = the previous sequential engine, exactly. Capped at the symbol table's writer-thread limit (`MAX_WRITER_THREADS`) |
-| `--data-dir` | *(absent)* | **Temporarily refused**: persistence for concurrent execution is being reworked (see Task 6+ of the MVCC plan), and the server exits at startup rather than serve a space recovery can't yet reconstruct soundly. Absent = pure in-memory, the only supported mode right now |
-| `--fsync` | `everysec` | When the log is fsynced: `always` = 200 means on disk (group-committed) · `everysec` = durable within ~1 s (Redis-style; the loss window covers process crash and power failure) · `no` = page cache decides. (Inert while `--data-dir` is refused; kept so the flag's shape doesn't change again once persistence is reworked.) |
-| `--checkpoint-every` | `1024` | Snapshot the space and delete pre-checkpoint log segments every N finished transactions; `0` disables (the log grows unbounded, recovery replays it in full). Same inert status as `--fsync` for now |
+| `--data-dir` | *(absent)* | Enable persistence: write-ahead log plus checkpoints rooted at this directory, replayed at startup before the listener binds. Absent = pure in-memory (nothing is written, nothing is recovered) |
+| `--fsync` | `everysec` | When the log is fsynced: `always` = every batch of commit records is fsynced as it is written · `everysec` = durable within ~1 s (Redis-style; the loss window covers process crash and power failure) · `no` = page cache decides. Note that the 200 does not currently wait on the fsync under any policy (see Durability below) |
+| `--checkpoint-every` | `1024` | Snapshot the space and delete pre-checkpoint log segments every N finished transactions; `0` disables (the log grows unbounded, recovery replays it in full). A due checkpoint is deferred while any transaction is in flight, and stays due until one succeeds |
 
 Logging via `env_logger`: `RUST_LOG=info cargo +nightly run -p mork-server`.
 Stop with Ctrl-C (open connections are closed, the engine thread is joined).
@@ -60,23 +60,53 @@ curl 'http://127.0.0.1:8081/export?pattern=%5B2%5D%20petri%20%5B3%5D%20%21%20res
   `(exec (<tx-id> L) …)` — uniformly across data, patterns, and templates, so your
   pattern-matching still works. This gives each transaction a private work queue. The
   wrapper is stripped from everything you see (events, exports); you never observe it.
-- **Sequential scheduling.** Transactions execute strictly one at a time, in submission
-  order: the running transaction steps to quiescence before the next queued one is even
-  applied. (This is what makes atomic rollback sound — nothing else runs in between that
-  could observe reverted state.) *Within* your transaction, execs run in plain trie order
-  over your locs — your program's own inference control is untouched. A transaction holds
-  the engine for at most `--step-budget` steps (see the flags table).
-- **Serial writes, parallel reads.** All mutation happens on one engine thread, one step at
-  a time (interleaving is turn-taking, never concurrent writes). Reads (`/export`) and the
-  event stream are served in parallel from copy-on-write snapshots and never block on, or
-  are blocked by, execution.
-- **Isolation: serial.** All transactions share one space's data region, but because
-  execution is sequential a transaction only ever sees the *committed* results of its
-  predecessors — never another program mid-flight. (MVCC snapshots are future work.)
+- **Concurrent execution.** Up to `--workers` transactions run at once, each on its own
+  worker thread against its own consistent snapshot of the space — `--workers` is a
+  ceiling, not a promise (see *Head-of-line dispatch* below). **Commit order is not
+  submission order**: a short transaction submitted later can commit first, and its
+  `version` will be the lower one. *Within* your transaction, execs run in plain trie
+  order over your locs — your program's own inference control is untouched. One
+  transaction runs for at most `--step-budget` steps (see the flags table).
+- **Head-of-line dispatch** *(known limitation)*. The committer only looks for newly
+  arrived requests at the moment it dispatches or commits something; while anything is in
+  flight it blocks on the *results* channel, so a request that arrives mid-flight waits
+  for the next commit however many workers are idle. Measured at `--workers 8` with one
+  307 ms transaction running and seven workers free: a trivial `(tiny 1)` submitted
+  151 ms in waited 158 ms — the remainder of the long transaction, reproducible to the
+  millisecond across trials. A steady stream of submissions keeps the pool busy, a
+  trickle does not: four ~310 ms transactions submitted together took 1231 ms at
+  `--workers 1` and 683 ms at `--workers 8` — 1.8x faster for 8x the workers, not 4x.
+  Nothing is lost or reordered; it is purely latency.
+- **Concurrent writes, serialized commit.** Workers mutate only their private snapshots,
+  in parallel. A single committer thread then validates and installs each finished
+  transaction one at a time, which is what makes commit order a total order and gives
+  every commit a distinct `version`. Reads (`/export`) and the event stream are served
+  from published copy-on-write snapshots and never block on, or are blocked by, execution.
+- **Isolation: snapshot isolation with removal-scan validation.** A transaction sees only
+  its base snapshot — the state as of the last commit before it was dispatched — never
+  another transaction's in-flight work. At commit the committer diffs its final trie
+  against that base and checks the result against everything that committed meanwhile:
+
+  | Does **not** conflict | Conflicts |
+  |---|---|
+  | Disjoint paths | Both wrote the same path, one adding and one removing it |
+  | Siblings under a shared prefix (`(edge a b)` vs `(edge a c)`) | A pattern-scoped removal racing an insertion under the same ground prefix (the phantom the `$`-pattern would otherwise silently miss) |
+  | Two adds of the same path, or two removes of it (sets are idempotent) | |
+  | Read/read | |
+
+  A loser is rolled back entirely and gets a `422` plus an `abort` event carrying one of
+  exactly two reasons, verbatim:
+  `conflict: a path this transaction wrote was concurrently written` or
+  `phantom: a pattern-scoped removal raced a concurrent insertion under the same prefix`.
+  The prefix check over-approximates by design: a spurious abort is possible, a missed
+  conflict is not.
 - **Cancellation is program semantics.** *Within* a running transaction, a RemoveSink exec
-  that matches its pending execs deletes them — a program can stop its own chain. (With
-  sequential scheduling nothing of a transaction survives past its commit for another
-  transaction to cancel; namespace wrapping keeps it that way.)
+  that matches its pending execs deletes them — a program can stop its own chain. Nothing
+  of a transaction survives its commit for another transaction to cancel: a worker only
+  commits once its whole snapshot has quiesced (or its leftovers were parked as inert
+  `(paused …)` data at the budget), so committed state never holds a steppable exec — and
+  an in-flight transaction's execs live in another worker's private snapshot, invisible
+  either way.
 - **CLI compatibility.** Any file that works as `mork run <file>` works unmodified as a
   `POST /run` body: same parser, same exec shape, same semantics, identical results.
 
@@ -214,26 +244,34 @@ a slightly stale but always consistent view. To coordinate, compare the `version
   built fresh for that transaction and dropped when it ends — not one `Space` shared for
   the process lifetime. A program that opens a `z3` subprocess or memory-maps an ACT file
   gets that resource for its own transaction only; it does not persist into the next one.
-- **Runaway programs**: a program whose continuations never stop can't wedge the queue —
-  after `--step-budget` steps it is either quiesced by force (`commit`: results kept,
-  continuations parked as `(paused …)` data) or rolled back (`abort`). Size the budget to
-  your workload: it's the upper bound on how long one transaction can hold the engine.
-- **Durability** (`--data-dir`) — **temporarily refused at startup** (see the flags table);
-  the description below is the design this will return to once the WAL/recovery rework
-  for concurrent execution lands. It's a logical command log — transaction sources plus
-  commit/abort outcome records — with the engine never touching a file (a dedicated
-  writer thread owns all I/O and fsync timing; under `--fsync always` it also fires the
-  client's 200 after the group-commit fsync). Recovery replays the log against the
-  deterministic VM: same text, same trie order, same steps ⇒ byte-identical space. A
-  transaction killed mid-execution (logged but no outcome) is re-run fresh on startup,
-  before the listener binds. Checkpoints (`--checkpoint-every`) bound both: the engine's
-  cost is an O(1) copy-on-write clone; a background thread serializes it (compressed
-  `.paths`), installs it atomically (temp + fsync + rename), and deletes the log
-  segments it supersedes — recovery then restores the snapshot and replays only the
-  tail. A disk-write error poisons the log: writes get 503, reads keep serving.
-  Requires the default non-`interning` build.
-- **Roadmap** (not yet implemented): MVCC snapshots/isolation, then parallel execution
-  of write-disjoint execs.
+- **Runaway programs**: a program whose continuations never stop is bounded, not
+  harmless — after `--step-budget` steps it is either quiesced by force (`commit`:
+  results kept, continuations parked as `(paused …)` data) or rolled back (`abort`).
+  While it runs it *does* hold up the queue, because dispatch is head-of-line (see
+  Concurrency above): requests arriving mid-flight wait for it even with workers idle.
+  Size the budget to your workload — it is the upper bound both on how long one
+  transaction can occupy a worker and on how long a newly arrived request can sit
+  unread.
+- **Durability** (`--data-dir`): a logical command log — one record per *committed*
+  transaction, holding its source text and the version it ran against — with the engine
+  never touching a file (a dedicated writer thread owns all I/O and fsync timing).
+  Aborted and mid-execution transactions are never logged, so there is nothing to undo:
+  recovery replays each committed record against the deterministic VM, rebuilding the
+  exact base snapshot that record names and re-running it there, in log order. Same
+  text, same base, same trie order, same steps ⇒ byte-identical space; a replay that
+  runs a different number of steps or installs at a different version refuses to start
+  rather than serve a divergent space. Checkpoints (`--checkpoint-every`) bound recovery
+  time: the engine's cost is an O(1) copy-on-write clone; a background thread serializes
+  it (compressed `.paths`), installs it atomically (temp + fsync + rename), and deletes
+  the log segments it supersedes — recovery then restores the snapshot and replays only
+  the tail. Requires the default non-`interning` build. Two rough edges to know about:
+  the 200 is sent as soon as the record is handed to the writer thread, so it does not
+  imply "fsynced" even under `--fsync always`; and a disk-write error poisons the log
+  (further records are dropped rather than written) without yet being surfaced to
+  clients — the server keeps committing in memory.
+- **Roadmap** (not yet implemented): parallel execution of write-disjoint execs *within*
+  one transaction; durable-before-ACK and a 503 on a poisoned log (the WAL's ack path
+  exists but the committer does not use it).
 
 ## Testing
 
@@ -241,13 +279,24 @@ Black-box Python suite in [`tests/`](tests/) (managed by `uv`; pinned Python 3.1
 Rust unit tests:
 
 ```sh
-cargo +nightly test -p mork-server        # Rust unit tests (wrap.rs)
+cargo +nightly test -p mork-server        # Rust unit tests (conflict rules, WAL, wrapping)
 
 cd server/tests
 uv sync                                   # one-time env setup
-uv run pytest                             # e2e + regression (builds & spawns the server itself)
+uv run pytest                             # e2e + concurrency + recovery + regression
+                                          # (builds & spawns the server itself)
 uv run ruff check . && uv run ruff format --check . && uv run mypy .   # style + types
 ```
+
+`test_concurrency.py` covers the isolation claim above at `--workers 4`/`--workers 8`:
+eight writers on disjoint paths, and eight more on sibling paths under one shared prefix,
+all of which must commit. Overlap is forced rather than hoped for — each submission is
+padded with a self-namespaced diverging program capped by `--step-budget`, and each test
+asserts the batch beat its own measured solo latency by enough that the transactions must
+have been in flight together, so they really did validate against each other. Both tests
+fail at `--workers 1` for exactly that reason. Given the overlap, an abort means conflict
+detection started approximating by prefix instead of by path. `test_recovery.py` covers
+`--data-dir` (kill, respawn, same space).
 
 Regression cases are golden files: drop `<name>.metta` + `<name>.check` (JSON with
 `pattern`, `template`, `expected` lines) into `examples/` and pytest picks them up.

@@ -3,13 +3,16 @@
 import socket
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 import requests
 
 from client import MorkClient
+
+# `spawner(extra_args) -> (client, process)`: what the fixture of the same name hands out.
+Spawner = Callable[[list[str]], tuple[MorkClient, "subprocess.Popen[bytes]"]]
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES_DIR = REPO_ROOT / "server" / "examples"
@@ -31,7 +34,7 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
-def _launch(mork_binary: Path, addr: str, extra_args: list[str]) -> subprocess.Popen:
+def _launch(mork_binary: Path, addr: str, extra_args: list[str]) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         [str(mork_binary), "--addr", addr, *extra_args],
         stdout=subprocess.DEVNULL,
@@ -39,7 +42,7 @@ def _launch(mork_binary: Path, addr: str, extra_args: list[str]) -> subprocess.P
     )
 
 
-def _wait_ready(proc: subprocess.Popen, addr: str) -> None:
+def _wait_ready(proc: subprocess.Popen[bytes], addr: str) -> None:
     deadline = time.monotonic() + 10.0
     while True:
         try:
@@ -71,14 +74,14 @@ def server(mork_binary: Path, request: pytest.FixtureRequest) -> Iterator[MorkCl
 
 
 @pytest.fixture
-def spawner(mork_binary: Path):
+def spawner(mork_binary: Path) -> Iterator[Spawner]:
     """Full-control spawning for crash-recovery tests: `spawn(extra_args)` returns
     `(client, proc)`; kill/respawn at will (e.g. same --data-dir), everything spawned is
     cleaned up at teardown."""
-    procs: list[subprocess.Popen] = []
+    procs: list[subprocess.Popen[bytes]] = []
     clients: list[MorkClient] = []
 
-    def spawn(extra_args: list[str]) -> tuple[MorkClient, subprocess.Popen]:
+    def spawn(extra_args: list[str]) -> tuple[MorkClient, subprocess.Popen[bytes]]:
         addr = f"127.0.0.1:{_free_port()}"
         proc = _launch(mork_binary, addr, extra_args)
         procs.append(proc)

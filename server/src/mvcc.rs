@@ -2,9 +2,6 @@
 //! installation. Everything here is a pure function over `PathMap<()>` — no threads,
 //! no I/O — so the whole conflict model is testable without an engine.
 
-// Tasks 4-6 wire this into the engine; nothing calls it yet.
-#![allow(dead_code)]
-
 use pathmap::PathMap;
 use pathmap::zipper::{ZipperValues, ZipperIteration};
 

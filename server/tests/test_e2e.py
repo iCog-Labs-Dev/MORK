@@ -8,11 +8,13 @@ import json
 import re
 import socket
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import pytest
 
 from client import MorkClient, MorkError, SseEvent
 from conftest import EXAMPLES_DIR
+from test_concurrency import PADDING
 
 TXID_RE = re.compile(r"\btx\d+_[a-z0-9]{8}\b")
 PEANO_FOUR = "(S (S (S (S Z))))"
@@ -296,7 +298,7 @@ def _raw_events(host: str, port: int) -> tuple[socket.socket, str]:
 
 def _raw_wait_for(
     sock: socket.socket, buf: str, name: str, timeout: float = 10.0
-) -> tuple[dict, str]:
+) -> tuple[dict[str, Any], str]:
     """Read SSE frames off a raw `/events` socket (as opened by `_raw_events`) until one
     named `name` arrives. Returns its data plus any leftover buffered bytes, so callers
     can keep making further calls against the same stream."""
@@ -308,7 +310,7 @@ def _raw_wait_for(
                 raise AssertionError(f"events stream closed before {name!r} arrived")
             buf += chunk.decode()
         frame, _, buf = buf.partition("\n\n")
-        ev_name, data = None, None
+        ev_name, data = None, {}
         for line in frame.split("\n"):
             if line.startswith("event: "):
                 ev_name = line.removeprefix("event: ")
@@ -318,46 +320,68 @@ def _raw_wait_for(
             return data, buf
 
 
-@pytest.mark.parametrize("server", [["--workers", "4"]], indirect=True)
+# How many racing rounds `test_concurrent_conflict_one_transaction_aborts` may spend
+# looking for an overlap, and the step budget that makes each round likely to produce
+# one. See that test's docstring for where both numbers come from.
+CONFLICT_ROUNDS = 40
+CONFLICT_STEP_BUDGET = "50"
+
+
+@pytest.mark.parametrize(
+    "server", [["--workers", "4", "--step-budget", CONFLICT_STEP_BUDGET]], indirect=True
+)
 def test_concurrent_conflict_one_transaction_aborts(server: MorkClient) -> None:
     """A real MVCC conflict at `--workers 4`: one transaction removes-by-pattern
     `(edge{n} $x $y)`, another concurrently adds a brand new `(edge{n} c d)` — the
     phantom shape `mvcc::validate` exists to catch (a pattern-scoped removal racing a
     concurrent insertion under the same ground prefix).
 
-    Getting two transactions to actually overlap (share a base version) from outside
-    the process is a genuine race, not something this test can force outright:
-    - Padding one side with a many-step loop to buy a guaranteed timing margin was
-      tried and abandoned — it uncovered a separate, serious bug (see the fix-round
-      report): a transaction that runs many interpreter steps concurrently with
-      *any* transaction that includes a removal exec intermittently hangs the
-      server, regardless of whether the two conflict. That is a real defect for a
-      follow-up task to fix, not something to route around by shipping a test that
-      can hang CI.
-    - A plain `ThreadPoolExecutor` race (as used elsewhere in this file) only
-      overlaps roughly 20% of the time — Python's own thread-scheduling gap between
-      the two `submit` calls is often wider than the two requests' actual server-side
-      overlap window. Firing both over pre-connected raw sockets, back-to-back with
-      no Python scheduling in between, closes most of that gap: empirically ~80% of
-      attempts overlap.
+    Two transactions only conflict if they share a base version, and from outside the
+    process that overlap has to be bought rather than hoped for. Submitting the pair
+    back-to-back over pre-connected raw sockets is not enough on its own: measured over
+    200 rounds with the `/events` subscriber attached, only 1% of rounds overlapped
+    (the earlier fix round measured 2% over two 500-round samples, and 5.7% with no
+    subscriber). These transactions are small enough that the first one usually commits
+    before the second is even dispatched, so closing Python's thread-scheduling gap
+    barely moves the number.
 
-    So this test retries with fresh, disjoint data each round (avoiding any
-    state leaking between attempts) until it observes an actual conflict, capped at
-    20 rounds. At an 80% measured per-round hit rate the odds of exhausting the cap
-    with no overlap are astronomically small (~1e-14); if it ever does exhaust, the
-    test fails loudly with a clear message rather than silently passing — this is
-    a bounded retry for a genuinely racy phenomenon, not a hope-it-works flake.
+    The lever that does work is padding the removing side with the same self-namespaced
+    diverging program `test_concurrency.py` uses, capped by `--step-budget`. It holds
+    the remover in flight while the adder commits underneath it, so the remover
+    validates against a version newer than its base and aborts. Each round gets its own
+    `edge{round}` facts and its own `a{round}` padding namespace, so nothing leaks
+    between rounds and the padding never invents a conflict of its own. Measured over
+    200 rounds at `--step-budget 50`: 34% of rounds conflict, at 0.06 s per round.
+    (Padding used to be off the table because it killed the server — that turned out to
+    be undefined behaviour in PathMap, `LineListNode::pjoin_dyn` calling
+    `as_dense_unchecked()` on a `CellByteNode`, trapping as SIGILL. It is fixed.)
+
+    Hence the 40-round cap. The per-round rate is *not* stationary — conflicts are
+    front-loaded into the cold-start rounds and the rate decays as the process warms —
+    so a binomial confidence interval over the sample would be the wrong model and is
+    deliberately not quoted. Compounding a pessimistic 25% floor instead:
+    `0.75^40 ≈ 1e-5`. Over 65 trials of this loop — 40 in a standalone harness plus 25
+    full runs of this test — the first conflict landed on round 0 in 24 of them, with a
+    median of round 1 and a worst case of round 13; none came close to the cap. Cost
+    follows the same shape: ~0.12 s in the median, ~2.4 s if the cap is ever spent. If it does exhaust, the test fails loudly rather
+    than silently passing — a bounded retry for a genuinely racy phenomenon, not a
+    hope-it-works flake.
     """
     host, _, port_s = server.base_url.removeprefix("http://").partition(":")
     port = int(port_s)
     ev_sock, ev_buf = _raw_events(host, port)
-    for round_ in range(20):
+    for round_ in range(CONFLICT_ROUNDS):
         a_src = (
-            f"(edge{round_} a b)\n(exec 0 (, (edge{round_} $x $y)) (O (- (edge{round_} $x $y))))\n"
+            f"(edge{round_} a b)\n"
+            f"(exec 0 (, (edge{round_} $x $y)) (O (- (edge{round_} $x $y))))\n"
+            + PADDING.format(ns=f"a{round_}")
+            + "\n"
         )
         b_src = f"(edge{round_} c d)\n"
         sa = _raw_post(host, port, a_src.encode())
         sb = _raw_post(host, port, b_src.encode())
+        # `_raw_response` closes each socket once it has the whole body, so a long run
+        # holds no more than the two sockets of the round it is in.
         status_a, body_a = _raw_response(sa)
         status_b, body_b = _raw_response(sb)
         if status_a == 422 or status_b == 422:
@@ -367,9 +391,9 @@ def test_concurrent_conflict_one_transaction_aborts(server: MorkClient) -> None:
             break
     else:
         pytest.fail(
-            "no conflict observed in 20 rounds — either the race genuinely never overlapped "
-            "(vanishingly unlikely at the measured ~80% per-round rate) or commit's wiring "
-            "regressed; investigate before assuming bad luck"
+            f"no conflict observed in {CONFLICT_ROUNDS} rounds — either the race genuinely "
+            "never overlapped (~1e-5 at the measured padded rate of ~34% per round) or "
+            "commit's wiring regressed; investigate before assuming bad luck"
         )
 
     assert loser_status == 422

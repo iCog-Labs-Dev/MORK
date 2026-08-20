@@ -9,20 +9,21 @@ loss-window differences are only observable under real power failure.
 
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-from client import MorkClient
-from conftest import EXAMPLES_DIR
+from client import MorkClient, TxResult
+from conftest import EXAMPLES_DIR, Spawner
 from test_e2e import DIVERGING, PEANO_FOUR, RESULT_PATTERN
 
 
-def _run_and_wait(client: MorkClient, src: str, outcome: str = "quiescent"):
+def _run_and_wait(client: MorkClient, src: str, outcome: str = "quiescent") -> TxResult:
     with client.events() as stream:
         res = client.run(src)
         stream.wait_for(outcome, tx=res.tx)
     return res
 
 
-def test_recovery_after_quiescence(spawner, tmp_path) -> None:
+def test_recovery_after_quiescence(spawner: Spawner, tmp_path: Path) -> None:
     args = ["--data-dir", str(tmp_path), "--fsync", "always"]
     c1, p1 = spawner(args)
     _run_and_wait(c1, (EXAMPLES_DIR / "adder.metta").read_text())
@@ -36,7 +37,7 @@ def test_recovery_after_quiescence(spawner, tmp_path) -> None:
     assert c2.export(pattern=RESULT_PATTERN, template="_1") == [PEANO_FOUR]
 
 
-def test_recovery_under_everysec(spawner, tmp_path) -> None:
+def test_recovery_under_everysec(spawner: Spawner, tmp_path: Path) -> None:
     args = ["--data-dir", str(tmp_path)]  # default --fsync everysec
     c1, p1 = spawner(args)
     _run_and_wait(c1, "(fact 1)\n(exec 0 (, (fact $x)) (, (derived $x)))")
@@ -49,7 +50,7 @@ def test_recovery_under_everysec(spawner, tmp_path) -> None:
     assert c2.export() == before
 
 
-def test_crash_mid_execution_leaves_no_trace(spawner, tmp_path) -> None:
+def test_crash_mid_execution_leaves_no_trace(spawner: Spawner, tmp_path: Path) -> None:
     """Under the current WAL schema, one record is written per COMMITTED transaction
     only (see wal.rs's module doc) — an uncommitted transaction is invisible, so a
     crash mid-run and an explicit abort are the same fact: "this never happened".
@@ -67,12 +68,10 @@ def test_crash_mid_execution_leaves_no_trace(spawner, tmp_path) -> None:
     assert c2.export() == []
 
 
-def test_tx_counter_and_version_survive(spawner, tmp_path) -> None:
+def test_tx_counter_and_version_survive(spawner: Spawner, tmp_path: Path) -> None:
     args = ["--data-dir", str(tmp_path), "--fsync", "always"]
     c1, p1 = spawner(args)
-    last = None
-    for i in range(3):
-        last = _run_and_wait(c1, f"(fact {i})")
+    last = [_run_and_wait(c1, f"(fact {i})") for i in range(3)][-1]
 
     p1.kill()
     p1.wait(timeout=10)
@@ -86,7 +85,7 @@ def test_tx_counter_and_version_survive(spawner, tmp_path) -> None:
     assert res.version == last.version + 1
 
 
-def test_checkpoint_restore_and_log_gc(spawner, tmp_path) -> None:
+def test_checkpoint_restore_and_log_gc(spawner: Spawner, tmp_path: Path) -> None:
     """--checkpoint-every N: the space is snapshotted, pre-checkpoint segments are
     deleted, and recovery = restore checkpoint + replay only the log tail."""
     args = ["--data-dir", str(tmp_path), "--fsync", "always", "--checkpoint-every", "2"]
@@ -119,7 +118,7 @@ def test_checkpoint_restore_and_log_gc(spawner, tmp_path) -> None:
     assert int(res.tx[2:].split("_")[0]) == 4  # counter: meta (2) + tail replay (3) + 1
 
 
-def test_clean_restart(spawner, tmp_path) -> None:
+def test_clean_restart(spawner: Spawner, tmp_path: Path) -> None:
     args = ["--data-dir", str(tmp_path)]
     c1, p1 = spawner(args)
     _run_and_wait(c1, "(persistent fact)")
@@ -132,7 +131,7 @@ def test_clean_restart(spawner, tmp_path) -> None:
     assert c2.export() == before
 
 
-def test_concurrent_writes_survive_restart(spawner, tmp_path) -> None:
+def test_concurrent_writes_survive_restart(spawner: Spawner, tmp_path: Path) -> None:
     """Transactions committed under --workers 4 must all be present after a restart."""
     args = ["--data-dir", str(tmp_path), "--workers", "4"]
     c1, p1 = spawner(args)
@@ -149,7 +148,7 @@ def test_concurrent_writes_survive_restart(spawner, tmp_path) -> None:
     assert sorted(c2.export()) == sorted(before)
 
 
-def test_recovery_is_order_independent_of_worker_count(spawner, tmp_path) -> None:
+def test_recovery_is_order_independent_of_worker_count(spawner: Spawner, tmp_path: Path) -> None:
     """Replay follows the log's commit order, not the worker count, so recovering
     a 4-worker log with 1 worker must produce the same space."""
     c1, p1 = spawner(["--data-dir", str(tmp_path), "--workers", "4"])
