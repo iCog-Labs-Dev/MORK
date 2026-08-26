@@ -72,22 +72,23 @@ fn a_reacquired_permit_does_not_alias_another_threads_slot() {
     // idle, so the same free index is handed out repeatedly -- which is what leaves the
     // stale thread-local pointing at a slot someone else now owns. Firing all the jobs
     // at once instead mostly gives each worker a distinct slot and hides the bug.
+    let mut bad = 0;
     for i in 0..WORKERS {
         job_tx.send(i).unwrap();
-        recv_job(&done_rx);
+        bad += recv_job(&done_rx);
     }
 
     for i in WORKERS..JOBS {
         job_tx.send(i).unwrap();
     }
-    let bad: usize = (WORKERS..JOBS).map(|_| recv_job(&done_rx)).sum();
+    bad += (WORKERS..JOBS).map(|_| recv_job(&done_rx)).sum::<usize>();
 
     drop(job_tx);
     for w in workers {
         w.join().expect("a worker panicked; a permit was aliased badly enough to abort");
     }
 
-    let total = (JOBS - WORKERS) * SYMS_PER_JOB;
+    let total = JOBS * SYMS_PER_JOB;
     assert_eq!(bad, 0, "{bad} of {total} symbols did not read back as their own bytes");
 }
 

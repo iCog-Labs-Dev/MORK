@@ -86,6 +86,10 @@ fn export(state: &Arc<ServerState>, query: &HashMap<String, String>) -> Response
             .header("x-mork-version", snap.version.to_string())
             .body(Full::new(Bytes::from(text)).boxed())
             .unwrap(),
+        // Same marker `/run` uses: the symbol table being saturated is not a bad request.
+        Err(e) if e.starts_with("unavailable:") => {
+            json_response(StatusCode::SERVICE_UNAVAILABLE, json!({"ok": false, "error": e}))
+        }
         Err(e) => json_response(StatusCode::BAD_REQUEST, json!({"ok": false, "error": e})),
     }
 }

@@ -7,11 +7,15 @@
 //!
 //! Every parse takes a `mork-interning` write permit and drops it again, so workers keep
 //! recycling a pool of at most `MAX_WRITER_THREADS` (128) slots rather than owning one
-//! each. `--workers` is capped at that ceiling and the only other parse site — recovery —
-//! runs before any worker spawns, so a worker's `try_aquire_permission` cannot run out of
-//! slots. Note that what a permit actually protects is only compiled in under the
-//! kernel's `interning` feature, which is off by default: with it off the permit is taken
-//! and released but the tokenizer never interns.
+//! each. That pool is shared beyond this module: `/export` parses its pattern and template
+//! on a tokio thread, and recovery parses at startup. `--workers` is capped at the ceiling
+//! *inclusively*, so at `--workers 128` a fully busy pool holds every slot and a
+//! concurrent parse elsewhere finds none — `read::parse_expr_bytes` acquires its own
+//! permit up front so that surfaces as a 503 instead of a panic.
+//!
+//! Note that what a permit protects is only compiled in under the kernel's `interning`
+//! feature, which is off by default: with it off the permit is still taken and released,
+//! but the tokenizer never interns.
 
 use std::sync::{Arc, Mutex, mpsc};
 
