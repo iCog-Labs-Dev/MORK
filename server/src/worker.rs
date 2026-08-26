@@ -3,8 +3,15 @@
 //!
 //! `Space` is `!Send`, so a worker never receives one — it receives a `PathMap` and a
 //! `SharedMappingHandle` (both `Send + Sync`) and builds its `Space` locally via
-//! `Space::with`. Symbol interning across threads is already supported by
-//! `mork-interning` (per-thread write permits, 128 thread ceiling).
+//! `Space::with`.
+//!
+//! Every parse takes a `mork-interning` write permit and drops it again, so workers keep
+//! recycling a pool of at most `MAX_WRITER_THREADS` (128) slots rather than owning one
+//! each. `--workers` is capped at that ceiling and the only other parse site — recovery —
+//! runs before any worker spawns, so a worker's `try_aquire_permission` cannot run out of
+//! slots. Note that what a permit actually protects is only compiled in under the
+//! kernel's `interning` feature, which is off by default: with it off the permit is taken
+//! and released but the tokenizer never interns.
 
 use std::sync::{Arc, Mutex, mpsc};
 

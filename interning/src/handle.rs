@@ -9,7 +9,13 @@ impl<'a> core::ops::Drop for WritePermit<'a> {
     LIVE_PERMIT_HANDLES.set(permits);
 
     if permits == 0 {
-      self.permissions[MAPPING_THREAD_INDEX.get().unwrap() as usize].0.thread_id.store(0, atomic::Ordering::Release);
+      // `take`, not `get`: releasing the slot without clearing the thread's index leaves
+      // `try_aquire_permission` short-circuiting on a stale value, so the next permit this
+      // thread asks for is granted with no CAS -- for a slot another thread may already
+      // own. Both then write the same `permissions[index]` and `to_bytes[index]`, whose
+      // Relaxed atomics assume a single owner.
+      let index = MAPPING_THREAD_INDEX.take().unwrap();
+      self.permissions[index as usize].0.thread_id.store(0, atomic::Ordering::Release);
     }
   }
 }
