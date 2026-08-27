@@ -1,0 +1,157 @@
+; AF rent collection. WAS selects one current STI fact; this rule calculates
+; deterministic STI/LTI rent from concrete state and parameter facts.
+(exec (0)
+  (I
+    (WAS ecan_af_rent (STI $atom $old_sti))
+    (BTM (LTI $atom $old_lti))
+    (BTM (BankSTI $old_bank_sti))
+    (BTM (BankLTI $old_bank_lti))
+    (BTM (ECANParam TARGET_STI $target_sti))
+    (BTM (ECANParam TARGET_LTI $target_lti))
+    (BTM (ECANParam STI_FUNDS_BUFFER $sti_buffer))
+    (BTM (ECANParam LTI_FUNDS_BUFFER $lti_buffer))
+    (BTM (ECANParam StartingAtomStiRent $base_sti_rent))
+    (BTM (ECANParam StartingAtomLtiRent $base_lti_rent))
+    (BTM (ECANParam RENT_ELAPSED_ROUNDS $elapsed_rounds)))
+  (O
+    (pure
+      (RentResult $atom $old_sti $old_lti $old_bank_sti $old_bank_lti $new_values)
+      $new_values
+      (tuple
+        (f64_to_string
+          (sub_f64 (f64_from_string $old_sti)
+            (min_f64 (f64_from_string $old_sti)
+              (product_f64 (f64_from_string $base_sti_rent)
+                (sum_f64
+                  (ceil_f64 (clamp_f64
+                    (div_f64 (max_f64 (f64_from_string 0.0)
+                      (sub_f64 (f64_from_string $target_sti) (f64_from_string $old_bank_sti)))
+                      (f64_from_string $sti_buffer))
+                    (f64_from_string 0.0) (f64_from_string 1.0)))
+                  (clamp_f64
+                    (div_f64
+                      (max_f64 (f64_from_string 0.0)
+                        (sub_f64 (f64_from_string $target_sti)
+                          (f64_from_string $old_bank_sti)))
+                      (f64_from_string $sti_buffer))
+                    (f64_from_string 0.0) (f64_from_string 1.0)))
+                (f64_from_string $elapsed_rounds)))))
+        (f64_to_string
+          (sub_f64 (f64_from_string $old_lti)
+            (min_f64 (f64_from_string $old_lti)
+              (product_f64 (f64_from_string $base_lti_rent)
+                (sum_f64
+                  (ceil_f64 (clamp_f64
+                    (div_f64 (max_f64 (f64_from_string 0.0)
+                      (sub_f64 (f64_from_string $target_lti) (f64_from_string $old_bank_lti)))
+                      (f64_from_string $lti_buffer))
+                    (f64_from_string 0.0) (f64_from_string 1.0)))
+                  (clamp_f64
+                    (div_f64
+                      (max_f64 (f64_from_string 0.0)
+                        (sub_f64 (f64_from_string $target_lti)
+                          (f64_from_string $old_bank_lti)))
+                      (f64_from_string $lti_buffer))
+                    (f64_from_string 0.0) (f64_from_string 1.0)))
+                (f64_from_string $elapsed_rounds)))))
+        (f64_to_string
+          (sum_f64 (f64_from_string $old_bank_sti)
+            (min_f64 (f64_from_string $old_sti)
+              (product_f64 (f64_from_string $base_sti_rent)
+                (sum_f64
+                  (ceil_f64 (clamp_f64
+                    (div_f64 (max_f64 (f64_from_string 0.0)
+                      (sub_f64 (f64_from_string $target_sti) (f64_from_string $old_bank_sti)))
+                      (f64_from_string $sti_buffer))
+                    (f64_from_string 0.0) (f64_from_string 1.0)))
+                  (clamp_f64
+                    (div_f64
+                      (max_f64 (f64_from_string 0.0)
+                        (sub_f64 (f64_from_string $target_sti)
+                          (f64_from_string $old_bank_sti)))
+                      (f64_from_string $sti_buffer))
+                    (f64_from_string 0.0) (f64_from_string 1.0)))
+                (f64_from_string $elapsed_rounds)))))
+        (f64_to_string
+          (sum_f64 (f64_from_string $old_bank_lti)
+            (min_f64 (f64_from_string $old_lti)
+              (product_f64 (f64_from_string $base_lti_rent)
+                (sum_f64
+                  (ceil_f64 (clamp_f64
+                    (div_f64 (max_f64 (f64_from_string 0.0)
+                      (sub_f64 (f64_from_string $target_lti) (f64_from_string $old_bank_lti)))
+                      (f64_from_string $lti_buffer))
+                    (f64_from_string 0.0) (f64_from_string 1.0)))
+                  (clamp_f64
+                    (div_f64
+                      (max_f64 (f64_from_string 0.0)
+                        (sub_f64 (f64_from_string $target_lti)
+                          (f64_from_string $old_bank_lti)))
+                      (f64_from_string $lti_buffer))
+                    (f64_from_string 0.0) (f64_from_string 1.0)))
+                (f64_from_string $elapsed_rounds)))))
+        (f64_to_string
+          (min_f64 (f64_from_string $old_sti)
+            (product_f64 (f64_from_string $base_sti_rent)
+              (sum_f64
+                (ceil_f64 (clamp_f64
+                  (div_f64 (max_f64 (f64_from_string 0.0)
+                    (sub_f64 (f64_from_string $target_sti) (f64_from_string $old_bank_sti)))
+                    (f64_from_string $sti_buffer))
+                  (f64_from_string 0.0) (f64_from_string 1.0)))
+                (clamp_f64
+                  (div_f64
+                    (max_f64 (f64_from_string 0.0)
+                      (sub_f64 (f64_from_string $target_sti)
+                        (f64_from_string $old_bank_sti)))
+                    (f64_from_string $sti_buffer))
+                  (f64_from_string 0.0) (f64_from_string 1.0)))
+              (f64_from_string $elapsed_rounds))))
+        (f64_to_string
+          (min_f64 (f64_from_string $old_lti)
+            (product_f64 (f64_from_string $base_lti_rent)
+              (sum_f64
+                (ceil_f64 (clamp_f64
+                  (div_f64 (max_f64 (f64_from_string 0.0)
+                    (sub_f64 (f64_from_string $target_lti) (f64_from_string $old_bank_lti)))
+                    (f64_from_string $lti_buffer))
+                  (f64_from_string 0.0) (f64_from_string 1.0)))
+                (clamp_f64
+                  (div_f64
+                    (max_f64 (f64_from_string 0.0)
+                      (sub_f64 (f64_from_string $target_lti)
+                        (f64_from_string $old_bank_lti)))
+                    (f64_from_string $lti_buffer))
+                  (f64_from_string 0.0) (f64_from_string 1.0)))
+              (f64_from_string $elapsed_rounds))))))))
+
+(exec (1 apply)
+  (I
+    (BTM (RentResult $atom $old_sti $old_lti $old_bank_sti $old_bank_lti
+      ($new_sti $new_lti $new_bank_sti $new_bank_lti $sti_rent $lti_rent)))
+    (BTM (STI $atom $old_sti))
+    (BTM (LTI $atom $old_lti))
+    (BTM (BankSTI $old_bank_sti))
+    (BTM (BankLTI $old_bank_lti)))
+  (O
+    (- (RentResult $atom $old_sti $old_lti $old_bank_sti $old_bank_lti
+      ($new_sti $new_lti $new_bank_sti $new_bank_lti $sti_rent $lti_rent)))
+    (- (STI $atom $old_sti))
+    (- (LTI $atom $old_lti))
+    (- (BankSTI $old_bank_sti))
+    (- (BankLTI $old_bank_lti))
+    (+ (STI $atom $new_sti))
+    (+ (LTI $atom $new_lti))
+    (+ (BankSTI $new_bank_sti))
+    (+ (BankLTI $new_bank_lti))
+    (+ (RentCollected $atom $old_sti $old_lti $new_sti $new_lti $sti_rent $lti_rent))))
+
+; Preserve identical STI/LTI and bank facts when neither lane owes rent.
+(exec (0 noop)
+  (I
+    (BTM (RentResult $atom $old_sti $old_lti $old_bank_sti $old_bank_lti
+      ($old_sti $old_lti $old_bank_sti $old_bank_lti 0.0 0.0))))
+  (O
+    (- (RentResult $atom $old_sti $old_lti $old_bank_sti $old_bank_lti
+      ($old_sti $old_lti $old_bank_sti $old_bank_lti 0.0 0.0)))
+    (+ (RentCollected $atom $old_sti $old_lti $old_sti $old_lti 0.0 0.0))))
