@@ -1,0 +1,56 @@
+; One-edge AF diffusion. The first rule selects one source STI fact through WAS
+; and calculates a single result tuple. The second MM2 rule applies that tuple.
+(exec (0)
+  (I
+    (WAS ecan_af_diffusion (STI $source $source_sti))
+    (BTM (DiffusionEdge $edge $source $target $relation_type $mean $confidence))
+    (BTM (STI $target $target_sti))
+    (BTM (ECANParam MAX_SPREAD_PERCENTAGE $max_spread))
+    (BTM (ECANParam HEBBIAN_MAX_ALLOCATION_PERCENTAGE $hebbian_allocation)))
+  (O
+    (pure
+      (DiffusionResult $edge $source $target $source_sti $target_sti $new_values)
+      $new_values
+      (tuple
+        (f64_to_string
+          (sub_f64 (f64_from_string $source_sti)
+            (min_f64 (f64_from_string $source_sti)
+              (max_f64 (f64_from_string 0.0)
+                (product_f64
+                  (f64_from_string $source_sti)
+                  (f64_from_string $max_spread)
+                  (sub_f64 (f64_from_string 1.0)
+                    (f64_from_string $hebbian_allocation)))))))
+        (f64_to_string
+          (sum_f64 (f64_from_string $target_sti)
+            (min_f64 (f64_from_string $source_sti)
+              (max_f64 (f64_from_string 0.0)
+                (product_f64
+                  (f64_from_string $source_sti)
+                  (f64_from_string $max_spread)
+                  (sub_f64 (f64_from_string 1.0)
+                    (f64_from_string $hebbian_allocation)))))))
+        (f64_to_string
+          (min_f64 (f64_from_string $source_sti)
+            (max_f64 (f64_from_string 0.0)
+              (product_f64
+                (f64_from_string $source_sti)
+                (f64_from_string $max_spread)
+                (sub_f64 (f64_from_string 1.0)
+                  (f64_from_string $hebbian_allocation))))))))))
+
+(exec (0 apply)
+  (I
+    (BTM (DiffusionResult $edge $source $target $source_sti $target_sti
+      ($new_source_sti $new_target_sti $transfer)))
+    (BTM (STI $source $source_sti))
+    (BTM (STI $target $target_sti)))
+  (O
+    (- (DiffusionResult $edge $source $target $source_sti $target_sti
+      ($new_source_sti $new_target_sti $transfer)))
+    (- (STI $source $source_sti))
+    (- (STI $target $target_sti))
+    (+ (STI $source $new_source_sti))
+    (+ (STI $target $new_target_sti))
+    (+ (Diffused $edge $source $target $source_sti $target_sti
+      $new_source_sti $new_target_sti $transfer))))
