@@ -1,0 +1,85 @@
+; Foreground ECAN stimulation. Submit both generic rules with one concrete
+; `(Stimulate event-id atom stimulus)` request per transaction.
+; The pure sink resolves one result, so calculation returns a four-value tuple
+; which the second MM2 rule applies inside the same foreground transaction.
+(exec (0)
+  (I
+    (BTM (Stimulate $event $atom $stimulus))
+    (BTM (STI $atom $old_sti))
+    (BTM (LTI $atom $old_lti))
+    (BTM (VLTI $atom $vlti))
+    (BTM (BankSTI $old_bank_sti))
+    (BTM (BankLTI $old_bank_lti))
+    (BTM (ECANParam TARGET_STI $target_sti))
+    (BTM (ECANParam TARGET_LTI $target_lti))
+    (BTM (ECANParam STI_FUNDS_BUFFER $sti_buffer))
+    (BTM (ECANParam LTI_FUNDS_BUFFER $lti_buffer))
+    (BTM (ECANParam STI_ATOM_WAGE $sti_atom_wage))
+    (BTM (ECANParam LTI_ATOM_WAGE $lti_atom_wage)))
+  (O
+    (pure
+      (StimulusResult $event $atom $stimulus
+        $old_sti $old_lti $old_bank_sti $old_bank_lti $new_values)
+      $new_values
+      (tuple
+        (f64_to_string
+          (sum_f64 (f64_from_string $old_sti)
+            (product_f64 (f64_from_string $stimulus) (f64_from_string $sti_atom_wage)
+              (sum_f64 (f64_from_string 1.0)
+                (clamp_f64
+                  (div_f64
+                    (sub_f64 (f64_from_string $old_bank_sti) (f64_from_string $target_sti))
+                    (f64_from_string $sti_buffer))
+                  (f64_from_string -1.0) (f64_from_string 1.0))))))
+        (f64_to_string
+          (sum_f64 (f64_from_string $old_lti)
+            (product_f64 (f64_from_string $stimulus) (f64_from_string $lti_atom_wage)
+              (sum_f64 (f64_from_string 1.0)
+                (clamp_f64
+                  (div_f64
+                    (sub_f64 (f64_from_string $old_bank_lti) (f64_from_string $target_lti))
+                    (f64_from_string $lti_buffer))
+                  (f64_from_string -1.0) (f64_from_string 1.0))))))
+        (f64_to_string
+          (sub_f64 (f64_from_string $old_bank_sti)
+            (product_f64 (f64_from_string $stimulus) (f64_from_string $sti_atom_wage)
+              (sum_f64 (f64_from_string 1.0)
+                (clamp_f64
+                  (div_f64
+                    (sub_f64 (f64_from_string $old_bank_sti) (f64_from_string $target_sti))
+                    (f64_from_string $sti_buffer))
+                  (f64_from_string -1.0) (f64_from_string 1.0))))))
+        (f64_to_string
+          (sub_f64 (f64_from_string $old_bank_lti)
+            (product_f64 (f64_from_string $stimulus) (f64_from_string $lti_atom_wage)
+              (sum_f64 (f64_from_string 1.0)
+                (clamp_f64
+                  (div_f64
+                    (sub_f64 (f64_from_string $old_bank_lti) (f64_from_string $target_lti))
+                    (f64_from_string $lti_buffer))
+                  (f64_from_string -1.0) (f64_from_string 1.0))))))))))
+
+(exec (0 apply)
+  (I
+    (BTM (StimulusResult $event $atom $stimulus
+      $old_sti $old_lti $old_bank_sti $old_bank_lti
+      ($new_sti $new_lti $new_bank_sti $new_bank_lti)))
+    (BTM (Stimulate $event $atom $stimulus))
+    (BTM (STI $atom $old_sti))
+    (BTM (LTI $atom $old_lti))
+    (BTM (BankSTI $old_bank_sti))
+    (BTM (BankLTI $old_bank_lti)))
+  (O
+    (- (StimulusResult $event $atom $stimulus
+      $old_sti $old_lti $old_bank_sti $old_bank_lti
+      ($new_sti $new_lti $new_bank_sti $new_bank_lti)))
+    (- (Stimulate $event $atom $stimulus))
+    (- (STI $atom $old_sti))
+    (- (LTI $atom $old_lti))
+    (- (BankSTI $old_bank_sti))
+    (- (BankLTI $old_bank_lti))
+    (+ (STI $atom $new_sti))
+    (+ (LTI $atom $new_lti))
+    (+ (BankSTI $new_bank_sti))
+    (+ (BankLTI $new_bank_lti))
+    (+ (Stimulated $event $atom $stimulus))))
