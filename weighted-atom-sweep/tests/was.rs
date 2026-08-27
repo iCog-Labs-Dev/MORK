@@ -151,7 +151,9 @@ fn test_cpq_does_not_relabel_old_paths_with_new_snapshot_version() {
 
     sweep.publish_snapshot(create_map(&[(&b"aaaa"[..], 1)]), 1);
     let rx = sweep.candidate_rx.take().expect("no candidate receiver");
-    let first = rx.recv_timeout(Duration::from_secs(2)).expect("no CPQ candidate");
+    let first = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("no CPQ candidate");
     assert_eq!(first.path, b"aaaa");
     assert_eq!(first.snapshot_version, 1);
 
@@ -169,4 +171,112 @@ fn test_cpq_does_not_relabel_old_paths_with_new_snapshot_version() {
     let candidate = version_two.expect("CPQ did not traverse snapshot version 2");
     assert_eq!(candidate.path, b"bbbb");
     sweep.shutdown_all();
+}
+
+#[test]
+fn strict_snapshot_validation_preserves_process_routing() {
+    let mut sweep = make_sweep();
+    let process_a = ProcessId("a".to_string());
+    let process_b = ProcessId("b".to_string());
+    let live_map = create_map(&[(&b"current"[..], 1)]);
+
+    sweep.candidate_buffers.insert(
+        process_a.clone(),
+        vec![
+            weighted_atom_sweep::AtomCandidate {
+                process_id: process_a.clone(),
+                path: b"current".to_vec(),
+                snapshot_version: 1,
+            },
+            weighted_atom_sweep::AtomCandidate {
+                process_id: process_a.clone(),
+                path: b"missing".to_vec(),
+                snapshot_version: 2,
+            },
+            weighted_atom_sweep::AtomCandidate {
+                process_id: process_a.clone(),
+                path: b"current".to_vec(),
+                snapshot_version: 2,
+            },
+        ]
+        .into(),
+    );
+    sweep.candidate_buffers.insert(
+        process_b.clone(),
+        vec![weighted_atom_sweep::AtomCandidate {
+            process_id: process_b.clone(),
+            path: b"current".to_vec(),
+            snapshot_version: 2,
+        }]
+        .into(),
+    );
+
+    assert!(sweep.select_existing_candidate(&process_a, &live_map, 2));
+    assert_eq!(sweep.metrics.stale_version_candidates, 1);
+    assert_eq!(sweep.metrics.missing_path_candidates, 1);
+    assert_eq!(sweep.metrics.candidates_consumed, 1);
+    assert_eq!(
+        sweep
+            .take_selected_candidate(&process_a, &live_map, 2)
+            .unwrap()
+            .process_id,
+        process_a
+    );
+    assert_eq!(sweep.candidate_buffers[&process_b].len(), 1);
+}
+
+#[test]
+fn replaced_exact_fact_cannot_be_consumed() {
+    let mut sweep = make_sweep();
+    let process = ProcessId("ecan_af_rent".to_string());
+    let old_path = b"(STI atom 10)".to_vec();
+    let new_path = b"(STI atom 9)".to_vec();
+    let live_map = create_map(&[(&new_path, 1)]);
+    sweep.candidate_buffers.insert(
+        process.clone(),
+        vec![weighted_atom_sweep::AtomCandidate {
+            process_id: process.clone(),
+            path: old_path,
+            snapshot_version: 3,
+        }]
+        .into(),
+    );
+
+    assert!(!sweep.select_existing_candidate(&process, &live_map, 3));
+    assert_eq!(sweep.metrics.missing_path_candidates, 1);
+    assert_eq!(sweep.metrics.candidates_consumed, 0);
+}
+
+#[test]
+fn obsolete_buffered_and_reserved_candidates_are_cleared() {
+    let mut sweep = make_sweep();
+    let process = ProcessId("ecan_af_diffusion".to_string());
+    let live_map = create_map(&[(&b"current"[..], 1)]);
+    sweep.candidate_buffers.insert(
+        process.clone(),
+        vec![
+            weighted_atom_sweep::AtomCandidate {
+                process_id: process.clone(),
+                path: b"current".to_vec(),
+                snapshot_version: 4,
+            },
+            weighted_atom_sweep::AtomCandidate {
+                process_id: process.clone(),
+                path: b"current".to_vec(),
+                snapshot_version: 5,
+            },
+        ]
+        .into(),
+    );
+    assert!(sweep.select_existing_candidate(&process, &live_map, 4));
+
+    sweep.discard_obsolete_candidates(5);
+
+    assert!(
+        sweep
+            .take_selected_candidate(&process, &live_map, 5)
+            .is_none()
+    );
+    assert_eq!(sweep.candidate_buffers[&process].len(), 1);
+    assert_eq!(sweep.metrics.stale_version_candidates, 1);
 }

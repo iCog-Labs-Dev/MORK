@@ -31,6 +31,14 @@ pub struct AtomCandidate {
     pub snapshot_version: u64,
 }
 
+/// Candidate validation counters maintained by MORK's serial consumer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SweepMetrics {
+    pub candidates_consumed: u64,
+    pub stale_version_candidates: u64,
+    pub missing_path_candidates: u64,
+}
+
 /// A single traversal process: an engine with its identifier.
 pub struct SweepProcess {
     pub id: ProcessId,
@@ -118,6 +126,7 @@ pub struct WeightedAtomSweep {
     worker_candidate_rxs: HashMap<ProcessId, mpsc::Receiver<AtomCandidate>>,
     pub candidate_buffers: HashMap<ProcessId, VecDeque<AtomCandidate>>,
     selected_candidates: HashMap<ProcessId, AtomCandidate>,
+    pub metrics: SweepMetrics,
 }
 
 pub const CANDIDATE_BUFFER_CAPACITY: usize = 1000;
@@ -139,6 +148,7 @@ impl WeightedAtomSweep {
             worker_candidate_rxs: HashMap::new(),
             candidate_buffers: HashMap::new(),
             selected_candidates: HashMap::new(),
+            metrics: SweepMetrics::default(),
         };
         debug!("WeightedAtomSweep initialization complete");
         result
@@ -209,24 +219,78 @@ impl WeightedAtomSweep {
         self.candidate_buffers.get_mut(process_id)?.pop_front()
     }
 
+    /// Discard buffered and reserved candidates that do not belong to the
+    /// currently eligible completed snapshot.
+    pub fn discard_obsolete_candidates(&mut self, snapshot_version: u64) {
+        self.buffer_candidates();
+        for buffer in self.candidate_buffers.values_mut() {
+            let before = buffer.len();
+            buffer.retain(|candidate| candidate.snapshot_version == snapshot_version);
+            self.metrics.stale_version_candidates += (before - buffer.len()) as u64;
+        }
+        self.selected_candidates.retain(|_, candidate| {
+            let current = candidate.snapshot_version == snapshot_version;
+            if !current {
+                self.metrics.stale_version_candidates += 1;
+            }
+            current
+        });
+    }
+
     /// Reserve the next candidate whose path still exists in the current live map.
     pub fn select_existing_candidate(
         &mut self,
         process_id: &ProcessId,
         live_map: &PathMap<u64>,
+        snapshot_version: u64,
     ) -> bool {
-        while let Some(candidate) = self.pop_candidate(process_id) {
-            let exists = live_map.read_zipper_at_path(&candidate.path).val().is_some();
-            if exists {
-                self.selected_candidates.insert(process_id.clone(), candidate);
-                return true;
-            }
-        }
-        false
+        let Some(candidate) = self.pop_existing_candidate(process_id, live_map, snapshot_version)
+        else {
+            return false;
+        };
+        self.selected_candidates.insert(process_id.clone(), candidate);
+        true
     }
 
-    pub fn take_selected_candidate(&mut self, process_id: &ProcessId) -> Option<AtomCandidate> {
-        self.selected_candidates.remove(process_id)
+    /// Consume the next candidate for this process that belongs to the eligible
+    /// snapshot and whose complete path still exists in the live map.
+    pub fn pop_existing_candidate(
+        &mut self,
+        process_id: &ProcessId,
+        live_map: &PathMap<u64>,
+        snapshot_version: u64,
+    ) -> Option<AtomCandidate> {
+        while let Some(candidate) = self.pop_candidate(process_id) {
+            if candidate.snapshot_version != snapshot_version {
+                self.metrics.stale_version_candidates += 1;
+                continue;
+            }
+            let exists = live_map.read_zipper_at_path(&candidate.path).val().is_some();
+            if exists {
+                self.metrics.candidates_consumed += 1;
+                return Some(candidate);
+            }
+            self.metrics.missing_path_candidates += 1;
+        }
+        None
+    }
+
+    pub fn take_selected_candidate(
+        &mut self,
+        process_id: &ProcessId,
+        live_map: &PathMap<u64>,
+        snapshot_version: u64,
+    ) -> Option<AtomCandidate> {
+        let candidate = self.selected_candidates.remove(process_id)?;
+        if candidate.snapshot_version != snapshot_version {
+            self.metrics.stale_version_candidates += 1;
+            return None;
+        }
+        if live_map.read_zipper_at_path(&candidate.path).val().is_none() {
+            self.metrics.missing_path_candidates += 1;
+            return None;
+        }
+        Some(candidate)
     }
 
     /// Spawn all registered processes into background threads.

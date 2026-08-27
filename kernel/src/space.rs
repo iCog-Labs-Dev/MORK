@@ -1135,17 +1135,23 @@ impl Space {
                 // occurrences separate preserves traversal multiplicity while
                 // still presenting ProductZipper with a normal trie factor.
                 let mut temp_map = PathMap::<u64>::new();
-                let selected = was_ref.take_selected_candidate(&process_id);
-                let mut candidates = selected.into_iter().chain(std::iter::from_fn(|| {
-                    was_ref.pop_candidate(&process_id)
-                }));
+                let selected = was_ref.take_selected_candidate(
+                    &process_id,
+                    btm_ref,
+                    snapshot_version,
+                ).or_else(|| {
+                    was_ref.pop_existing_candidate(
+                        &process_id,
+                        btm_ref,
+                        snapshot_version,
+                    )
+                });
+                let mut candidates = selected.into_iter();
                 while let Some(candidate) = candidates.next() {
                     let z = btm_ref.read_zipper_at_path(&candidate.path);
-                    if let Some(&val) = z.val() {
-                        let mut wz = temp_map.write_zipper_at_path(&candidate.path);
-                        wz.set_val_w(val);
-                        break;
-                    }
+                    let val = *z.val().expect("selected candidate was validated");
+                    let mut wz = temp_map.write_zipper_at_path(&candidate.path);
+                    wz.set_val_w(val);
                 }
 
                 Resource::WAS(temp_map.into_read_zipper(&[]))

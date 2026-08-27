@@ -13,7 +13,7 @@ pub mod traversal_factory;
 pub use ecan_af_topk::EcanAfTopK;
 pub use sweep::{
     AtomCandidate, AtomPosition, ProcessId, SweepController, SweepProcess, WeightedAtomSweep,
-    WeightedAtomSweepSettings,
+    WeightedAtomSweepSettings, SweepMetrics,
 };
 pub use traversal::{TraversalEngine, TraversalError};
 pub use traversal_factory::build_strategy;

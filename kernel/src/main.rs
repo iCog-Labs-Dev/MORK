@@ -6087,8 +6087,9 @@ fn source_was_existing_old_candidate() {
         }
     );
 
-    assert_eq!(results.len(), 1);
-    println!("source_was_existing_old_candidate: OK");
+    assert!(results.is_empty());
+    assert_eq!(s.was.metrics.stale_version_candidates, 1);
+    println!("source_was_existing_old_candidate: rejected stale candidate");
 }
 
 fn scheduler_basic() {
@@ -6203,6 +6204,18 @@ fn scheduler_background() {
     assert!(s.was.candidate_buffers
         .get(&ProcessId("engine_a".to_string()))
         .is_some_and(|buffer| buffer.is_empty()));
+    let background_rule = scheduler
+        .background_rules
+        .get(&ProcessId("engine_a".to_string()))
+        .expect("background rule was not indexed");
+    assert!(
+        s.btm
+            .read_zipper_at_path(background_rule)
+            .val()
+            .is_some(),
+        "background rule must be restored after execution"
+    );
+    assert_eq!(s.snapshot_version, 1, "publish only after the complete round");
     println!("scheduler_background: OK");
 }
 

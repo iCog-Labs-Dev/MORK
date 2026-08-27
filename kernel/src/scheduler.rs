@@ -110,6 +110,7 @@ impl CycleScheduler {
     pub fn run_background_round(&mut self, space: &mut Space) -> usize {
         self.index_background_rules(space);
         space.was.buffer_candidates();
+        space.was.discard_obsolete_candidates(space.snapshot_version);
 
         let process_order = if self.process_order.is_empty() {
             let mut discovered: Vec<_> = self.background_rules.keys().cloned().collect();
@@ -130,7 +131,11 @@ impl CycleScheduler {
             }
             let credits = self.background_credits.get(&process_id).copied().unwrap_or(default_credits);
             for _ in 0..credits {
-                if !space.was.select_existing_candidate(&process_id, &space.btm) {
+                if !space.was.select_existing_candidate(
+                    &process_id,
+                    &space.btm,
+                    space.snapshot_version,
+                ) {
                     break;
                 }
                 work_done += self.execute_background_batch(space, &process_id);
