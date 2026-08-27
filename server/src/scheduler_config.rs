@@ -108,4 +108,20 @@ mod tests {
         "#).unwrap_err();
         assert!(error.contains("unknown engine"));
     }
+
+    #[test]
+    fn ecan_example_orders_diffusion_before_rent() {
+        let config = SchedulerConfig::from_str(include_str!(
+            "../examples/ecan-shifting-drifting-scheduler.toml"
+        )).unwrap();
+
+        assert_eq!(config.foreground_transactions_per_round, 1);
+        assert_eq!(config.processes.len(), 2);
+        assert_eq!(config.processes[0].id, "ecan_af_diffusion");
+        assert_eq!(config.processes[0].engine, "ecan_af_topk");
+        assert_eq!(config.processes[0].cycles, 12);
+        assert_eq!(config.processes[1].id, "ecan_af_rent");
+        assert_eq!(config.processes[1].engine, "ecan_af_topk");
+        assert_eq!(config.processes[1].cycles, 12);
+    }
 }

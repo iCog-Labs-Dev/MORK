@@ -1,0 +1,14 @@
+# Foreground stimulation transactions complete before each background round.
+foreground_transactions_per_round = 1
+poll_interval_ms = 10
+
+# Process order is deterministic: diffuse first, then collect rent.
+[[processes]]
+id = "ecan_af_diffusion"
+engine = "ecan_af_topk"
+cycles = 12
+
+[[processes]]
+id = "ecan_af_rent"
+engine = "ecan_af_topk"
+cycles = 12
