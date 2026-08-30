@@ -1,0 +1,43 @@
+; Step 4 Python Source/Sink acceptance programs.
+; These blocks document the MM2 spelling consumed by the PY source/sink
+; integration. Every sink request uses a unique req_id; the matching source
+; request is evaluated only after the sink has completed and cached its result.
+; A PY source has the shape (PY session command result-pattern).
+
+; 1. Import a module.
+(exec 0 (, (seed 0)) (, (PY py1 (Import import-math math))))
+
+; 1b. Load an arbitrary file into the persistent worker namespace.
+; ImportFile returns no module handle to MORK; later calls use the alias.
+; (exec 0 (, (seed 0))
+;     (O (PY py1 (ImportFile load-functions file_functions /path/to/my_functions.py))))
+; (exec 1 (, (seed 0))
+;     (O (PY py1 (Call double-7 file_functions double (Args (Int 7)) (Kwargs)))))
+
+; 2. math.sqrt(16) -> (py-float 4.0).
+(exec 0 (, (seed 0)) (, (PY py1 (Call sqrt-16 math sqrt (Args (Int 16)) (Kwargs)))))
+(exec 1 (I (PY py1 (Call sqrt-16 math sqrt (Args (Int 16)) (Kwargs)) (Ok (Float 4)))) (, (sqrt-result 4)))
+
+; 3. Set then get a Python variable.
+(exec 0 (, (seed 0)) (, (PY py1 (SetVariable set-answer answer (Int 41)))))
+(exec 1 (I (PY py1 (GetVariable get-answer answer) (Ok (Int 41)))) (, (answer 41)))
+
+; 4. Object returned by exec 0 is reused by exec 1.
+(exec 0 (, (seed 0)) (, (PY py1 (Import import-math math))))
+(exec 1 (I (PY py1 (GetAttr math-pi (Handle @py:py1:1) pi) (Ok (Float 3.141592653589793)))) (, (pi 3.141592653589793)))
+
+; 5 and 6. NumPy array handle, followed by conversion to an MM2 list.
+(exec 0 (, (seed 0)) (, (PY py1 (Import import-numpy numpy))))
+(exec 0 (, (seed 0)) (, (PY py1 (Call make-array numpy array (Args (List (Int 1) (Int 2))) (Kwargs)))))
+(exec 1 (I (PY py1 (CallMethod array-list (Handle @py:py1:2) tolist (Args) (Kwargs)))) (, (array $xs)))
+
+; 7. Python exception is represented as (py-error ...).
+(exec 0 (, (seed 0)) (, (PY py1 (Call missing-module module_that_does_not_exist_for_mork_tests anything (Args) (Kwargs)))))
+(exec 1 (I (PY py1 (Call missing-module module_that_does_not_exist_for_mork_tests anything (Args) (Kwargs)))) (, (py-error $type $message $traceback)))
+
+; 8. py1 and py2 have independent workers, globals, and handle registries.
+(exec 0 (, (seed 0)) (, (PY py1 (SetVariable py1-set shared_name (Int 1)))))
+(exec 1 (I (PY py2 (GetVariable py2-get shared_name))) (, (isolated $error)))
+(exec 0 (, (seed 0)) (, (PY py1 (Import py1-import math))))
+(exec 0 (, (seed 0)) (, (PY py2 (Import py2-import math))))
+; The two import results must be @py:py1:1 and @py:py2:1 respectively.
