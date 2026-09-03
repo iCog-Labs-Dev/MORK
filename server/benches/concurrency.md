@@ -99,6 +99,40 @@ process started fresh per row.
 Long-transaction sample sizes are 118-196 per row, so the long p99 is close to that run's
 maximum rather than a real tail estimate. Short samples are 2.3k-74k.
 
+> [!warning] Full re-verification (2026-09-01): every row is elevated, not just `--workers 1`
+> All five rows were re-run with the exact runbook above, same binary built at current
+> HEAD, same 60 s duration. **Every row reads higher than originally published**, but by
+> very different margins:
+>
+> | `--workers` | tx/s (orig → new) | short p50 (orig → new) | long p50 (orig → new) |
+> |---:|---:|---:|---:|
+> | 1  | 41 → **137.6** (3.4x)  | 1000 → 300 ms | 1000 → 310 ms |
+> | 2  | 173 → **329.2** (1.9x) | 160 → 160 ms  | 590 → 200 ms |
+> | 4  | 1239 → **1490.1** (1.2x) | 10 → 7 ms   | 630 → 250 ms |
+> | 8  | 1244 → **1503.3** (1.2x) | 10 → 7 ms   | 630 → 250 ms |
+> | 16 | 1237 → **1520.7** (1.2x) | 10 → 7 ms   | 620 → 250 ms |
+>
+> (New tx/s cross-checked against `/stats`'s `version`/60s at every row, within ~0.5%.)
+>
+> Two different things are visible here, not one: the 4/8/16 rows moved by ~20%, inside
+> this doc's own stated **±20% noise budget** — plausibly just a quieter box this time
+> (the original runs admit contamination from an unrelated process). The **1 and 2 rows
+> moved far past that budget** (3.4x and 1.9x) and cannot be noise. Long-transaction p50
+> dropping uniformly from ~620-1000 ms to ~250-310 ms across *every* row (not just the
+> low-worker ones) — converging on the ~250 ms solo cost `_scan` was calibrated to — is
+> the strongest single signal that the whole original session ran under heavier
+> contention than an idle box, not just the `--workers 1` row.
+>
+> Treat every number in the table below as **superseded**, and treat conclusions built on
+> it accordingly: the "30x for 4x workers" headline is now closer to **11x for 4x
+> workers** (137.6 → 1490.1), the exact-1000ms-ceiling queueing-theory argument no longer
+> has its premise, and the `4→16` "plateau" is milder now (1490 → 1521, ~2% drift, still
+> plausibly flat) though it starts from a different baseline. What is **not** overturned:
+> zero aborts at every row still held, and the qualitative shape — a large jump from 1 to
+> 4 workers followed by near-flat scaling — still holds, just at different magnitudes.
+> This has not been root-caused (contamination is the standing hypothesis, not a
+> confirmed diagnosis), and the machine was not confirmed idle for this re-run either.
+
 Every row observed **zero aborts of either kind**, which is what the workload was built to
 produce (see the note at the top): every path is disjoint by construction. The abort tally
 itself is not vacuous — driving the phantom race from `test_e2e.py` past the same
